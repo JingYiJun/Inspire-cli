@@ -7,6 +7,8 @@ Config precedence (lowest to highest):
 """
 
 import os
+import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -95,8 +97,40 @@ def build_env_exports(env_dict: dict[str, str]) -> str:
     """
     if not env_dict:
         return ""
-    exports = " && ".join(f'export {k}="{v}"' for k, v in env_dict.items())
-    return exports + " && "
+
+    var_name_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    env_ref_re = re.compile(
+        r"^\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))$"
+    )
+
+    exports: list[str] = []
+    for key, raw_value in env_dict.items():
+        if not var_name_re.match(key):
+            raise ConfigError(
+                f"Invalid remote_env key: {key!r} (must match {var_name_re.pattern})"
+            )
+
+        value = raw_value
+        if value == "":
+            env_var = key
+            if env_var not in os.environ:
+                raise ConfigError(
+                    f"remote_env[{key}] is empty but {env_var} is not set in the local environment"
+                )
+            value = os.environ[env_var]
+        else:
+            match = env_ref_re.match(value)
+            if match is not None:
+                env_var = match.group("braced") or match.group("bare")
+                if env_var not in os.environ:
+                    raise ConfigError(
+                        f"remote_env[{key}] references {env_var} but it is not set in the local environment"
+                    )
+                value = os.environ[env_var]
+
+        exports.append(f"export {key}={shlex.quote(value)}")
+
+    return " && ".join(exports) + " && "
 
 
 @dataclass
@@ -197,6 +231,16 @@ class Config:
     job_image: Optional[str] = None
     job_project_id: Optional[str] = None
     job_workspace_id: Optional[str] = None
+
+    # Workspace routing (optional)
+    # When set, commands can auto-select the correct workspace based on resource type.
+    workspace_cpu_id: Optional[str] = None
+    workspace_gpu_id: Optional[str] = None
+    workspace_internet_id: Optional[str] = None
+
+    # Full workspace map loaded from TOML [workspaces]
+    # (includes custom aliases like workspaces.special = "ws-...").
+    workspaces: dict[str, str] = field(default_factory=dict)
 
     # Notebook settings
     notebook_resource: str = "1xH200"
@@ -493,6 +537,9 @@ class Config:
             "job.project_id": "job_project_id",
             "job.workspace_id": "job_workspace_id",
             "job.shm_size": "shm_size",
+            "workspaces.cpu": "workspace_cpu_id",
+            "workspaces.gpu": "workspace_gpu_id",
+            "workspaces.internet": "workspace_internet_id",
             "notebook.resource": "notebook_resource",
             "notebook.image": "notebook_image",
             "ssh.rtunnel_bin": "rtunnel_bin",
@@ -573,6 +620,10 @@ class Config:
             "job_image": None,
             "job_project_id": None,
             "job_workspace_id": None,
+            "workspace_cpu_id": None,
+            "workspace_gpu_id": None,
+            "workspace_internet_id": None,
+            "workspaces": {},
             # Notebook settings
             "notebook_resource": "1xH200",
             "notebook_image": None,
@@ -601,6 +652,7 @@ class Config:
         global_config_path: Path | None = None
         global_compute_groups: list[dict] = []
         global_remote_env: dict[str, str] = {}
+        global_workspaces: dict[str, str] = {}
         if cls.GLOBAL_CONFIG_PATH.exists():
             global_config_path = cls.GLOBAL_CONFIG_PATH
             global_raw = cls._load_toml(cls.GLOBAL_CONFIG_PATH)
@@ -610,6 +662,10 @@ class Config:
             global_remote_env = {
                 str(k): str(v) for k, v in global_raw.pop("remote_env", {}).items()
             }
+
+            raw_workspaces = global_raw.get("workspaces") or {}
+            if isinstance(raw_workspaces, dict):
+                global_workspaces = {str(k): str(v) for k, v in raw_workspaces.items()}
             flat_global = cls._flatten_toml(global_raw)
             for toml_key, value in flat_global.items():
                 field_name = cls._toml_key_to_field(toml_key)
@@ -622,11 +678,15 @@ class Config:
             if global_remote_env:
                 config_dict["remote_env"] = global_remote_env
                 sources["remote_env"] = SOURCE_GLOBAL
+            if global_workspaces:
+                config_dict["workspaces"] = global_workspaces
+                sources["workspaces"] = SOURCE_GLOBAL
 
         # 3. Merge project config.toml (walk up from cwd to find .inspire/config.toml)
         project_config_path = cls._find_project_config()
         project_compute_groups: list[dict] = []
         project_remote_env: dict[str, str] = {}
+        project_workspaces: dict[str, str] = {}
         if project_config_path:
             project_raw = cls._load_toml(project_config_path)
             # Extract compute_groups array before flattening
@@ -635,6 +695,10 @@ class Config:
             project_remote_env = {
                 str(k): str(v) for k, v in project_raw.pop("remote_env", {}).items()
             }
+
+            raw_workspaces = project_raw.get("workspaces") or {}
+            if isinstance(raw_workspaces, dict):
+                project_workspaces = {str(k): str(v) for k, v in raw_workspaces.items()}
             flat_project = cls._flatten_toml(project_raw)
             for toml_key, value in flat_project.items():
                 field_name = cls._toml_key_to_field(toml_key)
@@ -651,6 +715,11 @@ class Config:
                 merged_remote_env.update(project_remote_env)
                 config_dict["remote_env"] = merged_remote_env
                 sources["remote_env"] = SOURCE_PROJECT
+            if project_workspaces:
+                merged_workspaces = dict(config_dict.get("workspaces", {}))
+                merged_workspaces.update(project_workspaces)
+                config_dict["workspaces"] = merged_workspaces
+                sources["workspaces"] = SOURCE_PROJECT
 
         # 4. Override with env vars (highest priority)
         env_mapping = {
@@ -694,6 +763,9 @@ class Config:
             "INSP_IMAGE": "job_image",
             "INSPIRE_PROJECT_ID": "job_project_id",
             "INSPIRE_WORKSPACE_ID": "job_workspace_id",
+            "INSPIRE_WORKSPACE_CPU_ID": "workspace_cpu_id",
+            "INSPIRE_WORKSPACE_GPU_ID": "workspace_gpu_id",
+            "INSPIRE_WORKSPACE_INTERNET_ID": "workspace_internet_id",
             # Notebook settings
             "INSPIRE_NOTEBOOK_RESOURCE": "notebook_resource",
             "INSPIRE_NOTEBOOK_IMAGE": "notebook_image",

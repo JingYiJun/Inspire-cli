@@ -17,6 +17,7 @@ from inspire.cli.utils.tunnel import (
     save_tunnel_config,
     _get_proxy_command,
     get_ssh_command_args,
+    has_internet_for_gpu_type,
     TunnelNotAvailableError,
     BridgeNotFoundError,
 )
@@ -241,6 +242,7 @@ class TestConfig:
         """Test loading config from environment variables."""
         monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
         monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
+        monkeypatch.delenv("INSPIRE_BASE_URL", raising=False)
 
         config = Config.from_env()
 
@@ -360,21 +362,89 @@ class TestConfigHelpers:
     def test_build_env_exports_single(self) -> None:
         """Test building env exports with single var."""
         result = build_env_exports({"FOO": "bar"})
-        assert result == 'export FOO="bar" && '
+        assert result == "export FOO=bar && "
 
     def test_build_env_exports_multiple(self) -> None:
         """Test building env exports with multiple vars."""
         result = build_env_exports({"FOO": "bar", "BAZ": "qux"})
         # Order may vary due to dict iteration, so check both parts
-        assert 'export FOO="bar"' in result
-        assert 'export BAZ="qux"' in result
+        assert "export FOO=bar" in result
+        assert "export BAZ=qux" in result
         assert result.endswith(" && ")
         assert " && " in result  # Separates the two exports
+
+    def test_build_env_exports_env_ref_bare(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """remote_env supports $VARNAME to pull from local environment."""
+        monkeypatch.setenv("TOKEN", "sekret")
+        result = build_env_exports({"WANDB_API_KEY": "$TOKEN"})
+        assert result == "export WANDB_API_KEY=sekret && "
+
+    def test_build_env_exports_env_ref_braced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """remote_env supports ${VARNAME} to pull from local environment."""
+        monkeypatch.setenv("TOKEN", "sekret")
+        result = build_env_exports({"WANDB_API_KEY": "${TOKEN}"})
+        assert result == "export WANDB_API_KEY=sekret && "
+
+    def test_build_env_exports_empty_uses_same_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty remote_env value uses the local environment value for that key."""
+        monkeypatch.setenv("WANDB_API_KEY", "sekret")
+        result = build_env_exports({"WANDB_API_KEY": ""})
+        assert result == "export WANDB_API_KEY=sekret && "
+
+    def test_build_env_exports_quotes_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Values are safely shell-quoted."""
+        monkeypatch.setenv("TOKEN", "has spaces")
+        result = build_env_exports({"WANDB_API_KEY": "$TOKEN"})
+        assert result == "export WANDB_API_KEY='has spaces' && "
+
+    def test_build_env_exports_missing_env_var_raises(self) -> None:
+        """Missing env var references should fail early."""
+        with pytest.raises(ConfigError, match="not set in the local environment"):
+            build_env_exports({"WANDB_API_KEY": "$MISSING"})
+
+    def test_build_env_exports_invalid_key_raises(self) -> None:
+        """Invalid shell variable names should fail early."""
+        with pytest.raises(ConfigError, match="Invalid remote_env key"):
+            build_env_exports({"NOT-VALID": "x"})
 
 
 # ===========================================================================
 # Tunnel tests
 # ===========================================================================
+
+
+class TestHasInternetForGpuType:
+    """Tests for has_internet_for_gpu_type helper function."""
+
+    def test_empty_gpu_type_returns_true(self) -> None:
+        """Empty GPU type defaults to having internet (CPU)."""
+        assert has_internet_for_gpu_type("") is True
+
+    def test_none_returns_true(self) -> None:
+        """None GPU type defaults to having internet."""
+        # Type hint says str, but handle None gracefully
+        assert has_internet_for_gpu_type(None) is True  # type: ignore[arg-type]
+
+    def test_h200_returns_false(self) -> None:
+        """H200 GPUs don't have internet."""
+        assert has_internet_for_gpu_type("H200") is False
+        assert has_internet_for_gpu_type("h200") is False
+        assert has_internet_for_gpu_type("H200-SXM") is False
+
+    def test_h100_returns_false(self) -> None:
+        """H100 GPUs don't have internet."""
+        assert has_internet_for_gpu_type("H100") is False
+        assert has_internet_for_gpu_type("h100") is False
+        assert has_internet_for_gpu_type("H100-SXM") is False
+
+    def test_4090_returns_true(self) -> None:
+        """4090 GPUs have internet."""
+        assert has_internet_for_gpu_type("4090") is True
+        assert has_internet_for_gpu_type("RTX 4090") is True
+
+    def test_cpu_returns_true(self) -> None:
+        """CPU (no GPU) has internet."""
+        assert has_internet_for_gpu_type("CPU") is True
 
 
 class TestBridgeProfile:
@@ -424,6 +494,41 @@ class TestBridgeProfile:
         assert profile.name == "test-bridge"
         assert profile.ssh_user == "root"  # default
         assert profile.ssh_port == 22222   # default
+        assert profile.has_internet is True  # default
+
+    def test_has_internet_field(self) -> None:
+        """Test has_internet field in BridgeProfile."""
+        profile_with_internet = BridgeProfile(
+            name="bridge1",
+            proxy_url="https://proxy.example.com",
+            has_internet=True,
+        )
+        profile_without_internet = BridgeProfile(
+            name="bridge2",
+            proxy_url="https://proxy.example.com",
+            has_internet=False,
+        )
+
+        # Test to_dict includes has_internet
+        assert profile_with_internet.to_dict()["has_internet"] is True
+        assert profile_without_internet.to_dict()["has_internet"] is False
+
+        # Test from_dict with has_internet
+        d = {
+            "name": "test",
+            "proxy_url": "https://proxy.example.com",
+            "has_internet": False,
+        }
+        profile = BridgeProfile.from_dict(d)
+        assert profile.has_internet is False
+
+        # Test backward compatibility - missing has_internet defaults to True
+        d_legacy = {
+            "name": "legacy",
+            "proxy_url": "https://proxy.example.com",
+        }
+        profile_legacy = BridgeProfile.from_dict(d_legacy)
+        assert profile_legacy.has_internet is True
 
 
 class TestTunnelConfig:
@@ -498,6 +603,49 @@ class TestTunnelConfig:
         assert len(bridges) == 2
         names = {b.name for b in bridges}
         assert names == {"bridge1", "bridge2"}
+
+    def test_get_bridge_with_internet_prefers_default(self) -> None:
+        """Test get_bridge_with_internet prefers the default bridge."""
+        config = TunnelConfig()
+        # Add bridge1 as default (first added)
+        config.add_bridge(BridgeProfile(name="bridge1", proxy_url="https://p1.example.com", has_internet=True))
+        config.add_bridge(BridgeProfile(name="bridge2", proxy_url="https://p2.example.com", has_internet=True))
+
+        result = config.get_bridge_with_internet()
+
+        assert result is not None
+        assert result.name == "bridge1"  # Default bridge
+
+    def test_get_bridge_with_internet_skips_no_internet_default(self) -> None:
+        """Test get_bridge_with_internet skips default if it has no internet."""
+        config = TunnelConfig()
+        config.add_bridge(BridgeProfile(name="gpu-bridge", proxy_url="https://gpu.example.com", has_internet=False))
+        config.add_bridge(BridgeProfile(name="cpu-bridge", proxy_url="https://cpu.example.com", has_internet=True))
+        # gpu-bridge is default (first added)
+        assert config.default_bridge == "gpu-bridge"
+
+        result = config.get_bridge_with_internet()
+
+        assert result is not None
+        assert result.name == "cpu-bridge"  # Falls back to bridge with internet
+
+    def test_get_bridge_with_internet_returns_none_when_all_no_internet(self) -> None:
+        """Test get_bridge_with_internet returns None when no bridge has internet."""
+        config = TunnelConfig()
+        config.add_bridge(BridgeProfile(name="bridge1", proxy_url="https://p1.example.com", has_internet=False))
+        config.add_bridge(BridgeProfile(name="bridge2", proxy_url="https://p2.example.com", has_internet=False))
+
+        result = config.get_bridge_with_internet()
+
+        assert result is None
+
+    def test_get_bridge_with_internet_empty_config(self) -> None:
+        """Test get_bridge_with_internet returns None for empty config."""
+        config = TunnelConfig()
+
+        result = config.get_bridge_with_internet()
+
+        assert result is None
 
 
 class TestTunnelConfigPersistence:

@@ -97,6 +97,12 @@ username = "your_username"
 [api]
 base_url = "https://your-inspire-platform.com"
 
+[workspaces]
+# cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)
+# gpu = "ws-..."       # GPU workspace (H100/H200 jobs)
+# internet = "ws-..."  # Internet-enabled GPU workspace (e.g. RTX 4090)
+# special = "ws-..."   # Custom alias (use with --workspace special)
+
 [[compute_groups]]
 name = "H100 Cluster"
 id = "lcg-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -117,6 +123,9 @@ inspire config show
 | `INSPIRE_BASE_URL` | API base URL |
 | `INSPIRE_TARGET_DIR` | Shared filesystem path |
 | `INSPIRE_WORKSPACE_ID` | Default workspace ID |
+| `INSPIRE_WORKSPACE_CPU_ID` | CPU workspace ID (default workspace) |
+| `INSPIRE_WORKSPACE_GPU_ID` | GPU workspace ID (H100/H200) |
+| `INSPIRE_WORKSPACE_INTERNET_ID` | Internet-enabled workspace ID (e.g. RTX 4090) |
 | `INSPIRE_PROJECT_ID` | Default project ID |
 | `INSP_IMAGE` | Default Docker image |
 | `INSP_PRIORITY` | Job priority (1-10) |

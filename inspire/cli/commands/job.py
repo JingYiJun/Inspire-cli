@@ -48,6 +48,7 @@ from inspire.cli.utils.tunnel import (
     TunnelNotAvailableError,
 )
 from inspire.cli.utils.browser_api import find_best_compute_group_accurate
+from inspire.cli.utils.workspace import select_workspace_id
 from inspire.cli.formatters import json_formatter, human_formatter
 
 
@@ -83,6 +84,12 @@ def _wrap_in_bash(command: str) -> str:
 @click.option("--priority", type=int, default=lambda: int(os.environ.get("INSP_PRIORITY", "6")), help="Task priority 1-10 (default: 6, env: INSP_PRIORITY)")
 @click.option("--max-time", type=float, default=100.0, help="Max runtime in hours (default: 100)")
 @click.option("--location", help="Preferred datacenter location")
+@click.option("--workspace", help="Workspace name (from [workspaces])")
+@click.option(
+    "--workspace-id",
+    "workspace_id_override",
+    help="Workspace ID override (highest precedence)",
+)
 @click.option(
     "--auto/--no-auto",
     default=True,
@@ -105,6 +112,8 @@ def create(
     priority: int,
     max_time: float,
     location: str,
+    workspace: Optional[str],
+    workspace_id_override: Optional[str],
     auto: bool,
     image: str,
     nodes: int,
@@ -139,14 +148,30 @@ def create(
         config, _ = Config.from_files_and_env(require_target_dir=True)
         api = AuthManager.get_api(config)
 
+        # Parse resource early for workspace routing + optional auto-selection.
+        try:
+            requested_gpu_type, requested_gpu_count = api.resource_manager.parse_resource_request(resource)
+        except Exception as e:
+            _handle_error(ctx, "ValidationError", f"Invalid resource spec: {e}", EXIT_VALIDATION_ERROR)
+            return
+
+        selected_workspace_id = select_workspace_id(
+            config,
+            gpu_type=requested_gpu_type.value,
+            explicit_workspace_id=workspace_id_override,
+            explicit_workspace_name=workspace,
+        )
+        if not selected_workspace_id:
+            _handle_error(
+                ctx,
+                "ConfigError",
+                "No workspace_id configured for GPU workloads. Set [workspaces].gpu or INSPIRE_WORKSPACE_ID.",
+                EXIT_CONFIG_ERROR,
+            )
+            return
+
         # Auto-select location based on GPU availability (if requested)
         if auto and not location:
-            try:
-                requested_gpu_type, requested_gpu_count = api.resource_manager.parse_resource_request(resource)
-            except Exception as e:
-                _handle_error(ctx, "ValidationError", f"Invalid resource spec: {e}", EXIT_VALIDATION_ERROR)
-                return
-
             # Use accurate browser API for resource selection
             best = find_best_compute_group_accurate(
                 gpu_type=requested_gpu_type.value,
@@ -202,9 +227,10 @@ def create(
         # Prepend remote_env exports to command
         env_exports = build_env_exports(config.remote_env)
 
-        # If INSPIRE_TARGET_DIR is configured, wrap the command so
-        # stdout/stderr land in a single master log file under
-        # ${INSPIRE_TARGET_DIR}/.inspire/.
+        # If INSPIRE_TARGET_DIR is configured, wrap the command so:
+        # 1. We cd to the target directory first (where the code lives)
+        # 2. stdout/stderr land in a single master log file under
+        #    ${INSPIRE_TARGET_DIR}/.inspire/.
         final_command = f"{env_exports}{command}" if env_exports else command
         log_path = None
         if config.target_dir:
@@ -212,7 +238,7 @@ def create(
             log_dir = os.path.join(config.target_dir, ".inspire")
             log_filename = f"training_master_{timestamp}.log"
             log_path = os.path.join(log_dir, log_filename)
-            final_command = f'{env_exports}mkdir -p "{log_dir}" && ( {command} ) > "{log_path}" 2>&1'
+            final_command = f'{env_exports}mkdir -p "{log_dir}" && ( cd "{config.target_dir}" && {command} ) > "{log_path}" 2>&1'
 
         # Convert hours to milliseconds
         max_time_ms = str(int(max_time * 3600 * 1000))
@@ -224,6 +250,8 @@ def create(
             resource=resource,
             framework=framework,
             prefer_location=location,
+            project_id=config.job_project_id,
+            workspace_id=selected_workspace_id,
             image=image,
             task_priority=priority,
             instance_count=nodes,
