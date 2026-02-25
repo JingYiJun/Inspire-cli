@@ -6,9 +6,10 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import click
 
@@ -21,7 +22,51 @@ from inspire.config import (
 from .env_detect import _redact_token_like_text
 from .toml_helpers import _toml_dumps
 
+from inspire.platform.web.browser_api.core import _set_base_url
 from inspire.platform.web.browser_api.notebooks import NotebookFailedError
+
+_CATALOG_DROP_FIELDS = frozenset(
+    {
+        "id",
+        "alias",
+        "workspace_id",
+        "probed_at",
+        "probe_notebook_id",
+        "probe_error",
+    }
+)
+
+
+class _ProbeDefaults(NamedTuple):
+    ssh_runtime: object
+    ssh_public_key: str
+    probe_workspace_id: str
+    logic_compute_group_id: str
+    quota_id: str
+    cpu_count: int
+    memory_size: int
+    selected_image: object
+    task_priority: int
+    shm_size: int
+
+
+@dataclass(frozen=True)
+class _DiscoveryPersistRequest:
+    force: bool
+    config: Config
+    browser_api_module: object
+    session: object
+    account_key: str
+    workspace_id: str
+    projects: list[object]
+    selected_project: object
+    probe_shared_path: bool
+    probe_limit: int
+    probe_keep_notebooks: bool
+    probe_pubkey: str | None
+    probe_timeout: int
+    prompted_credentials: tuple[str, str, str] | None
+    cli_target_dir: str | None
 
 
 def _slugify_alias(value: str) -> str:
@@ -513,6 +558,123 @@ def _discover_workspace_aliases() -> dict[str, str]:
     return overrides
 
 
+def _ensure_playwright_browser() -> None:
+    """Check that the Playwright Chromium browser is installed; offer to install it."""
+    import subprocess
+    import sys
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return  # already installed
+    except Exception:
+        pass
+
+    click.echo()
+    click.echo(
+        "Playwright Chromium browser is required for SSO authentication "
+        "(one-time ~150 MB download)."
+    )
+    if not click.confirm("Install Chromium now?", default=True):
+        click.echo("Cannot proceed without a browser for SSO login.")
+        raise SystemExit(1)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        click.echo(click.style("Chromium installation failed.", fg="red"))
+        raise SystemExit(1)
+
+
+def _resolve_credentials_interactive(
+    config: object,
+    *,
+    cli_username: str | None,
+    cli_base_url: str | None,
+    allow_config_password: bool = False,
+) -> tuple[str, str, str]:
+    """Resolve base_url, username, and password, prompting when missing."""
+    placeholder = "https://api.example.com"
+
+    # --- base_url ---
+    base_url = (cli_base_url or "").strip()
+    if not base_url:
+        cfg_base_url = str(getattr(config, "base_url", "") or "").strip()
+        if cfg_base_url and cfg_base_url != placeholder:
+            base_url = cfg_base_url
+    if not base_url:
+        base_url = click.prompt("Platform URL", type=str).strip()
+    if not base_url:
+        click.echo(click.style("Platform URL is required.", fg="red"))
+        raise SystemExit(1)
+
+    # --- username ---
+    username = (cli_username or "").strip()
+    if not username:
+        cfg_username = str(getattr(config, "username", "") or "").strip()
+        if cfg_username:
+            username = cfg_username
+    if not username:
+        username = click.prompt("Username", type=str).strip()
+    if not username:
+        click.echo(click.style("Username is required.", fg="red"))
+        raise SystemExit(1)
+
+    # --- password ---
+    # When the caller explicitly provided credentials (allow_config_password=True),
+    # the config/env password is likely valid — use it to support non-interactive
+    # --force mode.  In the session-failed fallback path the old password may be
+    # stale, so always prompt for a fresh one.
+    password = ""
+    if allow_config_password:
+        password = str(getattr(config, "password", "") or "").strip()
+    if not password:
+        password = click.prompt("Password", type=str, hide_input=True)
+    if not password:
+        click.echo(click.style("Password is required.", fg="red"))
+        raise SystemExit(1)
+
+    return username, password, base_url
+
+
+def _ensure_ssh_key() -> None:
+    """Check for an SSH key; offer to generate one if missing."""
+    import subprocess
+
+    ssh_dir = Path.home() / ".ssh"
+    candidates = [ssh_dir / "id_ed25519.pub", ssh_dir / "id_rsa.pub"]
+    if any(p.exists() for p in candidates):
+        return
+
+    click.echo()
+    click.echo("No SSH key found. SSH keys are needed for bridge/tunnel/notebook SSH features.")
+
+    # Non-interactive contexts (CI, tests) must not block on prompts or fail on EOF.
+    stdin = click.get_text_stream("stdin")
+    if not getattr(stdin, "isatty", lambda: False)():
+        click.echo("Skipping SSH key generation in non-interactive mode.")
+        return
+
+    if not click.confirm("Generate a new ed25519 SSH key?", default=True):
+        return
+
+    ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key_path = ssh_dir / "id_ed25519"
+    result = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-C", "inspire-cli"],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        click.echo(f"SSH key generated: {key_path}")
+    else:
+        click.echo(click.style("SSH key generation failed.", fg="yellow"))
+
+
 def _merge_alias_map(
     *,
     existing: dict[str, str],
@@ -600,45 +762,92 @@ def _merge_compute_groups(
         if not group_id:
             continue
         merged = dict(by_id.get(group_id, {}))
+        existing_ws = set(merged.get("workspace_ids") or [])
+        new_ws = set(item.get("workspace_ids") or [])
         merged.update({k: v for k, v in item.items() if v is not None and v != ""})
+        combined = sorted(existing_ws | new_ws)
+        if combined:
+            merged["workspace_ids"] = combined
         by_id[group_id] = merged
 
     merged_list = list(by_id.values())
+    for entry in merged_list:
+        for k in [k for k, v in entry.items() if v == ""]:
+            del entry[k]
     merged_list.sort(
         key=lambda entry: (str(entry.get("gpu_type") or ""), str(entry.get("name") or "").lower())
     )
     return merged_list
 
 
-def _init_discover_mode(
-    force: bool,
+def _resolve_discover_runtime(
     *,
-    probe_shared_path: bool,
-    probe_limit: int,
-    probe_keep_notebooks: bool,
-    probe_pubkey: str | None,
-    probe_timeout: int,
-) -> None:
-    """Initialize per-account catalogs by discovering projects and compute groups."""
-    from inspire.platform.web import browser_api as browser_api_module
-    from inspire.platform.web import session as web_session_module
-    from inspire.platform.web.session import DEFAULT_WORKSPACE_ID
+    config: Config,
+    web_session_module,  # noqa: ANN001
+    default_workspace_id: str,
+    cli_username: str | None,
+    cli_base_url: str | None,
+) -> tuple[object, tuple[str, str, str] | None, str, str]:
+    # When the caller explicitly provides credentials via CLI flags, skip the
+    # cached-session fast path so we honour the override instead of silently
+    # using a session that belongs to a different user / base-url.
+    session = None
+    prompted_credentials: tuple[str, str, str] | None = None
+    if cli_username or cli_base_url:
+        _ensure_playwright_browser()
+        username, password, base_url = _resolve_credentials_interactive(
+            config,
+            cli_username=cli_username,
+            cli_base_url=cli_base_url,
+            allow_config_password=True,
+        )
+        prompted_credentials = (username, password, base_url)
+        click.echo("Logging in...")
+        session = web_session_module.login_with_playwright(
+            username,
+            password,
+            base_url=base_url,
+        )
+        click.echo("Logged in.")
+    else:
+        try:
+            session = web_session_module.get_web_session(require_workspace=True)
+        except (ValueError, RuntimeError):
+            _ensure_playwright_browser()
+            username, password, base_url = _resolve_credentials_interactive(
+                config,
+                cli_username=cli_username,
+                cli_base_url=cli_base_url,
+            )
+            prompted_credentials = (username, password, base_url)
+            click.echo("Logging in...")
+            session = web_session_module.login_with_playwright(
+                username,
+                password,
+                base_url=base_url,
+            )
+            click.echo("Logged in.")
 
-    config, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
-
-    try:
-        session = web_session_module.get_web_session(require_workspace=True)
-    except ValueError as e:
-        click.echo(click.style(str(e), fg="red"))
-        raise SystemExit(1) from e
-
-    account_key = (config.username or session.login_username or "").strip()
+    if prompted_credentials:
+        account_key = prompted_credentials[0]
+    else:
+        account_key = (config.username or session.login_username or "").strip()
     if not account_key:
         click.echo(click.style("Could not resolve account key (username)", fg="red"))
         raise SystemExit(1)
 
+    placeholder = "https://api.example.com"
+    if prompted_credentials:
+        _set_base_url(prompted_credentials[2])
+    else:
+        cfg_base_url = str(getattr(config, "base_url", "") or "").strip()
+        if cfg_base_url and cfg_base_url != placeholder:
+            _set_base_url(cfg_base_url)
+        elif session.base_url:
+            _set_base_url(session.base_url)
+
     workspace_id = str(session.workspace_id or "").strip()
-    if not workspace_id or workspace_id == DEFAULT_WORKSPACE_ID:
+    if not workspace_id or workspace_id == default_workspace_id:
         click.echo(
             click.style(
                 "Could not detect a real workspace_id. Set INSPIRE_WORKSPACE_ID and retry.",
@@ -647,10 +856,18 @@ def _init_discover_mode(
         )
         raise SystemExit(1)
 
-    click.echo(click.style("Discovering account catalog...", bold=True))
-    click.echo(f"Account: {account_key}")
-    click.echo(f"Workspace: {workspace_id}")
+    return session, prompted_credentials, account_key, workspace_id
 
+
+def _load_projects_for_discovery(
+    *,
+    browser_api_module,  # noqa: ANN001
+    session,  # noqa: ANN001
+    workspace_id: str,
+    force: bool,
+    probe_shared_path: bool,
+    probe_limit: int,
+) -> tuple[list[object], object]:
     try:
         projects = browser_api_module.list_projects(workspace_id=workspace_id, session=session)
     except Exception as e:  # pragma: no cover - network/runtime dependent
@@ -692,7 +909,10 @@ def _init_discover_mode(
         if 1 <= choice <= len(projects):
             selected_project = projects[choice - 1]
 
-    global_path = Config.GLOBAL_CONFIG_PATH
+    return projects, selected_project
+
+
+def _confirm_discovery_writes(*, force: bool, global_path: Path, project_path: Path) -> bool:
     if global_path.exists() and not force:
         click.echo()
         click.echo(click.style(f"Global config already exists: {global_path}", fg="yellow"))
@@ -700,9 +920,8 @@ def _init_discover_mode(
             "Update it with discovered catalogs? (will rewrite file)", default=True
         ):
             click.echo("Aborted.")
-            return
+            return False
 
-    project_path = Path.cwd() / PROJECT_CONFIG_DIR / CONFIG_FILENAME
     if project_path.exists() and not force:
         click.echo()
         click.echo(click.style(f"Project config already exists: {project_path}", fg="yellow"))
@@ -710,8 +929,15 @@ def _init_discover_mode(
             "Update it with discovered context/defaults? (will rewrite file)", default=True
         ):
             click.echo("Aborted.")
-            return
+            return False
+    return True
 
+
+def _load_discovery_global_state(
+    *,
+    global_path: Path,
+    account_key: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     global_data: dict[str, Any] = {}
     if global_path.exists():
         global_data = Config._load_toml(global_path)
@@ -726,6 +952,14 @@ def _init_discover_mode(
         account_section = {}
         accounts[account_key] = account_section
 
+    return global_data, account_section
+
+
+def _resolve_project_catalog_aliases(
+    *,
+    account_section: dict[str, Any],
+    projects: list[object],
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
     existing_projects = account_section.get("projects")
     if not isinstance(existing_projects, dict):
         existing_projects = {}
@@ -737,29 +971,40 @@ def _init_discover_mode(
         project_catalog = {}
         account_section["project_catalog"] = project_catalog
 
+    typed_catalog: dict[str, dict[str, Any]] = {}
+    for project_id, entry in project_catalog.items():
+        if not isinstance(project_id, str):
+            continue
+        if isinstance(entry, dict):
+            typed_catalog[project_id] = entry
+        else:
+            typed_catalog[project_id] = {}
+
+    account_section["project_catalog"] = typed_catalog
+    return alias_for_id, typed_catalog
+
+
+def _populate_project_catalog(
+    *,
+    project_catalog: dict[str, dict[str, Any]],
+    projects: list[object],
+    browser_api_module,  # noqa: ANN001
+    session,  # noqa: ANN001
+    workspace_id: str,
+    account_key: str,
+    force: bool,
+) -> None:
     for project in projects:
         project_id = str(getattr(project, "project_id", "") or "").strip()
         if not project_id:
             continue
 
-        entry = project_catalog.get(project_id)
-        if not isinstance(entry, dict):
-            entry = {}
-            project_catalog[project_id] = entry
-
-        entry.setdefault("id", project_id)
-
-        alias = str(alias_for_id.get(project_id) or "").strip()
-        if alias:
-            entry["alias"] = alias
-
+        entry = project_catalog.setdefault(project_id, {})
         name = str(getattr(project, "name", "") or "").strip()
         if name:
             entry["name"] = name
 
         project_workspace_id = str(getattr(project, "workspace_id", "") or workspace_id).strip()
-        entry["workspace_id"] = project_workspace_id
-
         workdir = str(entry.get("workdir") or "").strip()
         if not workdir or force:
             try:
@@ -774,26 +1019,40 @@ def _init_discover_mode(
             except Exception:
                 workdir = ""
 
-        if workdir:
-            entry["workdir"] = workdir
-            shared_group = _derive_shared_path_group(workdir, account_key=account_key)
-            if shared_group and not str(entry.get("shared_path_group") or "").strip():
-                entry["shared_path_group"] = shared_group
+        if not workdir:
+            continue
+        entry["workdir"] = workdir
+        shared_group = _derive_shared_path_group(workdir, account_key=account_key)
+        if shared_group and not str(entry.get("shared_path_group") or "").strip():
+            entry["shared_path_group"] = shared_group
 
+
+def _update_account_shared_path_group(
+    *,
+    account_section: dict[str, Any],
+    project_catalog: dict[str, dict[str, Any]],
+    force: bool,
+) -> None:
     global_user_groups: set[str] = set()
     for entry in project_catalog.values():
-        if not isinstance(entry, dict):
-            continue
         shared_group = str(entry.get("shared_path_group") or "").strip()
-        if not shared_group or "/global_user/" not in shared_group:
-            continue
-        global_user_groups.add(shared_group)
+        if shared_group and "/global_user/" in shared_group:
+            global_user_groups.add(shared_group)
 
-    if len(global_user_groups) == 1:
-        shared_path_group = next(iter(global_user_groups))
-        if force or not str(account_section.get("shared_path_group") or "").strip():
-            account_section["shared_path_group"] = shared_path_group
+    if len(global_user_groups) != 1:
+        return
 
+    shared_path_group = next(iter(global_user_groups))
+    if force or not str(account_section.get("shared_path_group") or "").strip():
+        account_section["shared_path_group"] = shared_path_group
+
+
+def _print_shared_path_group_summary(
+    *,
+    projects: list[object],
+    project_catalog: dict[str, dict[str, Any]],
+    alias_for_id: dict[str, str],
+) -> None:
     shared_group_to_aliases: dict[str, list[str]] = {}
     for project in projects:
         project_id = str(getattr(project, "project_id", "") or "").strip()
@@ -803,37 +1062,49 @@ def _init_discover_mode(
         if not alias:
             alias = _slugify_alias(str(getattr(project, "name", "") or "").strip()) or project_id
 
-        entry = project_catalog.get(project_id)
-        shared_group = (
-            str(entry.get("shared_path_group") or "").strip() if isinstance(entry, dict) else ""
-        )
+        entry = project_catalog.get(project_id) or {}
+        shared_group = str(entry.get("shared_path_group") or "").strip()
         shared_group_to_aliases.setdefault(shared_group or "<unknown>", []).append(alias)
 
     click.echo()
     if len(shared_group_to_aliases) == 1 and "<unknown>" not in shared_group_to_aliases:
         group = next(iter(shared_group_to_aliases))
         click.echo(click.style("Shared path group:", bold=True) + f" {group}")
-    else:
-        click.echo(click.style("Shared path groups:", bold=True))
-        for group, aliases in sorted(
-            shared_group_to_aliases.items(),
-            key=lambda item: (item[0] == "<unknown>", item[0]),
-        ):
-            click.echo(f"  - {group} ({len(aliases)} project(s))")
-            sample = ", ".join(sorted(aliases)[:8])
-            if sample:
-                suffix = " ..." if len(aliases) > 8 else ""
-                click.echo(f"      {sample}{suffix}")
-        if "<unknown>" in shared_group_to_aliases:
-            click.echo(
-                "  Hint: run with --probe-shared-path to populate unknown shared-path groups."
-            )
+        return
 
-    existing_workspaces = account_section.get("workspaces")
+    click.echo(click.style("Shared path groups:", bold=True))
+    for group, aliases in sorted(
+        shared_group_to_aliases.items(),
+        key=lambda item: (item[0] == "<unknown>", item[0]),
+    ):
+        click.echo(f"  - {group} ({len(aliases)} project(s))")
+        sample = ", ".join(sorted(aliases)[:8])
+        if sample:
+            suffix = " ..." if len(aliases) > 8 else ""
+            click.echo(f"      {sample}{suffix}")
+    if "<unknown>" in shared_group_to_aliases:
+        click.echo("  Hint: run with --probe-shared-path to populate unknown shared-path groups.")
+
+
+def _get_existing_workspace_aliases(
+    *,
+    global_data: dict[str, Any],
+    account_section: dict[str, Any],
+) -> dict[str, str]:
+    existing_workspaces = global_data.get("workspaces")
     if not isinstance(existing_workspaces, dict):
-        existing_workspaces = {}
-    merged_workspaces: dict[str, str] = dict(existing_workspaces)
+        existing_workspaces = account_section.get("workspaces")
+    if not isinstance(existing_workspaces, dict):
+        return {}
+    return dict(existing_workspaces)
 
+
+def _merge_workspace_aliases(
+    *,
+    config: Config,
+    merged_workspaces: dict[str, str],
+    force: bool,
+) -> dict[str, str]:
     config_workspaces = getattr(config, "workspaces", None)
     if isinstance(config_workspaces, dict):
         for raw_alias, raw_workspace_id in config_workspaces.items():
@@ -861,20 +1132,200 @@ def _init_discover_mode(
         value = str(workspace_value or "").strip()
         if value:
             merged_workspaces[alias] = value
+    return env_overrides
 
-    merged_workspaces.setdefault("cpu", workspace_id)
-    merged_workspaces.setdefault("gpu", workspace_id)
-    merged_workspaces.setdefault("internet", workspace_id)
-    account_section["workspaces"] = merged_workspaces
 
+def _discover_workspace_options(
+    *,
+    session,  # noqa: ANN001
+    workspace_id: str,
+) -> tuple[list[str], dict[str, str]]:
+    discovered_workspace_ids: list[str] = list(session.all_workspace_ids or [])
+    discovered_workspace_names: dict[str, str] = dict(session.all_workspace_names or {})
+
+    if len(discovered_workspace_ids) <= 1:
+        try:
+            from inspire.platform.web.browser_api.workspaces import try_enumerate_workspaces
+
+            api_workspaces = try_enumerate_workspaces(session, workspace_id=workspace_id)
+            for ws in api_workspaces:
+                ws_id = str(ws.get("id") or "").strip()
+                ws_name = str(ws.get("name") or "").strip()
+                if ws_id and ws_id not in discovered_workspace_ids:
+                    discovered_workspace_ids.append(ws_id)
+                if ws_id and ws_name:
+                    discovered_workspace_names.setdefault(ws_id, ws_name)
+        except Exception:
+            pass
+
+    return discovered_workspace_ids, discovered_workspace_names
+
+
+def _guess_workspace_alias(
+    alias: str,
+    discovered_workspace_ids: list[str],
+    discovered_workspace_names: dict[str, str],
+) -> str | None:
+    """Return the best-guess workspace ID for *alias* (cpu/gpu/internet), or ``None``."""
+    for ws_id in discovered_workspace_ids:
+        name = (discovered_workspace_names.get(ws_id) or "").strip()
+        if not name:
+            continue
+        low = name.lower()
+
+        if alias == "cpu" and "cpu" in low:
+            return ws_id
+        if alias == "internet" and ("上网" in name or "internet" in low):
+            return ws_id
+        if alias == "gpu":
+            gpu_hit = any(kw in low for kw in ("gpu", "h100", "h200")) or any(
+                kw in name for kw in ("训练", "分布式", "高性能")
+            )
+            if gpu_hit and "cpu" not in low and "上网" not in name and "internet" not in low:
+                return ws_id
+
+    return None
+
+
+def _prompt_workspace_aliases(
+    *,
+    force: bool,
+    workspace_id: str,
+    merged_workspaces: dict[str, str],
+    env_overrides: dict[str, str],
+    discovered_workspace_ids: list[str],
+    discovered_workspace_names: dict[str, str],
+) -> None:
+    if len(discovered_workspace_ids) > 1 and not force:
+        click.echo()
+        click.echo(click.style("Multiple workspaces discovered:", bold=True))
+        for idx, ws_id in enumerate(discovered_workspace_ids, start=1):
+            ws_name = discovered_workspace_names.get(ws_id, "")
+            if ws_name:
+                click.echo(f"  {idx}. {ws_name} ({ws_id})")
+            else:
+                click.echo(f"  {idx}. {ws_id}")
+
+        for alias in ("cpu", "gpu", "internet"):
+            if alias in env_overrides:
+                continue
+
+            guess = _guess_workspace_alias(
+                alias, discovered_workspace_ids, discovered_workspace_names
+            )
+            default_idx = 1
+            for idx, ws_id in enumerate(discovered_workspace_ids, start=1):
+                if ws_id == (guess or workspace_id):
+                    default_idx = idx
+                    break
+
+            choice = click.prompt(
+                f"Workspace for '{alias}' alias",
+                type=int,
+                default=default_idx,
+                show_default=True,
+            )
+            if 1 <= choice <= len(discovered_workspace_ids):
+                merged_workspaces[alias] = discovered_workspace_ids[choice - 1]
+            else:
+                merged_workspaces.setdefault(alias, workspace_id)
+        return
+
+    for alias in ("cpu", "gpu", "internet"):
+        guess = _guess_workspace_alias(alias, discovered_workspace_ids, discovered_workspace_names)
+        merged_workspaces.setdefault(alias, guess or workspace_id)
+
+
+def _persist_workspace_aliases(
+    *,
+    global_data: dict[str, Any],
+    account_section: dict[str, Any],
+    config: Config,
+    session,  # noqa: ANN001
+    workspace_id: str,
+    force: bool,
+) -> None:
+    merged_workspaces = _get_existing_workspace_aliases(
+        global_data=global_data,
+        account_section=account_section,
+    )
+    env_overrides = _merge_workspace_aliases(
+        config=config,
+        merged_workspaces=merged_workspaces,
+        force=force,
+    )
+    discovered_workspace_ids, discovered_workspace_names = _discover_workspace_options(
+        session=session,
+        workspace_id=workspace_id,
+    )
+    _prompt_workspace_aliases(
+        force=force,
+        workspace_id=workspace_id,
+        merged_workspaces=merged_workspaces,
+        env_overrides=env_overrides,
+        discovered_workspace_ids=discovered_workspace_ids,
+        discovered_workspace_names=discovered_workspace_names,
+    )
+    global_data["workspaces"] = merged_workspaces
+    account_section.pop("workspaces", None)
+
+
+def _persist_api_base_url(
+    *,
+    global_data: dict[str, Any],
+    account_section: dict[str, Any],
+    config: Config,
+) -> None:
     base_url = (config.base_url or "").strip()
     if base_url and base_url != "https://api.example.com":
-        api_section = account_section.get("api")
+        api_section = global_data.get("api")
         if not isinstance(api_section, dict):
             api_section = {}
-            account_section["api"] = api_section
+            global_data["api"] = api_section
         api_section.setdefault("base_url", base_url)
+    account_section.pop("api", None)
 
+
+def _discover_docker_registry(
+    *,
+    global_data: dict[str, Any],
+    browser_api_module,  # noqa: ANN001
+    session,  # noqa: ANN001
+    workspace_id: str,
+) -> None:
+    """Auto-detect docker_registry from image URLs returned by the platform."""
+    api_section = global_data.get("api")
+    if isinstance(api_section, dict) and api_section.get("docker_registry"):
+        return  # already set
+
+    try:
+        images = browser_api_module.list_images(
+            workspace_id=workspace_id, source="SOURCE_OFFICIAL", session=session
+        )
+    except Exception:
+        return
+
+    for img in images:
+        url = str(getattr(img, "url", "") or "").strip()
+        if not url:
+            continue
+        # Image URLs look like "registry.host/path/image:tag" — extract hostname.
+        url = url.split("://", 1)[-1]  # strip scheme if present
+        host = url.split("/", 1)[0]
+        if host and "." in host:
+            if not isinstance(api_section, dict):
+                api_section = {}
+                global_data["api"] = api_section
+            api_section["docker_registry"] = host
+            return
+
+
+def _discover_compute_groups(
+    *,
+    browser_api_module,  # noqa: ANN001
+    session,  # noqa: ANN001
+    workspace_id: str,
+) -> list[dict[str, Any]]:
     compute_groups: list[dict[str, Any]] = []
     try:
         raw_groups = browser_api_module.list_compute_groups(
@@ -910,192 +1361,288 @@ def _init_discover_mode(
             if not location and "(" in name and name.endswith(")"):
                 location = name.rsplit("(", 1)[-1].rstrip(")").strip()
 
-            compute_groups.append(
-                {
-                    "name": name,
-                    "id": group_id,
-                    "gpu_type": str(gpu_types.get(group_id, "") or "").strip(),
-                    "location": location,
-                }
-            )
+            cg_entry: dict[str, Any] = {"name": name, "id": group_id}
+            gpu_type = str(gpu_types.get(group_id, "") or "").strip()
+            if gpu_type:
+                cg_entry["gpu_type"] = gpu_type
+            if location:
+                cg_entry["location"] = location
+            compute_groups.append(cg_entry)
     except Exception:
-        compute_groups = []
+        return []
+    return compute_groups
 
-    existing_compute_groups = account_section.get("compute_groups")
+
+def _correct_workspace_aliases(
+    merged_workspaces: dict[str, str],
+    compute_groups: list[dict[str, Any]],
+) -> None:
+    """Fix workspace aliases using actual compute-group GPU types.
+
+    The initial guess (``_guess_workspace_alias``) relies on workspace *names*
+    only.  After compute groups are discovered we know which workspaces actually
+    contain GPU resources and can correct mis-classifications — e.g. a workspace
+    named "高性能计算" that contains only CPU groups should not be the "gpu"
+    alias.
+    """
+
+    # Build workspace → set-of-gpu-types mapping.
+    ws_gpu_types: dict[str, set[str]] = {}
+    for cg in compute_groups:
+        gt = str(cg.get("gpu_type") or "").strip()
+        for ws_id in cg.get("workspace_ids") or []:
+            ws_gpu_types.setdefault(ws_id, set()).add(gt)
+
+    def _has_real_gpu(ws_id: str) -> bool:
+        return any(t and t != "CPU" for t in ws_gpu_types.get(ws_id, set()))
+
+    current_gpu_ws = merged_workspaces.get("gpu", "")
+    if current_gpu_ws and _has_real_gpu(current_gpu_ws):
+        return  # current assignment is fine
+
+    # Current gpu workspace has no real GPUs — find a better one.
+    best_ws: str | None = None
+    best_count = 0
+    for ws_id, types in ws_gpu_types.items():
+        real = sum(1 for t in types if t and t != "CPU")
+        if real > best_count:
+            best_ws = ws_id
+            best_count = real
+
+    if best_ws:
+        merged_workspaces["gpu"] = best_ws
+
+
+def _persist_compute_groups(
+    *,
+    global_data: dict[str, Any],
+    account_section: dict[str, Any],
+    compute_groups: list[dict[str, Any]],
+) -> None:
+    existing_compute_groups = global_data.get("compute_groups")
+    if not isinstance(existing_compute_groups, list):
+        existing_compute_groups = account_section.get("compute_groups")
     if not isinstance(existing_compute_groups, list):
         existing_compute_groups = []
     if compute_groups:
-        account_section["compute_groups"] = _merge_compute_groups(
+        global_data["compute_groups"] = _merge_compute_groups(
             existing_compute_groups, compute_groups
         )
+    account_section.pop("compute_groups", None)
 
-    if probe_shared_path:
-        click.echo()
-        click.echo(click.style("Probing shared filesystem paths...", bold=True))
 
-        try:
-            ssh_public_key = _load_ssh_public_key(probe_pubkey)
-        except ValueError as e:
-            click.echo(click.style(str(e), fg="red"))
-            raise SystemExit(1) from e
+def _resolve_probe_defaults(
+    *,
+    config: Config,
+    merged_workspaces: dict[str, str],
+    workspace_id: str,
+    browser_api_module,  # noqa: ANN001
+    session,  # noqa: ANN001
+    probe_pubkey: str | None,
+) -> _ProbeDefaults:
+    try:
+        ssh_public_key = _load_ssh_public_key(probe_pubkey)
+    except ValueError as e:
+        click.echo(click.style(str(e), fg="red"))
+        raise SystemExit(1) from e
 
-        try:
-            from inspire.config.ssh_runtime import resolve_ssh_runtime_config
+    try:
+        from inspire.config.ssh_runtime import resolve_ssh_runtime_config
 
-            ssh_runtime = resolve_ssh_runtime_config()
-        except Exception as e:
-            click.echo(click.style(f"Failed to resolve SSH runtime config: {e}", fg="red"))
-            raise SystemExit(1) from e
+        ssh_runtime = resolve_ssh_runtime_config()
+    except Exception as e:
+        click.echo(click.style(f"Failed to resolve SSH runtime config: {e}", fg="red"))
+        raise SystemExit(1) from e
 
-        probe_workspace_id = str(
-            getattr(config, "workspace_cpu_id", "") or merged_workspaces.get("cpu") or workspace_id
-        ).strip()
-        if not probe_workspace_id:
-            probe_workspace_id = workspace_id
+    probe_workspace_id = str(
+        getattr(config, "workspace_cpu_id", "") or merged_workspaces.get("cpu") or workspace_id
+    ).strip()
+    if not probe_workspace_id:
+        probe_workspace_id = workspace_id
 
-        try:
-            notebook_groups = browser_api_module.list_notebook_compute_groups(
-                workspace_id=probe_workspace_id,
-                session=session,
-            )
-            logic_compute_group_id = _select_probe_cpu_compute_group_id(notebook_groups)
-            if not logic_compute_group_id:
-                raise ValueError("No CPU compute group found")
+    try:
+        notebook_groups = browser_api_module.list_notebook_compute_groups(
+            workspace_id=probe_workspace_id,
+            session=session,
+        )
+        logic_compute_group_id = _select_probe_cpu_compute_group_id(notebook_groups)
+        if not logic_compute_group_id:
+            raise ValueError("No CPU compute group found")
 
-            schedule = browser_api_module.get_notebook_schedule(
-                workspace_id=probe_workspace_id,
-                session=session,
-            )
-            quota_id, cpu_count, memory_size = _select_probe_cpu_quota(schedule)
+        schedule = browser_api_module.get_notebook_schedule(
+            workspace_id=probe_workspace_id,
+            session=session,
+        )
+        quota_id, cpu_count, memory_size = _select_probe_cpu_quota(schedule)
 
-            images = browser_api_module.list_images(
-                workspace_id=probe_workspace_id,
-                session=session,
-            )
-            selected_image = _select_probe_image(images)
-            if not selected_image:
-                raise ValueError("No images available")
-        except Exception as e:
-            click.echo(click.style(f"Failed to resolve probe defaults: {e}", fg="red"))
-            raise SystemExit(1) from e
+        images = browser_api_module.list_images(
+            workspace_id=probe_workspace_id,
+            session=session,
+        )
+        selected_image = _select_probe_image(images)
+        if not selected_image:
+            raise ValueError("No images available")
+    except Exception as e:
+        click.echo(click.style(f"Failed to resolve probe defaults: {e}", fg="red"))
+        raise SystemExit(1) from e
 
-        shm_size = int(config.shm_size) if config.shm_size is not None else 32
-        task_priority = int(config.job_priority) if config.job_priority is not None else 6
-        task_priority = max(1, min(9, task_priority))
+    shm_size = int(config.shm_size) if config.shm_size is not None else 32
+    task_priority = int(config.job_priority) if config.job_priority is not None else 6
+    task_priority = max(1, min(9, task_priority))
 
-        to_probe: list[object] = []
-        for project in projects:
-            entry = project_catalog.get(project.project_id)
-            shared = (
-                str((entry or {}).get("shared_path_group") or "").strip()
-                if isinstance(entry, dict)
-                else ""
-            )
-            error = (
-                str((entry or {}).get("probe_error") or "").strip()
-                if isinstance(entry, dict)
-                else ""
-            )
-            if not force and shared and not error:
-                continue
-            to_probe.append(project)
-
-        if probe_limit:
-            to_probe = to_probe[:probe_limit]
-
-        if not to_probe:
-            click.echo("No projects require probing.")
-        else:
-            global_path.parent.mkdir(parents=True, exist_ok=True)
-
-            for idx, project in enumerate(to_probe, start=1):
-                project_id = str(getattr(project, "project_id", "") or "").strip()
-                project_name = str(getattr(project, "name", "") or "").strip()
-                project_alias = str(
-                    alias_for_id.get(project_id) or _slugify_alias(project_name) or project_id
-                )
-
-                click.echo(f"[{idx}/{len(to_probe)}] {project_name} ({project_alias})")
-
-                probe_result = _probe_project_shared_path_group(
-                    browser_api_module=browser_api_module,
-                    session=session,
-                    workspace_id=probe_workspace_id,
-                    account_key=account_key,
-                    project_id=project_id,
-                    project_name=project_name,
-                    project_alias=project_alias,
-                    ssh_public_key=ssh_public_key,
-                    ssh_runtime=ssh_runtime,
-                    logic_compute_group_id=logic_compute_group_id,
-                    quota_id=quota_id,
-                    cpu_count=cpu_count,
-                    memory_size=memory_size,
-                    image_id=str(getattr(selected_image, "image_id", "") or ""),
-                    image_url=str(getattr(selected_image, "url", "") or ""),
-                    shm_size=shm_size,
-                    task_priority=task_priority,
-                    keep_notebook=probe_keep_notebooks,
-                    timeout=probe_timeout,
-                )
-
-                entry = project_catalog.get(project_id)
-                if not isinstance(entry, dict):
-                    entry = {"id": project_id}
-                    project_catalog[project_id] = entry
-
-                entry["probed_at"] = _utc_now_iso()
-                if probe_result.get("notebook_id"):
-                    entry["probe_notebook_id"] = probe_result["notebook_id"]
-
-                shared_path_group = str(probe_result.get("shared_path_group") or "").strip()
-                if shared_path_group:
-                    entry["shared_path_group"] = shared_path_group
-                    entry.pop("probe_error", None)
-                else:
-                    probe_error = str(probe_result.get("probe_error") or "").strip()
-                    if probe_error:
-                        entry["probe_error"] = probe_error
-
-                global_path.write_text(_toml_dumps(global_data))
-
-    global_path.parent.mkdir(parents=True, exist_ok=True)
-    global_path.write_text(_toml_dumps(global_data))
-
-    selected_alias = alias_for_id.get(selected_project.project_id)
-    if not selected_alias:
-        selected_alias = _slugify_alias(selected_project.name) or "default"
-
-    project_data: dict[str, Any] = {}
-    if project_path.exists():
-        project_data = Config._load_toml(project_path)
-
-    auth_section = project_data.get("auth")
-    if not isinstance(auth_section, dict):
-        auth_section = {}
-        project_data["auth"] = auth_section
-    auth_section["username"] = account_key
-
-    context = project_data.get("context")
-    if not isinstance(context, dict):
-        context = {}
-        project_data["context"] = context
-
-    context.update(
-        {
-            "account": account_key,
-            "project": selected_alias,
-            "workspace_cpu": "cpu",
-            "workspace_gpu": "gpu",
-            "workspace_internet": "internet",
-        }
+    return _ProbeDefaults(
+        ssh_runtime=ssh_runtime,
+        ssh_public_key=ssh_public_key,
+        probe_workspace_id=probe_workspace_id,
+        logic_compute_group_id=logic_compute_group_id,
+        quota_id=quota_id,
+        cpu_count=cpu_count,
+        memory_size=memory_size,
+        selected_image=selected_image,
+        task_priority=task_priority,
+        shm_size=shm_size,
     )
 
-    defaults = project_data.get("defaults")
-    if not isinstance(defaults, dict):
-        defaults = {}
-        project_data["defaults"] = defaults
 
+def _build_probe_project_list(
+    *,
+    projects: list[object],
+    project_catalog: dict[str, dict[str, Any]],
+    force: bool,
+    probe_limit: int,
+) -> list[object]:
+    to_probe: list[object] = []
+    for project in projects:
+        entry = project_catalog.get(project.project_id) or {}
+        shared = str(entry.get("shared_path_group") or "").strip()
+        error = str(entry.get("probe_error") or "").strip()
+        if not force and shared and not error:
+            continue
+        to_probe.append(project)
+    if probe_limit:
+        to_probe = to_probe[:probe_limit]
+    return to_probe
+
+
+def _apply_probe_result(
+    *,
+    entry: dict[str, Any],
+    probe_result: dict[str, Any],
+) -> None:
+    entry["probed_at"] = _utc_now_iso()
+    if probe_result.get("notebook_id"):
+        entry["probe_notebook_id"] = probe_result["notebook_id"]
+
+    shared_path_group = str(probe_result.get("shared_path_group") or "").strip()
+    if shared_path_group:
+        entry["shared_path_group"] = shared_path_group
+        entry.pop("probe_error", None)
+        return
+
+    probe_error = str(probe_result.get("probe_error") or "").strip()
+    if probe_error:
+        entry["probe_error"] = probe_error
+
+
+def _run_shared_path_probe(
+    *,
+    browser_api_module,  # noqa: ANN001
+    session,  # noqa: ANN001
+    account_key: str,
+    projects: list[object],
+    project_catalog: dict[str, dict[str, Any]],
+    alias_for_id: dict[str, str],
+    force: bool,
+    probe_limit: int,
+    probe_keep_notebooks: bool,
+    probe_timeout: int,
+    probe_defaults: _ProbeDefaults,
+) -> None:
+    to_probe = _build_probe_project_list(
+        projects=projects,
+        project_catalog=project_catalog,
+        force=force,
+        probe_limit=probe_limit,
+    )
+    if not to_probe:
+        click.echo("No projects require probing.")
+        return
+
+    for idx, project in enumerate(to_probe, start=1):
+        project_id = str(getattr(project, "project_id", "") or "").strip()
+        project_name = str(getattr(project, "name", "") or "").strip()
+        project_alias = str(
+            alias_for_id.get(project_id) or _slugify_alias(project_name) or project_id
+        )
+        click.echo(f"[{idx}/{len(to_probe)}] {project_name} ({project_alias})")
+
+        probe_result = _probe_project_shared_path_group(
+            browser_api_module=browser_api_module,
+            session=session,
+            workspace_id=probe_defaults.probe_workspace_id,
+            account_key=account_key,
+            project_id=project_id,
+            project_name=project_name,
+            project_alias=project_alias,
+            ssh_public_key=probe_defaults.ssh_public_key,
+            ssh_runtime=probe_defaults.ssh_runtime,
+            logic_compute_group_id=probe_defaults.logic_compute_group_id,
+            quota_id=probe_defaults.quota_id,
+            cpu_count=probe_defaults.cpu_count,
+            memory_size=probe_defaults.memory_size,
+            image_id=str(getattr(probe_defaults.selected_image, "image_id", "") or ""),
+            image_url=str(getattr(probe_defaults.selected_image, "url", "") or ""),
+            shm_size=probe_defaults.shm_size,
+            task_priority=probe_defaults.task_priority,
+            keep_notebook=probe_keep_notebooks,
+            timeout=probe_timeout,
+        )
+
+        entry = project_catalog.setdefault(project_id, {"id": project_id})
+        _apply_probe_result(entry=entry, probe_result=probe_result)
+
+
+def _drop_catalog_runtime_fields(project_catalog: dict[str, dict[str, Any]]) -> None:
+    for entry in project_catalog.values():
+        for field in _CATALOG_DROP_FIELDS:
+            entry.pop(field, None)
+
+
+def _persist_prompted_credentials(
+    *,
+    global_data: dict[str, Any],
+    account_section: dict[str, Any],
+    prompted_credentials: tuple[str, str, str] | None,
+) -> None:
+    if not prompted_credentials:
+        return
+    _, prompted_password, prompted_base_url = prompted_credentials
+    account_section["password"] = prompted_password
+    api = global_data.get("api")
+    if not isinstance(api, dict):
+        api = {}
+        global_data["api"] = api
+    api["base_url"] = prompted_base_url
+
+
+def _get_or_create_dict_table(
+    *,
+    container: dict[str, Any],
+    key: str,
+) -> dict[str, Any]:
+    section = container.get(key)
+    if isinstance(section, dict):
+        return section
+    section = {}
+    container[key] = section
+    return section
+
+
+def _populate_project_defaults_from_config(
+    *,
+    defaults: dict[str, Any],
+    config: Config,
+) -> None:
     if config.target_dir:
         defaults.setdefault("target_dir", config.target_dir)
     if config.log_pattern:
@@ -1111,22 +1658,323 @@ def _init_discover_mode(
     if config.shm_size is not None:
         defaults.setdefault("shm_size", int(config.shm_size))
 
+
+def _prompt_target_dir(
+    *,
+    force: bool,
+    cli_target_dir: str | None,
+    selected_project: object,
+    project_catalog: dict[str, dict[str, Any]],
+) -> str | None:
+    """Prompt for target_dir, using the catalog workdir as suggestion."""
+    project_id = str(getattr(selected_project, "project_id", "") or "").strip()
+    entry = project_catalog.get(project_id, {})
+    catalog_workdir = str(entry.get("workdir") or "").strip()
+
+    if force:
+        return cli_target_dir or catalog_workdir or None
+
+    default = cli_target_dir or catalog_workdir or ""
+    if default:
+        result = click.prompt(
+            "Target directory on shared filesystem",
+            default=default,
+            show_default=True,
+        )
+    else:
+        result = click.prompt(
+            "Target directory on shared filesystem (e.g. /inspire/...)",
+            default="",
+            show_default=False,
+        )
+    return result.strip() or None
+
+
+def _write_discovered_project_config(
+    *,
+    project_path: Path,
+    config: Config,
+    account_key: str,
+    selected_alias: str,
+    target_dir: str | None = None,
+) -> None:
+    project_data: dict[str, Any] = {}
+    if project_path.exists():
+        project_data = Config._load_toml(project_path)
+
+    auth_section = _get_or_create_dict_table(container=project_data, key="auth")
+    auth_section["username"] = account_key
+
+    context = _get_or_create_dict_table(container=project_data, key="context")
+    context.update(
+        {
+            "account": account_key,
+            "project": selected_alias,
+            "workspace_cpu": "cpu",
+            "workspace_gpu": "gpu",
+            "workspace_internet": "internet",
+        }
+    )
+
+    defaults = _get_or_create_dict_table(container=project_data, key="defaults")
+    _populate_project_defaults_from_config(defaults=defaults, config=config)
+    if target_dir:
+        defaults["target_dir"] = target_dir
+
     project_path.parent.mkdir(parents=True, exist_ok=True)
     project_path.write_text(_toml_dumps(project_data))
+
+
+def _print_discover_completion(
+    *,
+    global_path: Path,
+    project_path: Path,
+    prompted_credentials: tuple[str, str, str] | None,
+) -> None:
+    click.echo()
+    click.echo(click.style("Wrote configuration:", bold=True))
+    click.echo(f"  - {global_path}")
+    click.echo(f"  - {project_path}")
+    click.echo()
+    if prompted_credentials:
+        click.echo("Note: prompted account password was stored in global config for this account.")
+        click.echo(f"  Location: {global_path}")
+        click.echo()
+        click.echo("Ready to use:")
+        click.echo("  inspire config show     # Verify configuration")
+        click.echo("  inspire resources list  # View available GPUs")
+        click.echo("  inspire notebook list   # List notebooks")
+        return
+    click.echo("Next steps:")
+    click.echo("  Run: inspire config show")
+
+
+def _persist_discovery_catalog(request: _DiscoveryPersistRequest) -> None:
+    force = request.force
+    config = request.config
+    browser_api_module = request.browser_api_module
+    session = request.session
+    account_key = request.account_key
+    workspace_id = request.workspace_id
+    projects = request.projects
+    selected_project = request.selected_project
+    probe_shared_path = request.probe_shared_path
+    probe_limit = request.probe_limit
+    probe_keep_notebooks = request.probe_keep_notebooks
+    probe_pubkey = request.probe_pubkey
+    probe_timeout = request.probe_timeout
+    prompted_credentials = request.prompted_credentials
+    cli_target_dir = request.cli_target_dir
+
+    global_path = Config.GLOBAL_CONFIG_PATH
+    project_path = Path.cwd() / PROJECT_CONFIG_DIR / CONFIG_FILENAME
+    if not _confirm_discovery_writes(
+        force=force, global_path=global_path, project_path=project_path
+    ):
+        return
+
+    global_data, account_section = _load_discovery_global_state(
+        global_path=global_path,
+        account_key=account_key,
+    )
+    alias_for_id, project_catalog = _resolve_project_catalog_aliases(
+        account_section=account_section,
+        projects=projects,
+    )
+    _populate_project_catalog(
+        project_catalog=project_catalog,
+        projects=projects,
+        browser_api_module=browser_api_module,
+        session=session,
+        workspace_id=workspace_id,
+        account_key=account_key,
+        force=force,
+    )
+    _update_account_shared_path_group(
+        account_section=account_section,
+        project_catalog=project_catalog,
+        force=force,
+    )
+    _print_shared_path_group_summary(
+        projects=projects,
+        project_catalog=project_catalog,
+        alias_for_id=alias_for_id,
+    )
+
+    _persist_workspace_aliases(
+        global_data=global_data,
+        account_section=account_section,
+        config=config,
+        session=session,
+        workspace_id=workspace_id,
+        force=force,
+    )
+    merged_workspaces = global_data.get("workspaces")
+    if not isinstance(merged_workspaces, dict):
+        merged_workspaces = {}
+
+    _persist_api_base_url(
+        global_data=global_data,
+        account_section=account_section,
+        config=config,
+    )
+    _discover_docker_registry(
+        global_data=global_data,
+        browser_api_module=browser_api_module,
+        session=session,
+        workspace_id=workspace_id,
+    )
+    all_ws_ids: set[str] = {workspace_id}
+    for ws_id in list(session.all_workspace_ids or []):
+        ws_str = str(ws_id or "").strip()
+        if ws_str:
+            all_ws_ids.add(ws_str)
+    for ws_id in merged_workspaces.values():
+        ws_str = str(ws_id or "").strip()
+        if ws_str:
+            all_ws_ids.add(ws_str)
+
+    compute_groups: list[dict[str, Any]] = []
+    for ws_id in sorted(all_ws_ids):
+        for cg in _discover_compute_groups(
+            browser_api_module=browser_api_module,
+            session=session,
+            workspace_id=ws_id,
+        ):
+            cg.setdefault("workspace_ids", [])
+            if ws_id not in cg["workspace_ids"]:
+                cg["workspace_ids"].append(ws_id)
+            compute_groups.append(cg)
+    _correct_workspace_aliases(merged_workspaces, compute_groups)
+    _persist_compute_groups(
+        global_data=global_data,
+        account_section=account_section,
+        compute_groups=compute_groups,
+    )
+
+    if probe_shared_path:
+        click.echo()
+        click.echo(click.style("Probing shared filesystem paths...", bold=True))
+        probe_defaults = _resolve_probe_defaults(
+            config=config,
+            merged_workspaces=merged_workspaces,
+            workspace_id=workspace_id,
+            browser_api_module=browser_api_module,
+            session=session,
+            probe_pubkey=probe_pubkey,
+        )
+        _run_shared_path_probe(
+            browser_api_module=browser_api_module,
+            session=session,
+            account_key=account_key,
+            projects=projects,
+            project_catalog=project_catalog,
+            alias_for_id=alias_for_id,
+            force=force,
+            probe_limit=probe_limit,
+            probe_keep_notebooks=probe_keep_notebooks,
+            probe_timeout=probe_timeout,
+            probe_defaults=probe_defaults,
+        )
+
+    _drop_catalog_runtime_fields(project_catalog)
+    _persist_prompted_credentials(
+        global_data=global_data,
+        account_section=account_section,
+        prompted_credentials=prompted_credentials,
+    )
+
+    global_path.parent.mkdir(parents=True, exist_ok=True)
+    global_path.write_text(_toml_dumps(global_data))
+    if prompted_credentials:
+        try:
+            global_path.chmod(0o600)
+        except OSError:
+            pass
+
+    selected_alias = alias_for_id.get(selected_project.project_id)
+    if not selected_alias:
+        selected_alias = _slugify_alias(selected_project.name) or "default"
+    target_dir = _prompt_target_dir(
+        force=force,
+        cli_target_dir=cli_target_dir,
+        selected_project=selected_project,
+        project_catalog=project_catalog,
+    )
+    _write_discovered_project_config(
+        project_path=project_path,
+        config=config,
+        account_key=account_key,
+        selected_alias=selected_alias,
+        target_dir=target_dir,
+    )
 
     resolved, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
     if not str(getattr(resolved, "job_project_id", "") or "").startswith("project-"):
         click.echo(click.style("Wrote config, but could not resolve a project_id", fg="red"))
         raise SystemExit(1)
 
-    click.echo()
-    click.echo(click.style("Wrote configuration:", bold=True))
-    click.echo(f"  - {global_path}")
-    click.echo(f"  - {project_path}")
-    click.echo()
-    click.echo("Next steps:")
-    click.echo(
-        "  1. Ensure a password is available via INSPIRE_PASSWORD or global "
-        '[accounts."<username>"].password'
+    _ensure_ssh_key()
+    _print_discover_completion(
+        global_path=global_path,
+        project_path=project_path,
+        prompted_credentials=prompted_credentials,
     )
-    click.echo("  2. Run: inspire config show")
+
+
+def _init_discover_mode(
+    force: bool,
+    *,
+    probe_shared_path: bool,
+    probe_limit: int,
+    probe_keep_notebooks: bool,
+    probe_pubkey: str | None,
+    probe_timeout: int,
+    cli_username: str | None = None,
+    cli_base_url: str | None = None,
+    cli_target_dir: str | None = None,
+) -> None:
+    """Initialize per-account catalogs by discovering projects and compute groups."""
+    from inspire.platform.web import browser_api as browser_api_module
+    from inspire.platform.web import session as web_session_module
+    from inspire.platform.web.session import DEFAULT_WORKSPACE_ID
+
+    config, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
+    session, prompted_credentials, account_key, workspace_id = _resolve_discover_runtime(
+        config=config,
+        web_session_module=web_session_module,
+        default_workspace_id=DEFAULT_WORKSPACE_ID,
+        cli_username=cli_username,
+        cli_base_url=cli_base_url,
+    )
+
+    click.echo(click.style("Discovering account catalog...", bold=True))
+    click.echo(f"Account: {account_key}")
+    click.echo(f"Workspace: {workspace_id}")
+    projects, selected_project = _load_projects_for_discovery(
+        browser_api_module=browser_api_module,
+        session=session,
+        workspace_id=workspace_id,
+        force=force,
+        probe_shared_path=probe_shared_path,
+        probe_limit=probe_limit,
+    )
+    _persist_discovery_catalog(
+        _DiscoveryPersistRequest(
+            force=force,
+            config=config,
+            browser_api_module=browser_api_module,
+            session=session,
+            account_key=account_key,
+            workspace_id=workspace_id,
+            projects=projects,
+            selected_project=selected_project,
+            probe_shared_path=probe_shared_path,
+            probe_limit=probe_limit,
+            probe_keep_notebooks=probe_keep_notebooks,
+            probe_pubkey=probe_pubkey,
+            probe_timeout=probe_timeout,
+            prompted_credentials=prompted_credentials,
+            cli_target_dir=cli_target_dir,
+        )
+    )

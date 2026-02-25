@@ -13,6 +13,7 @@ def _project(
     project_id: str,
     name: str,
     *,
+    gpu_limit: bool = False,
     member_gpu_limit: bool = False,
     member_remain_gpu_hours: float = 0.0,
     priority_name: str = "0",
@@ -21,6 +22,7 @@ def _project(
         project_id=project_id,
         name=name,
         workspace_id="ws-test",
+        gpu_limit=gpu_limit,
         member_gpu_limit=member_gpu_limit,
         member_remain_gpu_hours=member_remain_gpu_hours,
         priority_name=priority_name,
@@ -28,15 +30,16 @@ def _project(
 
 
 # ---------------------------------------------------------------------------
-# has_quota() — platform does NOT enforce cumulative GPU-hours
+# has_quota() — always True (scheduler enforces limits, not the CLI)
 # ---------------------------------------------------------------------------
 
 
-def test_has_quota_always_true_even_with_negative_hours() -> None:
-    """Negative member_remain_gpu_hours should NOT make a project over-quota."""
+def test_has_quota_always_true_even_with_gpu_limit() -> None:
+    """has_quota() returns True regardless of gpu_limit — CLI doesn't filter."""
     proj = _project(
         "p1",
         "Test",
+        gpu_limit=True,
         member_gpu_limit=True,
         member_remain_gpu_hours=-9520985.6,
         priority_name="10",
@@ -60,12 +63,12 @@ def test_has_quota_true_for_cpu_only() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auto-selection (no --project): priority-first ordering
+# Auto-selection (no --project): project_order first, then gpu_unlimited, then priority
 # ---------------------------------------------------------------------------
 
 
-def test_auto_select_prefers_high_priority_over_low_with_more_hours() -> None:
-    """HIGH-priority project should win over LOW with vastly more hours."""
+def test_auto_select_prefers_high_priority_among_unlimited() -> None:
+    """Among unlimited projects, higher priority wins."""
     high_negative = _project(
         "p-high",
         "CI-高优先级",
@@ -94,25 +97,23 @@ def test_auto_select_prefers_high_priority_over_low_with_more_hours() -> None:
     assert message is None
 
 
-def test_auto_select_breaks_tie_by_gpu_hours() -> None:
-    """Same priority → prefer more remaining GPU-hours."""
-    a = _project(
-        "p-a",
-        "Project A",
-        member_gpu_limit=True,
-        member_remain_gpu_hours=100.0,
+def test_auto_select_prefers_unlimited_over_capped() -> None:
+    """gpu_limit=False (unlimited) should be preferred over gpu_limit=True (capped)."""
+    capped = _project(
+        "p-capped",
+        "Capped Project",
+        gpu_limit=True,
         priority_name="10",
     )
-    b = _project(
-        "p-b",
-        "Project B",
-        member_gpu_limit=True,
-        member_remain_gpu_hours=500.0,
-        priority_name="10",
+    unlimited = _project(
+        "p-unlimited",
+        "Unlimited Project",
+        gpu_limit=False,
+        priority_name="4",  # lower priority, but unlimited wins
     )
 
-    selected, _ = select_project([a, b])
-    assert selected.project_id == "p-b"
+    selected, _ = select_project([capped, unlimited])
+    assert selected.project_id == "p-unlimited"
 
 
 def test_auto_select_breaks_tie_by_name() -> None:
@@ -277,6 +278,19 @@ def test_project_order_overrides_priority() -> None:
     assert selected.project_id == "p-low"
 
 
+def test_project_order_cpu_mode_ignores_gpu_limit_preference() -> None:
+    """In CPU mode, project_order should not be overridden by gpu_limit preference."""
+    capped = _project("p-capped", "Capped", gpu_limit=True, priority_name="1")
+    unlimited = _project("p-unlimited", "Unlimited", gpu_limit=False, priority_name="10")
+
+    selected, _ = select_project(
+        [capped, unlimited],
+        needs_gpu_quota=False,
+        project_order=["Capped", "Unlimited"],
+    )
+    assert selected.project_id == "p-capped"
+
+
 def test_project_order_by_project_id() -> None:
     """project_order can match by project_id."""
     a = _project("p-aaa", "Alpha", priority_name="10")
@@ -302,6 +316,27 @@ def test_project_order_unlisted_projects_fall_through() -> None:
 
     selected, _ = select_project([unlisted_high, listed], project_order=["Listed"])
     assert selected.project_id == "p-listed"
+
+
+def test_project_order_overrides_gpu_unlimited() -> None:
+    """User-defined project_order should take priority over gpu_unlimited.
+
+    Real scenario: CI has unlimited GPU hours but limited concurrent GPUs.
+    User prefers CQ (capped) over CI (unlimited) — project_order must win.
+    """
+    capped = _project("p-capped", "CQ", gpu_limit=True, priority_name="6")
+    unlimited = _project("p-unlimited", "CI", gpu_limit=False, priority_name="6")
+
+    # Without project_order: unlimited wins (tiebreaker)
+    selected, _ = select_project([capped, unlimited])
+    assert selected.project_id == "p-unlimited"
+
+    # With project_order: capped wins because user listed it first
+    selected, _ = select_project(
+        [capped, unlimited],
+        project_order=["CQ", "CI"],
+    )
+    assert selected.project_id == "p-capped"
 
 
 def test_project_order_empty_list_uses_default_sort() -> None:

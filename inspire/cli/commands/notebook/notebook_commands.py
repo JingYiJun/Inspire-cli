@@ -30,6 +30,9 @@ from inspire.cli.utils.notebook_cli import (
     resolve_json_output,
 )
 from inspire.cli.utils.tunnel_reconnect import (
+    NotebookBridgeReconnectState,
+    NotebookBridgeReconnectStatus,
+    attempt_notebook_bridge_rebuild,
     load_ssh_public_key_material,
     rebuild_notebook_bridge_profile,
     retry_pause_seconds,
@@ -263,16 +266,18 @@ def _list_notebooks_for_workspace(
     workspace_id: str,
     user_ids: list[str],
     keyword: str = "",
+    page_size: int = 20,
+    status: list[str] | None = None,
 ) -> list[dict]:
     body = {
         "workspace_id": workspace_id,
         "page": 1,
-        "page_size": 100,
+        "page_size": page_size,
         "filter_by": {
             "keyword": keyword,
             "user_id": user_ids,
             "logic_compute_group_id": [],
-            "status": [],
+            "status": status or [],
             "mirror_url": [],
         },
         "order_by": [{"field": "created_at", "order": "desc"}],
@@ -296,6 +301,80 @@ def _list_notebooks_for_workspace(
     return [item for item in items if isinstance(item, dict)]
 
 
+def _collect_workspace_ids_for_lookup(session: web_session_module.WebSession, config) -> list[str]:
+    candidates: list[str] = []
+    for ws_id in (
+        getattr(config, "workspace_cpu_id", None),
+        getattr(config, "workspace_gpu_id", None),
+        getattr(config, "workspace_internet_id", None),
+        getattr(config, "job_workspace_id", None),
+    ):
+        if ws_id:
+            candidates.append(str(ws_id))
+
+    workspaces_map = getattr(config, "workspaces", None)
+    if isinstance(workspaces_map, dict):
+        candidates.extend(str(value) for value in workspaces_map.values() if value)
+    if getattr(session, "workspace_id", None):
+        candidates.append(str(session.workspace_id))
+
+    workspace_ids = _unique_workspace_ids(candidates)
+    if workspace_ids:
+        return workspace_ids
+
+    resolved_ws = None
+    try:
+        resolved_ws = select_workspace_id(config)
+    except Exception:
+        resolved_ws = None
+
+    resolved_ws = resolved_ws or getattr(session, "workspace_id", None)
+    if resolved_ws and resolved_ws != _ZERO_WORKSPACE_ID:
+        return [str(resolved_ws)]
+    return []
+
+
+def _resolve_partial_notebook_id(
+    ctx: Context,
+    *,
+    session: web_session_module.WebSession,
+    config,
+    base_url: str,
+    partial: str,
+    json_output: bool,
+) -> str | None:
+    workspace_ids = _collect_workspace_ids_for_lookup(session, config)
+    if not workspace_ids:
+        return None
+
+    user_ids = _try_get_current_user_ids(session, base_url=base_url)
+    nb_matches: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    for ws_id in workspace_ids:
+        try:
+            items = _list_notebooks_for_workspace(
+                session,
+                base_url=base_url,
+                workspace_id=ws_id,
+                user_ids=user_ids,
+            )
+        except Exception:
+            continue
+        for item in items:
+            nid = _notebook_id_from_item(item)
+            if not nid or nid in seen_ids:
+                continue
+            seen_ids.add(nid)
+            uuid_part = nid[9:] if nid.lower().startswith("notebook-") else nid
+            if uuid_part.lower().startswith(partial):
+                label = item.get("name") or item.get("status") or ""
+                nb_matches.append((nid, label))
+
+    if not nb_matches:
+        return None
+    return resolve_partial_id(ctx, partial, "notebook", nb_matches, json_output)
+
+
 def _resolve_notebook_id(
     ctx: Context,
     *,
@@ -317,95 +396,20 @@ def _resolve_notebook_id(
     if _looks_like_notebook_id(identifier):
         return identifier, None
 
-    # Partial hex UUID (4+ hex chars that aren't a full UUID)
     if is_partial_id(identifier, prefix="notebook-"):
         partial = normalize_partial(identifier, prefix="notebook-")
-        # Gather workspace IDs for listing
-        candidates: list[str] = []
-        for ws_id in (
-            getattr(config, "workspace_cpu_id", None),
-            getattr(config, "workspace_gpu_id", None),
-            getattr(config, "workspace_internet_id", None),
-            getattr(config, "job_workspace_id", None),
-        ):
-            if ws_id:
-                candidates.append(str(ws_id))
-        workspaces_map = getattr(config, "workspaces", None)
-        if isinstance(workspaces_map, dict):
-            candidates.extend(str(v) for v in workspaces_map.values() if v)
-        if getattr(session, "workspace_id", None):
-            candidates.append(str(session.workspace_id))
+        resolved_partial = _resolve_partial_notebook_id(
+            ctx,
+            session=session,
+            config=config,
+            base_url=base_url,
+            partial=partial,
+            json_output=json_output,
+        )
+        if resolved_partial:
+            return resolved_partial, None
 
-        workspace_ids = _unique_workspace_ids(candidates)
-        if not workspace_ids:
-            resolved_ws = None
-            try:
-                resolved_ws = select_workspace_id(config)
-            except Exception:
-                pass
-            resolved_ws = resolved_ws or getattr(session, "workspace_id", None)
-            if resolved_ws and resolved_ws != _ZERO_WORKSPACE_ID:
-                workspace_ids = [str(resolved_ws)]
-
-        if workspace_ids:
-            user_ids = _try_get_current_user_ids(session, base_url=base_url)
-            nb_matches: list[tuple[str, str]] = []
-            seen_ids: set[str] = set()
-            for ws_id in workspace_ids:
-                try:
-                    items = _list_notebooks_for_workspace(
-                        session,
-                        base_url=base_url,
-                        workspace_id=ws_id,
-                        user_ids=user_ids,
-                    )
-                except Exception:
-                    continue
-                for item in items:
-                    nid = _notebook_id_from_item(item)
-                    if not nid or nid in seen_ids:
-                        continue
-                    seen_ids.add(nid)
-                    uuid_part = nid
-                    if nid.lower().startswith("notebook-"):
-                        uuid_part = nid[9:]
-                    if uuid_part.lower().startswith(partial):
-                        label = item.get("name") or item.get("status") or ""
-                        nb_matches.append((nid, label))
-
-            if nb_matches:
-                resolved_id = resolve_partial_id(ctx, partial, "notebook", nb_matches, json_output)
-                return resolved_id, None
-
-        # No matches found — fall through to name resolution below
-
-    candidates: list[str] = []
-    for ws_id in (
-        getattr(config, "workspace_cpu_id", None),
-        getattr(config, "workspace_gpu_id", None),
-        getattr(config, "workspace_internet_id", None),
-        getattr(config, "job_workspace_id", None),
-    ):
-        if ws_id:
-            candidates.append(str(ws_id))
-    workspaces_map = getattr(config, "workspaces", None)
-    if isinstance(workspaces_map, dict):
-        candidates.extend(str(v) for v in workspaces_map.values() if v)
-    if getattr(session, "workspace_id", None):
-        candidates.append(str(session.workspace_id))
-
-    workspace_ids = _unique_workspace_ids(candidates)
-    if not workspace_ids:
-        resolved = None
-        try:
-            resolved = select_workspace_id(config)
-        except Exception:
-            resolved = None
-
-        resolved = resolved or getattr(session, "workspace_id", None)
-        resolved = None if resolved == _ZERO_WORKSPACE_ID else resolved
-        if resolved:
-            workspace_ids = [str(resolved)]
+    workspace_ids = _collect_workspace_ids_for_lookup(session, config)
 
     if not workspace_ids:
         _handle_error(
@@ -989,6 +993,26 @@ def _print_notebook_detail(notebook: dict) -> None:
     help="List notebooks across all configured workspaces (cpu/gpu/internet)",
 )
 @click.option(
+    "--limit",
+    "-n",
+    type=int,
+    default=20,
+    show_default=True,
+    help="Max number of notebooks to show",
+)
+@click.option(
+    "--status",
+    "-s",
+    multiple=True,
+    help="Filter by status (e.g. RUNNING, STOPPED). Repeatable.",
+)
+@click.option(
+    "--name",
+    "keyword",
+    default="",
+    help="Filter by notebook name (keyword search)",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1001,6 +1025,9 @@ def list_notebooks(
     workspace_id: Optional[str],
     show_all: bool,
     all_workspaces: bool,
+    limit: int,
+    status: tuple[str, ...],
+    keyword: str,
     json_output: bool,
 ) -> None:
     """List notebook/interactive instances.
@@ -1009,8 +1036,11 @@ def list_notebooks(
     Examples:
         inspire notebook list
         inspire notebook list --all
-        inspire notebook list --workspace-id ws-xxx
-        inspire notebook list --workspace gpu
+        inspire notebook list -n 10
+        inspire notebook list -s RUNNING
+        inspire notebook list -s RUNNING -s STOPPED
+        inspire notebook list --name my-notebook
+        inspire notebook list --workspace gpu -s RUNNING -n 5
         inspire notebook list --all-workspaces
         inspire notebook list --json
     """
@@ -1102,15 +1132,16 @@ def list_notebooks(
 
     all_items: list[dict] = []
     for ws_id in workspace_ids:
+        status_filter = [s.upper() for s in status] if status else []
         body = {
             "workspace_id": ws_id,
             "page": 1,
-            "page_size": 100,
+            "page_size": limit,
             "filter_by": {
-                "keyword": "",
+                "keyword": keyword,
                 "user_id": user_ids,
                 "logic_compute_group_id": [],
-                "status": [],
+                "status": status_filter,
                 "mirror_url": [],
             },
             "order_by": [{"field": "created_at", "order": "desc"}],
@@ -1202,6 +1233,7 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
 
         lines.append(f"{name:<25} {status:<12} {resource_info:<12} {notebook_id:<38}")
 
+    lines.append(f"\nShowing {len(items)} notebook(s)")
     click.echo("\n".join(lines))
 
 
@@ -1229,9 +1261,18 @@ def _run_interactive_notebook_ssh_with_reconnect(
     )
 
     reconnect_limit = max(0, int(tunnel_retries))
-    reconnect_attempt = 0
-    ssh_public_key: Optional[str] = None
-    ssh_runtime = None
+    reconnect_state = NotebookBridgeReconnectState(
+        reconnect_limit=reconnect_limit,
+        reconnect_pause=tunnel_retry_pause,
+    )
+
+    def _runtime_loader() -> object:
+        return resolve_ssh_runtime_config(
+            cli_overrides={"rtunnel_bin": rtunnel_bin},
+        )
+
+    def _runtime_validator(runtime: object) -> None:
+        pass  # setup_script is optional; built-in bootstrap handles dropbear
 
     while True:
         tunnel_config = load_tunnel_config(account=tunnel_account)
@@ -1256,7 +1297,7 @@ def _run_interactive_notebook_ssh_with_reconnect(
             return
         if not should_attempt_ssh_reconnect(returncode, interactive=True):
             raise SystemExit(returncode if returncode is not None else 1)
-        if reconnect_attempt >= reconnect_limit:
+        if reconnect_state.reconnect_attempt >= reconnect_limit:
             _handle_error(
                 ctx,
                 "APIError",
@@ -1266,68 +1307,78 @@ def _run_interactive_notebook_ssh_with_reconnect(
             )
             return
 
-        reconnect_attempt += 1
+        attempt = reconnect_state.reconnect_attempt + 1
         click.echo(
             (
                 "SSH connection dropped; rebuilding tunnel automatically "
-                f"(attempt {reconnect_attempt}/{reconnect_limit})..."
+                f"(attempt {attempt}/{reconnect_limit})..."
             ),
             err=True,
         )
 
-        try:
-            if ssh_public_key is None:
-                ssh_public_key = load_ssh_public_key(pubkey)
-            if ssh_runtime is None:
-                ssh_runtime = resolve_ssh_runtime_config(
-                    cli_overrides={"rtunnel_bin": rtunnel_bin},
+        reconnect_result = attempt_notebook_bridge_rebuild(
+            state=reconnect_state,
+            bridge_name=profile_name,
+            bridge=bridge,
+            tunnel_config=tunnel_config,
+            session_loader=lambda: session,
+            runtime_loader=_runtime_loader,
+            rebuild_fn=rebuild_notebook_bridge_profile,
+            key_loader=lambda path: load_ssh_public_key(path),
+            runtime_validator=_runtime_validator,
+            pubkey_path=pubkey,
+            timeout=setup_timeout,
+            headless=not debug_playwright,
+        )
+
+        if isinstance(reconnect_result.error, (ValueError, ConfigError)):
+            hint = None
+            if "setup_script" in str(reconnect_result.error):
+                hint = (
+                    "Set [ssh].setup_script in config.toml or export INSPIRE_SETUP_SCRIPT "
+                    "to the setup script path on the cluster."
                 )
-            if ssh_runtime.dropbear_deb_dir and not ssh_runtime.setup_script:
-                _handle_error(
-                    ctx,
-                    "ConfigError",
-                    "Missing SSH setup script: ssh.setup_script (or INSPIRE_SETUP_SCRIPT) "
-                    "is required when ssh.dropbear_deb_dir is configured.",
-                    EXIT_CONFIG_ERROR,
-                    hint=(
-                        "Set [ssh].setup_script in config.toml or export "
-                        "INSPIRE_SETUP_SCRIPT to the setup script path on the cluster."
-                    ),
-                )
-                return
-            rebuild_notebook_bridge_profile(
-                bridge_name=profile_name,
-                bridge=bridge,
-                tunnel_config=tunnel_config,
-                session=session,
-                ssh_public_key=ssh_public_key,
-                ssh_runtime=ssh_runtime,
-                timeout=setup_timeout,
-                headless=not debug_playwright,
+            _handle_error(
+                ctx,
+                "ConfigError",
+                str(reconnect_result.error),
+                EXIT_CONFIG_ERROR,
+                hint=hint,
             )
-        except ValueError as e:
-            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
             return
-        except ConfigError as e:
-            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+
+        if reconnect_result.status is NotebookBridgeReconnectStatus.RETRY_LATER:
+            if reconnect_result.pause_seconds > 0:
+                time.sleep(reconnect_result.pause_seconds)
+            continue
+
+        if reconnect_result.status is NotebookBridgeReconnectStatus.NOT_REBUILDABLE:
+            _handle_error(
+                ctx,
+                "ConfigError",
+                f"Bridge profile '{profile_name}' is missing notebook metadata.",
+                EXIT_CONFIG_ERROR,
+                hint="Re-run 'inspire notebook ssh <notebook-id> --save-as <name>'.",
+            )
             return
-        except Exception as e:
-            if reconnect_attempt >= reconnect_limit:
+
+        if reconnect_result.status is NotebookBridgeReconnectStatus.EXHAUSTED:
+            if reconnect_result.error is not None:
                 _handle_error(
                     ctx,
                     "APIError",
-                    f"Failed to rebuild notebook tunnel after disconnect: {e}",
+                    f"Failed to rebuild notebook tunnel after disconnect: {reconnect_result.error}",
                     EXIT_API_ERROR,
                 )
                 return
-            pause_s = retry_pause_seconds(
-                reconnect_attempt,
-                base_pause=tunnel_retry_pause,
-                progressive=True,
+            _handle_error(
+                ctx,
+                "APIError",
+                "SSH connection dropped and auto-reconnect retries were exhausted.",
+                EXIT_API_ERROR,
+                hint="Re-run 'inspire notebook ssh <notebook-id>' to refresh the tunnel.",
             )
-            if pause_s > 0:
-                time.sleep(pause_s)
-            continue
+            return
 
         refreshed_config = load_tunnel_config(account=tunnel_account)
         if is_tunnel_available(
@@ -1337,7 +1388,7 @@ def _run_interactive_notebook_ssh_with_reconnect(
             retry_pause=1.0,
         ):
             continue
-        if reconnect_attempt >= reconnect_limit:
+        if reconnect_state.reconnect_attempt >= reconnect_limit:
             _handle_error(
                 ctx,
                 "APIError",
@@ -1348,7 +1399,7 @@ def _run_interactive_notebook_ssh_with_reconnect(
             return
 
         pause_s = retry_pause_seconds(
-            reconnect_attempt,
+            reconnect_state.reconnect_attempt,
             base_pause=tunnel_retry_pause,
             progressive=True,
         )
@@ -1535,20 +1586,6 @@ def run_notebook_ssh(
         )
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-        return
-
-    if ssh_runtime.dropbear_deb_dir and not ssh_runtime.setup_script:
-        _handle_error(
-            ctx,
-            "ConfigError",
-            "Missing SSH setup script: ssh.setup_script (or INSPIRE_SETUP_SCRIPT) is required "
-            "when ssh.dropbear_deb_dir is configured.",
-            EXIT_CONFIG_ERROR,
-            hint=(
-                "Set [ssh].setup_script in config.toml or export INSPIRE_SETUP_SCRIPT to the "
-                "setup script path on the cluster."
-            ),
-        )
         return
 
     try:

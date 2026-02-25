@@ -285,7 +285,7 @@ def list_notebook_compute_groups(
         return groups
 
     # API endpoint missing or returned an empty list — fall back to local config.
-    fallback = _config_compute_groups_fallback()
+    fallback = _config_compute_groups_fallback(workspace_id=workspace_id)
     if fallback:
         return fallback
 
@@ -306,7 +306,7 @@ def list_notebook_compute_groups(
     return []
 
 
-def _config_compute_groups_fallback() -> list[dict]:
+def _config_compute_groups_fallback(workspace_id: str | None = None) -> list[dict]:
     """Build synthetic compute group list from inspire-cli config."""
     try:
         cfg, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
@@ -316,7 +316,11 @@ def _config_compute_groups_fallback() -> list[dict]:
     groups = cfg.compute_groups
     result = []
     for g in groups:
+        group_ws_ids = g.get("workspace_ids") or []
+        if workspace_id and group_ws_ids and workspace_id not in group_ws_ids:
+            continue
         gpu_type = g.get("gpu_type", "")
+        is_real_gpu = gpu_type and gpu_type.upper() != "CPU"
         result.append(
             {
                 "logic_compute_group_id": g.get("id", ""),
@@ -331,7 +335,7 @@ def _config_compute_groups_fallback() -> list[dict]:
                             },
                         }
                     ]
-                    if gpu_type
+                    if is_real_gpu
                     else []
                 ),
             }

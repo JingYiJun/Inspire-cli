@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Optional
 
@@ -74,7 +75,17 @@ def login_with_playwright(
 
     proxy = get_playwright_proxy()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, proxy=proxy)
+        try:
+            browser = p.chromium.launch(headless=headless, proxy=proxy)
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc):
+                raise RuntimeError(
+                    "Playwright browser not found. First login requires a browser to "
+                    "complete SSO authentication.\n\n"
+                    "  Install with:  playwright install chromium\n"
+                    "  Or if using uv tool:  uvx --from inspire-cli playwright install chromium"
+                ) from None
+            raise
         context = browser.new_context(proxy=proxy, ignore_https_errors=True)
         page = context.new_page()
 
@@ -190,6 +201,49 @@ def login_with_playwright(
         if not workspace_id:
             workspace_id = DEFAULT_WORKSPACE_ID
 
+        # Discover all workspace IDs via /api/v1/user/routes/{spaceId}
+        # The response contains a "userWorkspaceList" route with all workspaces
+        # the user can access, each with name (display name) and path (ws-... ID).
+        all_workspace_ids: list[str] = []
+        all_workspace_names: dict[str, str] = {}
+        if workspace_id and workspace_id != DEFAULT_WORKSPACE_ID:
+            try:
+                routes_resp = context.request.get(
+                    f"{base_url}/api/v1/user/routes/{workspace_id}",
+                    headers={
+                        "Accept": "application/json",
+                        "Referer": f"{base_url}/jobs/distributedTraining",
+                    },
+                    timeout=15000,
+                )
+                if routes_resp.status == 200:
+                    routes_data = routes_resp.json()
+                    ws_pattern = re.compile(
+                        r"^ws-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                    )
+                    # Find the "userWorkspaceList" route group
+                    for route_group in (routes_data.get("data") or {}).get("routes") or []:
+                        if not isinstance(route_group, dict):
+                            continue
+                        if route_group.get("name") != "userWorkspaceList":
+                            continue
+                        for entry in route_group.get("routes") or []:
+                            if not isinstance(entry, dict):
+                                continue
+                            ws_id = str(entry.get("path") or "").strip()
+                            ws_name = str(entry.get("name") or "").strip()
+                            if ws_id and ws_pattern.match(ws_id) and ws_id != DEFAULT_WORKSPACE_ID:
+                                if ws_id not in all_workspace_names:
+                                    all_workspace_ids.append(ws_id)
+                                    all_workspace_names[ws_id] = ws_name
+            except Exception:
+                pass
+
+        # Ensure the primary workspace_id is included
+        if workspace_id and workspace_id != DEFAULT_WORKSPACE_ID:
+            if workspace_id not in all_workspace_ids:
+                all_workspace_ids.insert(0, workspace_id)
+
         # Capture storage state (cookies + localStorage)
         storage_state = context.storage_state()
 
@@ -204,6 +258,9 @@ def login_with_playwright(
             cookies=cookie_dict,
             workspace_id=workspace_id,
             login_username=username,
+            base_url=base_url,
+            all_workspace_ids=all_workspace_ids or None,
+            all_workspace_names=all_workspace_names or None,
             created_at=time.time(),
         )
         session.save(account=username)
@@ -262,14 +319,16 @@ def get_web_session(force_refresh: bool = False, require_workspace: bool = False
 
     # Use cached session if available and has cookies, even if beyond TTL.
     # The session cookies may still be valid server-side; let API calls determine validity.
-    cached = WebSession.load(allow_expired=True, account=username or None)
-    if cached and cached.storage_state.get("cookies"):
-        _maybe_apply_workspace_override(cached, env_workspace_id)
-        if (not require_workspace or _has_real_workspace_id(cached)) and _session_matches_username(
-            cached, username
-        ):
-            # Use cached session; server will reject if truly invalid.
-            return cached
+    # Skip this when force_refresh is set — the caller explicitly wants a fresh login.
+    if not force_refresh:
+        cached = WebSession.load(allow_expired=True, account=username or None)
+        if cached and cached.storage_state.get("cookies"):
+            _maybe_apply_workspace_override(cached, env_workspace_id)
+            if (
+                not require_workspace or _has_real_workspace_id(cached)
+            ) and _session_matches_username(cached, username):
+                # Use cached session; server will reject if truly invalid.
+                return cached
 
     # Session is missing or has no cookies, perform fresh login
     base_url = _load_runtime_config().base_url

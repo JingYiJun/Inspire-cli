@@ -13,6 +13,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from playwright.sync_api import Error as PlaywrightError
+except ImportError:  # pragma: no cover - Playwright may be unavailable in some environments.
+
+    class PlaywrightError(Exception):
+        pass
+
+
 from inspire.config.ssh_runtime import (
     DEFAULT_RTUNNEL_DOWNLOAD_URL,
     SshRuntimeConfig,
@@ -84,6 +92,9 @@ def build_rtunnel_setup_commands(
         cmd_lines.append(f"SSHD_DEB_DIR={shlex.quote(sshd_deb_dir)}")
     if dropbear_deb_dir:
         cmd_lines.append(f"DROPBEAR_DEB_DIR={shlex.quote(dropbear_deb_dir)}")
+    apt_mirror_url = ssh_runtime.apt_mirror_url
+    if apt_mirror_url:
+        cmd_lines.append(f"APT_MIRROR_URL={shlex.quote(apt_mirror_url)}")
 
     openssh_bootstrap_cmd = (
         'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x /tmp/rtunnel ] '
@@ -110,29 +121,55 @@ def build_rtunnel_setup_commands(
         ">/dev/null 2>&1 & fi"
     )
     # Dropbear may die between sessions (container restart, OOM, etc.).
-    # Ensure it is running when dropbear_deb_dir is configured.
-    # Supports two layouts:
+    # Ensure it is running when dropbear_deb_dir or apt_mirror_url is configured.
+    # Supports three installation paths (tried in order):
     #  1. Extracted deb tree: $DROPBEAR_DEB_DIR/usr/sbin/dropbear exists
     #  2. Raw .deb packages: $DROPBEAR_DEB_DIR/*.deb  (installed via dpkg -i)
+    #  3. APT mirror: $APT_MIRROR_URL (for no-internet GPU notebooks with missing deps)
     start_dropbear_cmd = (
-        'if [ -n "${DROPBEAR_DEB_DIR:-}" ]; then '
+        'if [ -n "${DROPBEAR_DEB_DIR:-}" ] || [ -n "${APT_MIRROR_URL:-}" ]; then '
+        'DB_BIN=""; '
+        # Path 1: Extracted deb tree with runtime verification
+        'if [ -n "${DROPBEAR_DEB_DIR:-}" ] && [ -x "$DROPBEAR_DEB_DIR/usr/sbin/dropbear" ]; then '
         'DB_BIN="$DROPBEAR_DEB_DIR/usr/sbin/dropbear"; '
-        # If extracted tree exists, set LD_LIBRARY_PATH for it
-        'if [ -x "$DB_BIN" ]; then '
         "export LD_LIBRARY_PATH="
         '"$DROPBEAR_DEB_DIR/lib/x86_64-linux-gnu:'
         "$DROPBEAR_DEB_DIR/usr/lib/x86_64-linux-gnu:"
         '${LD_LIBRARY_PATH:-}"; '
-        # If not extracted but .deb files exist, install via dpkg
-        'elif ls "$DROPBEAR_DEB_DIR"/*.deb >/dev/null 2>&1; then '
+        '"$DB_BIN" -V >/dev/null 2>&1 || DB_BIN=""; fi; '
+        # Path 2: Raw .deb packages via dpkg
+        'if [ -z "$DB_BIN" ] && [ -n "${DROPBEAR_DEB_DIR:-}" ] && '
+        'ls "$DROPBEAR_DEB_DIR"/*.deb >/dev/null 2>&1; then '
         'dpkg -i "$DROPBEAR_DEB_DIR"/*.deb >/dev/null 2>&1 || true; '
-        "DB_BIN=/usr/sbin/dropbear; fi; "
+        "[ -x /usr/sbin/dropbear ] && DB_BIN=/usr/sbin/dropbear; fi; "
         # Also check system-installed dropbear as fallback
-        'if [ ! -x "$DB_BIN" ] && [ -x /usr/sbin/dropbear ]; then '
-        "DB_BIN=/usr/sbin/dropbear; fi; "
-        'if [ -x "$DB_BIN" ] && ! ps -ef | grep -q "[d]ropbear.*-p.*$SSH_PORT"; then '
-        'DB_KEY="$DROPBEAR_DEB_DIR/usr/bin/dropbearkey"; '
-        '[ -x "$DB_KEY" ] || DB_KEY=$(which dropbearkey 2>/dev/null || true); '
+        'if [ -z "$DB_BIN" ] || [ ! -x "$DB_BIN" ]; then '
+        "[ -x /usr/sbin/dropbear ] && DB_BIN=/usr/sbin/dropbear; fi; "
+        # Path 3: APT mirror fallback — install dropbear + deps (libtomcrypt1 etc.)
+        # Uses /etc/os-release for codename (more reliable than lsb_release which
+        # may not exist in containers).  Temporarily disables default sources to
+        # avoid slow timeouts on unreachable mirrors (archive.ubuntu.com) in
+        # no-internet GPUs.
+        'if { [ -z "$DB_BIN" ] || [ ! -x "$DB_BIN" ]; } && [ -n "${APT_MIRROR_URL:-}" ]; then '
+        'CODENAME=$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}"); '
+        '[ -z "$CODENAME" ] && CODENAME=$(lsb_release -cs 2>/dev/null || true); '
+        '[ -z "$CODENAME" ] && CODENAME=jammy; '
+        "for _f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do "
+        '[ -f "$_f" ] && mv "$_f" "$_f.bak" 2>/dev/null; done; '
+        'echo "deb $APT_MIRROR_URL $CODENAME main restricted universe multiverse" '
+        "> /etc/apt/sources.list.d/inspire-mirror.list; "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "apt-get update -qq >/dev/null 2>&1 && "
+        "apt-get install -y -qq dropbear-bin >/dev/null 2>&1 || true; "
+        "for _f in /etc/apt/sources.list.bak /etc/apt/sources.list.d/*.list.bak; do "
+        '[ -f "$_f" ] && mv "$_f" "${_f%.bak}" 2>/dev/null; done; '
+        "[ -x /usr/sbin/dropbear ] && DB_BIN=/usr/sbin/dropbear; fi; "
+        # Start dropbear if found and not already running
+        'if [ -n "$DB_BIN" ] && [ -x "$DB_BIN" ] && ! ps -ef | grep -q "[d]ropbear.*-p.*$SSH_PORT"; then '
+        'DB_KEY=""; '
+        '[ -n "${DROPBEAR_DEB_DIR:-}" ] && [ -x "$DROPBEAR_DEB_DIR/usr/bin/dropbearkey" ] '
+        '&& DB_KEY="$DROPBEAR_DEB_DIR/usr/bin/dropbearkey"; '
+        '[ -z "$DB_KEY" ] && DB_KEY=$(which dropbearkey 2>/dev/null || true); '
         'if [ ! -f /tmp/dropbear_ed25519_host_key ] && [ -n "$DB_KEY" ] && [ -x "$DB_KEY" ]; then '
         '"$DB_KEY" -t ed25519 -f /tmp/dropbear_ed25519_host_key >/dev/null 2>&1; fi; '
         '"$DB_BIN" -E -s -g -p "127.0.0.1:$SSH_PORT" '
@@ -146,7 +183,7 @@ def build_rtunnel_setup_commands(
         ">/tmp/rtunnel-server.log 2>&1 & fi"
     )
 
-    if dropbear_deb_dir:
+    if dropbear_deb_dir or apt_mirror_url:
         setup_script = ssh_runtime.setup_script
         if setup_script:
             cmd_lines.append(f"SETUP_SCRIPT={shlex.quote(setup_script)}")
@@ -232,7 +269,7 @@ def _load_state_file(path: Path) -> dict[str, Any]:
         return {"version": _CACHE_VERSION, "notebooks": {}}
     try:
         raw = json.loads(path.read_text())
-    except Exception:
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {"version": _CACHE_VERSION, "notebooks": {}}
     if not isinstance(raw, dict):
         return {"version": _CACHE_VERSION, "notebooks": {}}
@@ -249,7 +286,7 @@ def _save_state_file(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
     try:
         os.chmod(path, 0o600)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -364,7 +401,7 @@ def redact_proxy_url(proxy_url: str) -> str:
         return urlunsplit(
             (parts.scheme, parts.netloc, redacted_path, redacted_query, parts.fragment)
         )
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         # Best-effort fallback: redact obvious token query patterns.
         if "token=" in proxy_url:
             before, _, after = proxy_url.partition("token=")
@@ -454,7 +491,7 @@ def wait_for_rtunnel_reachable(
             resp = context.request.get(proxy_url, timeout=5000)
             try:
                 body = resp.text()
-            except Exception:
+            except (PlaywrightError, AttributeError, RuntimeError, TypeError, ValueError):
                 body = ""
             last_status = _redact_token_like_text(f"{resp.status} {body[:200].strip()}")
             if attempt <= 3:
@@ -471,7 +508,14 @@ def wait_for_rtunnel_reachable(
                 consecutive_404 += 1
             else:
                 consecutive_404 = 0
-        except Exception as e:
+        except (
+            PlaywrightError,
+            ConnectionError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            ValueError,
+        ) as e:
             last_status = _summarize_request_error(e)
             if attempt <= 3:
                 _sys.stderr.write(f"  Attempt {attempt}: {last_status}\n")
@@ -554,7 +598,7 @@ def _candidate_urls_from_tunnel_config(
 ) -> list[str]:
     try:
         config = load_tunnel_config(account=account)
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return []
 
     candidates: list[str] = []
@@ -608,7 +652,7 @@ def probe_existing_rtunnel_proxy_url(
         for url in deduped_urls:
             try:
                 resp = http.get(url, timeout=5)  # type: ignore[attr-defined]
-            except Exception:
+            except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError):
                 continue
             body = resp.text[:400] if getattr(resp, "text", "") else ""  # type: ignore[attr-defined]
             if not _is_reachable_proxy_response(status_code=resp.status_code, body=body):  # type: ignore[attr-defined]
@@ -622,17 +666,17 @@ def probe_existing_rtunnel_proxy_url(
                     base_url=base_url,
                     account=resolved_account,
                 )
-            except Exception:
+            except OSError:
                 pass
             return url
         return None
-    except Exception:
+    except (OSError, ValueError, RuntimeError, AttributeError):
         return None
     finally:
         try:
             if http is not None:
                 http.close()  # type: ignore[attr-defined]
-        except Exception:
+        except (OSError, AttributeError):
             pass
 
 
@@ -733,14 +777,22 @@ def _create_terminal_via_api(context: Any, lab_url: str) -> str | None:
                 if cookie.get("name") == "_xsrf":
                     headers["X-XSRFToken"] = cookie["value"]
                     break
-        except Exception:
+        except (AttributeError, KeyError, TypeError):
             pass
 
         resp = context.request.post(api_url, headers=headers, timeout=10000)
         if resp.status in (200, 201):
             data = resp.json()
             return data.get("name")
-    except Exception:
+    except (
+        PlaywrightError,
+        ConnectionError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+        TypeError,
+    ):
         pass
     return None
 
@@ -778,7 +830,7 @@ def _build_terminal_websocket_url(lab_url: str, term_name: str) -> str:
 
 
 def _send_terminal_command_via_websocket(
-    page: Any,
+    page_or_frame: Any,
     *,
     ws_url: str,
     command: str,
@@ -786,6 +838,10 @@ def _send_terminal_command_via_websocket(
     completion_marker: str | None = None,
 ) -> bool:
     """Send a command to a Jupyter terminal via WebSocket.
+
+    *page_or_frame* should be the Playwright frame whose origin matches the
+    WebSocket URL (typically the JupyterLab iframe, not the outer page) so
+    that the browser creates a same-origin WebSocket connection.
 
     Waits for a shell prompt (``["stdout", ...]`` message) before sending
     stdin so that the command is not lost if bash hasn't initialized yet.
@@ -797,9 +853,8 @@ def _send_terminal_command_via_websocket(
     """
     stdin_payload = command.rstrip("\r\n") + "\r"
     try:
-        return bool(
-            page.evaluate(
-                """
+        result = page_or_frame.evaluate(
+            """
                 async ({ wsUrl, stdinData, timeoutMs, promptTimeoutMs, marker }) => {
                   return await new Promise((resolve) => {
                     let settled = false;
@@ -879,23 +934,22 @@ def _send_terminal_command_via_websocket(
                   });
                 }
                 """,
-                {
-                    "wsUrl": ws_url,
-                    "stdinData": stdin_payload,
-                    "timeoutMs": int(timeout_ms),
-                    "promptTimeoutMs": min(int(timeout_ms) - 500, 3000),
-                    "marker": completion_marker or "",
-                },
-            )
+            {
+                "wsUrl": ws_url,
+                "stdinData": stdin_payload,
+                "timeoutMs": int(timeout_ms),
+                "promptTimeoutMs": min(int(timeout_ms) - 500, 3000),
+                "marker": completion_marker or "",
+            },
         )
-    except Exception:
+        return bool(result)
+    except (PlaywrightError, AttributeError, RuntimeError, TypeError, ValueError):
         return False
 
 
 def _send_setup_command_via_terminal_ws(
     *,
     context: Any,
-    page: Any,
     lab_frame: Any,
     batch_cmd: str,
 ) -> bool:
@@ -905,14 +959,14 @@ def _send_setup_command_via_terminal_ws(
 
     ws_url = _build_terminal_websocket_url(lab_frame.url, term_name)
     return _send_terminal_command_via_websocket(
-        page,
+        lab_frame,
         ws_url=ws_url,
         command=batch_cmd,
         # The setup script ends with `echo INSPIRE_RTUNNEL_SETUP_DONE`.
         # Wait for this marker so the caller knows the script finished
-        # (dpkg -i can take 5-10s on GPU notebooks).  Use a generous
-        # timeout; the overall setup_timeout guards against hangs.
-        timeout_ms=30000,
+        # (dpkg -i can take 5-10s on GPU notebooks, apt install 60-90s).
+        # Use a generous timeout; the overall setup_timeout guards against hangs.
+        timeout_ms=120000,
         completion_marker="INSPIRE_RTUNNEL_SETUP_DONE",
     )
 
@@ -964,14 +1018,14 @@ def _wait_for_terminal_surface(
     try:
         lab_frame.locator(".xterm").first.wait_for(state="attached", timeout=timeout_ms)
         return True
-    except Exception:
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
         pass
 
     for selector in _TERMINAL_INPUT_SELECTORS:
         try:
             if lab_frame.locator(selector).first.count() > 0:
                 return True
-        except Exception:
+        except (PlaywrightError, RuntimeError, AttributeError, TypeError, ValueError):
             pass
     return False
 
@@ -1028,7 +1082,7 @@ def _wait_for_file_menu_ready(
                 timeout=per_label_timeout,
             )
             return True
-        except Exception:
+        except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
             pass
     return False
 
@@ -1048,7 +1102,7 @@ def _click_terminal_tab(
         if settle_ms > 0:
             page.wait_for_timeout(settle_ms)
         return True
-    except Exception:
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError, TypeError):
         return False
 
 
@@ -1068,7 +1122,7 @@ def _open_terminal_from_file_menu(
                 timeout=action_timeout_ms
             )
             return True
-        except Exception:
+        except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
             pass
     return False
 
@@ -1085,7 +1139,7 @@ def _focus_terminal_input(
                 term_focus.click(timeout=_FOCUS_INPUT_CLICK_TIMEOUT_MS)
                 page.wait_for_timeout(40)
                 return True
-            except Exception:
+            except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
                 pass
 
         _click_terminal_tab(
@@ -1099,164 +1153,230 @@ def _focus_terminal_input(
     return False
 
 
-def _open_or_create_terminal(
+def _log_terminal_status(message: str) -> None:
+    import sys as _sys
+
+    _sys.stderr.write(message + "\n")
+    _sys.stderr.flush()
+
+
+def _wait_for_api_terminal_surface(
+    lab_frame: Any,
+    page: Any,
+) -> bool:
+    if _wait_for_terminal_surface(lab_frame, timeout_ms=500):
+        return True
+    if _wait_for_terminal_surface_progressive(
+        lab_frame,
+        page,
+        total_timeout_ms=_API_TERMINAL_PROGRESSIVE_WAIT_MS,
+    ):
+        return True
+    return _wait_for_terminal_surface_progressive(
+        lab_frame,
+        page,
+        total_timeout_ms=_API_TERMINAL_RECOVERY_WAIT_MS,
+    )
+
+
+def _open_terminal_via_rest_api(
+    *,
     context: Any,
     page: Any,
     lab_frame: Any,
-) -> bool:
-    """Open a terminal in JupyterLab.  REST API first, then DOM fallbacks."""
-    import sys as _sys
-
+) -> tuple[bool, bool]:
     lab_url = lab_frame.url
-    api_term_created = False
-    api_term_navigated = False
-
-    # ------------------------------------------------------------------
-    # Strategy 1: REST API – create terminal + navigate directly to it
-    # ------------------------------------------------------------------
     term_name = _create_terminal_via_api(context, lab_url)
-    if term_name:
-        _sys.stderr.write(f"  Created terminal '{term_name}' via REST API.\n")
-        _sys.stderr.flush()
-        server_base = _jupyter_server_base(lab_url)
-        term_url = f"{server_base}lab/terminals/{term_name}?reset"
-        try:
-            lab_frame.goto(term_url, timeout=15000, wait_until="domcontentloaded")
-            api_term_navigated = True
-            if _wait_for_terminal_surface(lab_frame, timeout_ms=_FAST_API_XTERM_ATTACH_TIMEOUT_MS):
-                return True
-        except Exception:
-            pass
-        if api_term_navigated:
-            _sys.stderr.write(
-                "  REST API terminal created but xterm not yet visible; "
-                "continuing with API terminal path.\n"
-            )
-            _sys.stderr.flush()
-            if _wait_for_terminal_surface(lab_frame, timeout_ms=500):
-                return True
-            if _wait_for_terminal_surface_progressive(
-                lab_frame,
-                page,
-                total_timeout_ms=_API_TERMINAL_PROGRESSIVE_WAIT_MS,
-            ):
-                return True
-            if _wait_for_terminal_surface_progressive(
-                lab_frame,
-                page,
-                total_timeout_ms=_API_TERMINAL_RECOVERY_WAIT_MS,
-            ):
-                return True
-            api_term_created = True
+    if not term_name:
+        return False, False
 
-        if not api_term_navigated:
-            _sys.stderr.write(
-                "  REST API terminal created but navigation failed, trying DOM fallbacks...\n"
-            )
-            _sys.stderr.flush()
-            api_term_created = True
+    _log_terminal_status(f"  Created terminal '{term_name}' via REST API.")
+    server_base = _jupyter_server_base(lab_url)
+    term_url = f"{server_base}lab/terminals/{term_name}?reset"
+    try:
+        lab_frame.goto(term_url, timeout=15000, wait_until="domcontentloaded")
+        if _wait_for_terminal_surface(lab_frame, timeout_ms=_FAST_API_XTERM_ATTACH_TIMEOUT_MS):
+            return True, True
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
+        _log_terminal_status(
+            "  REST API terminal created but navigation failed, trying DOM fallbacks..."
+        )
+        return False, True
 
-    if api_term_created:
-        if _click_terminal_tab(
-            lab_frame,
-            page,
-            timeout_ms=min(_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS, 500),
-            settle_ms=60,
-        ) and _wait_for_terminal_surface_progressive(
-            lab_frame,
-            page,
-            total_timeout_ms=900,
-        ):
-            return True
-        if _open_terminal_from_file_menu(
+    _log_terminal_status(
+        "  REST API terminal created but xterm not yet visible; continuing with API terminal path."
+    )
+    return _wait_for_api_terminal_surface(lab_frame, page), True
+
+
+def _recover_api_terminal_surface(
+    *,
+    lab_frame: Any,
+    page: Any,
+) -> bool:
+    if _click_terminal_tab(
+        lab_frame,
+        page,
+        timeout_ms=min(_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS, 500),
+        settle_ms=60,
+    ) and _wait_for_terminal_surface_progressive(
+        lab_frame,
+        page,
+        total_timeout_ms=900,
+    ):
+        return True
+
+    menu_ready = _wait_for_file_menu_ready(lab_frame, timeout_ms=_FAST_API_MENU_READY_TIMEOUT_MS)
+    if (
+        menu_ready
+        and _open_terminal_from_file_menu(
             lab_frame,
             action_timeout_ms=_FAST_MENU_ACTION_TIMEOUT_MS,
-        ) and _wait_for_terminal_surface_progressive(
+        )
+        and _wait_for_terminal_surface_progressive(
             lab_frame,
             page,
             total_timeout_ms=2200,
-        ):
-            return True
+        )
+    ):
+        return True
+
+    return False
+
+
+def _wait_for_terminal_entry_point(
+    *,
+    lab_frame: Any,
+    api_term_created: bool,
+) -> None:
+    if api_term_created:
         _wait_for_file_menu_ready(lab_frame, timeout_ms=_FAST_API_MENU_READY_TIMEOUT_MS)
-    else:
+        return
+
+    try:
+        lab_frame.locator(_TERMINAL_CARD_SELECTOR).first.wait_for(state="visible", timeout=45000)
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
+        _wait_for_file_menu_ready(lab_frame, timeout_ms=45000)
+
+
+def _dismiss_terminal_dialog_once(
+    *,
+    lab_frame: Any,
+    page: Any,
+    settle_ms: int,
+) -> bool:
+    for label in ("Dismiss", "No", "否", "不接收", "取消"):
         try:
-            lab_frame.locator(_TERMINAL_CARD_SELECTOR).first.wait_for(
-                state="visible", timeout=45000
-            )
-        except Exception:
-            _wait_for_file_menu_ready(lab_frame, timeout_ms=45000)
+            btn = lab_frame.get_by_role("button", name=label)
+            if btn.count() > 0:
+                btn.first.click(timeout=1000)
+                page.wait_for_timeout(settle_ms)
+                return True
+        except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
+            pass
 
-    for _pass in range(1):
-        dismissed = False
-        for label in ("Dismiss", "No", "否", "不接收", "取消"):
-            try:
-                btn = lab_frame.get_by_role("button", name=label)
-                if btn.count() > 0:
-                    btn.first.click(timeout=1000)
-                    dismissed = True
-                    break
-            except Exception:
-                pass
-        if not dismissed:
-            try:
-                close_btn = lab_frame.locator("button.jp-Dialog-close, button[aria-label='Close']")
-                if close_btn.count() > 0:
-                    close_btn.first.click(timeout=1000)
-                    dismissed = True
-            except Exception:
-                pass
-        if dismissed:
+    try:
+        close_btn = lab_frame.locator("button.jp-Dialog-close, button[aria-label='Close']")
+        if close_btn.count() > 0:
+            close_btn.first.click(timeout=1000)
+            page.wait_for_timeout(settle_ms)
+            return True
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
+        pass
+
+    return False
+
+
+def _open_terminal_card(
+    *,
+    lab_frame: Any,
+    api_term_created: bool,
+) -> bool:
+    terminal_card = lab_frame.locator(_TERMINAL_CARD_SELECTOR)
+    card_wait_timeout = _FAST_TERMINAL_CARD_WAIT_TIMEOUT_MS if api_term_created else 8000
+    card_click_timeout = _FAST_TERMINAL_CARD_CLICK_TIMEOUT_MS if api_term_created else 8000
+    try:
+        terminal_card.first.wait_for(state="visible", timeout=card_wait_timeout)
+        terminal_card.first.click(timeout=card_click_timeout)
+        return True
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
+        return False
+
+
+def _open_terminal_card_from_launcher(
+    *,
+    lab_frame: Any,
+    page: Any,
+    api_term_created: bool,
+) -> bool:
+    try:
+        launcher_btn = lab_frame.locator(
+            "button[title*='Launcher'], button[aria-label*='Launcher']"
+        ).first
+        if launcher_btn.count() > 0:
+            launcher_btn.click(timeout=1200)
             page.wait_for_timeout(150)
-        else:
-            break
+    except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
+        return False
 
-    terminal_opened = False
+    return _open_terminal_card(lab_frame=lab_frame, api_term_created=api_term_created)
 
+
+def _open_terminal_via_dom_fallback(
+    *,
+    lab_frame: Any,
+    page: Any,
+    api_term_created: bool,
+) -> bool:
     if _click_terminal_tab(
         lab_frame,
         page,
         timeout_ms=_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS,
         settle_ms=100,
     ):
-        terminal_opened = True
+        return True
 
-    if not terminal_opened:
-        terminal_card = lab_frame.locator(_TERMINAL_CARD_SELECTOR)
-        card_wait_timeout = _FAST_TERMINAL_CARD_WAIT_TIMEOUT_MS if api_term_created else 8000
-        card_click_timeout = _FAST_TERMINAL_CARD_CLICK_TIMEOUT_MS if api_term_created else 8000
-        try:
-            terminal_card.first.wait_for(state="visible", timeout=card_wait_timeout)
-            terminal_card.first.click(timeout=card_click_timeout)
-            terminal_opened = True
-        except Exception:
-            pass
+    if _open_terminal_card(lab_frame=lab_frame, api_term_created=api_term_created):
+        return True
+    if _open_terminal_card_from_launcher(
+        lab_frame=lab_frame,
+        page=page,
+        api_term_created=api_term_created,
+    ):
+        return True
 
-    if not terminal_opened:
-        try:
-            launcher_btn = lab_frame.locator(
-                "button[title*='Launcher'], button[aria-label*='Launcher']"
-            ).first
-            if launcher_btn.count() > 0:
-                launcher_btn.click(timeout=1200)
-                page.wait_for_timeout(150)
-            terminal_card = lab_frame.locator(_TERMINAL_CARD_SELECTOR)
-            card_wait_timeout = _FAST_TERMINAL_CARD_WAIT_TIMEOUT_MS if api_term_created else 8000
-            card_click_timeout = _FAST_TERMINAL_CARD_CLICK_TIMEOUT_MS if api_term_created else 8000
-            terminal_card.first.wait_for(state="visible", timeout=card_wait_timeout)
-            terminal_card.first.click(timeout=card_click_timeout)
-            terminal_opened = True
-        except Exception:
-            pass
+    menu_action_timeout = _FAST_MENU_ACTION_TIMEOUT_MS if api_term_created else 2000
+    if _open_terminal_from_file_menu(lab_frame, action_timeout_ms=menu_action_timeout):
+        return True
 
-    if not terminal_opened:
-        menu_action_timeout = _FAST_MENU_ACTION_TIMEOUT_MS if api_term_created else 2000
-        if _open_terminal_from_file_menu(lab_frame, action_timeout_ms=menu_action_timeout):
-            terminal_opened = True
+    return api_term_created and _wait_for_terminal_surface(lab_frame, timeout_ms=1200)
 
-    if not terminal_opened and api_term_created:
-        terminal_opened = _wait_for_terminal_surface(lab_frame, timeout_ms=1200)
 
-    if not terminal_opened:
+def _open_or_create_terminal(
+    context: Any,
+    page: Any,
+    lab_frame: Any,
+) -> bool:
+    """Open a terminal in JupyterLab.  REST API first, then DOM fallbacks."""
+    terminal_ready, api_term_created = _open_terminal_via_rest_api(
+        context=context,
+        page=page,
+        lab_frame=lab_frame,
+    )
+    if terminal_ready:
+        return True
+
+    if api_term_created and _recover_api_terminal_surface(lab_frame=lab_frame, page=page):
+        return True
+
+    _wait_for_terminal_entry_point(lab_frame=lab_frame, api_term_created=api_term_created)
+    _dismiss_terminal_dialog_once(lab_frame=lab_frame, page=page, settle_ms=150)
+
+    if not _open_terminal_via_dom_fallback(
+        lab_frame=lab_frame,
+        page=page,
+        api_term_created=api_term_created,
+    ):
         return False
 
     _click_terminal_tab(
@@ -1265,17 +1385,7 @@ def _open_or_create_terminal(
         timeout_ms=_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS,
         settle_ms=80,
     )
-
-    for label in ("Dismiss", "No", "否", "不接收", "取消"):
-        try:
-            btn = lab_frame.get_by_role("button", name=label)
-            if btn.count() > 0:
-                btn.first.click(timeout=1000)
-                page.wait_for_timeout(120)
-                break
-        except Exception:
-            pass
-
+    _dismiss_terminal_dialog_once(lab_frame=lab_frame, page=page, settle_ms=120)
     return True
 
 
@@ -1364,7 +1474,14 @@ def _ensure_proxy_readiness_with_fallback(
                 page=page,
             )
             return derived_vscode_url, diagnostics
-        except Exception as derived_error:
+        except (
+            PlaywrightError,
+            ConnectionError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            ValueError,
+        ) as derived_error:
             diagnostics.append(f"derived={_extract_probe_error_summary(derived_error)}")
 
     try:
@@ -1375,7 +1492,14 @@ def _ensure_proxy_readiness_with_fallback(
             page=page,
         )
         return proxy_url, diagnostics
-    except Exception as primary_error:
+    except (
+        PlaywrightError,
+        ConnectionError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+    ) as primary_error:
         diagnostics.append(f"primary={_extract_probe_error_summary(primary_error)}")
 
     fallback_proxy_url = _build_vscode_proxy_url(page, port=port)
@@ -1385,7 +1509,7 @@ def _ensure_proxy_readiness_with_fallback(
             if vscode_tab.count() > 0:
                 vscode_tab.click(timeout=1500)
                 page.wait_for_timeout(200)
-        except Exception:
+        except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
             pass
         fallback_proxy_url = _build_vscode_proxy_url(page, port=port)
 
@@ -1408,13 +1532,143 @@ def _ensure_proxy_readiness_with_fallback(
             page=page,
         )
         return fallback_proxy_url, diagnostics
-    except Exception as fallback_error:
+    except (
+        PlaywrightError,
+        ConnectionError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+    ) as fallback_error:
         diagnostics.append(f"fallback={_extract_probe_error_summary(fallback_error)}")
         _sys.stderr.write(
             "  Fallback proxy did not pass HTTP readiness; " "continuing with SSH preflight.\n"
         )
         _sys.stderr.flush()
         return best_for_ssh, diagnostics
+
+
+def _send_rtunnel_setup_script(
+    *,
+    context: Any,
+    page: Any,
+    lab_frame: Any,
+    batch_cmd: str,
+    timer: "_StepTimer",
+) -> bool:
+    import sys as _sys
+
+    setup_sent_via_ws = False
+    try:
+        setup_sent_via_ws = _send_setup_command_via_terminal_ws(
+            context=context,
+            lab_frame=lab_frame,
+            batch_cmd=batch_cmd,
+        )
+    except (PlaywrightError, RuntimeError, TimeoutError, ValueError):
+        setup_sent_via_ws = False
+
+    if setup_sent_via_ws:
+        _sys.stderr.write("  Sent setup script via Jupyter terminal WebSocket.\n")
+        _sys.stderr.flush()
+        timer.mark("open_terminal")
+        timer.mark("focus_xterm")
+        timer.mark("build_and_send_cmd")
+        return True
+
+    if not _open_or_create_terminal(context, page, lab_frame):
+        raise ValueError("Failed to open Jupyter terminal")
+    timer.mark("open_terminal")
+
+    if not _focus_terminal_input(lab_frame, page):
+        page.wait_for_timeout(350)
+        if not _wait_for_terminal_surface(lab_frame, timeout_ms=2000):
+            raise ValueError("Failed to focus Jupyter terminal: xterm surface not ready")
+        if not _focus_terminal_input(lab_frame, page):
+            raise ValueError("Failed to focus Jupyter terminal input")
+    timer.mark("focus_xterm")
+
+    _sys.stderr.write(
+        f"  Executing setup script ({len(batch_cmd)} chars) in notebook terminal...\n"
+    )
+    _sys.stderr.flush()
+    page.keyboard.insert_text(batch_cmd)
+    page.keyboard.press("Enter")
+    timer.mark("build_and_send_cmd")
+    return False
+
+
+def _wait_for_setup_completion(
+    *,
+    page: Any,
+    setup_sent_via_ws: bool,
+    timer: "_StepTimer",
+) -> None:
+    # Both WS and Playwright paths need time for the setup commands to execute
+    # (dpkg install, dropbear keygen/start, rtunnel start).  The WS path sends
+    # commands instantly but they still take time to run on the remote.
+    if not setup_sent_via_ws:
+        # xterm.js renders to <canvas>, so Playwright text locators are blind
+        # to output. A short delay lets setup finish before HTTP probe checks.
+        page.wait_for_timeout(3000)
+    else:
+        import time
+
+        time.sleep(3)
+    timer.mark("wait_marker")
+
+
+def _capture_terminal_debug_artifact(*, page: Any, timer: "_StepTimer") -> None:
+    try:
+        page.screenshot(path="/tmp/notebook_terminal_debug.png")
+    except (PlaywrightError, OSError, RuntimeError, TimeoutError, ValueError, TypeError):
+        pass
+    timer.mark("screenshot")
+
+
+def _verify_and_cache_rtunnel_proxy(
+    *,
+    notebook_id: str,
+    jupyter_proxy_url: str,
+    port: int,
+    ssh_port: int,
+    timeout: int,
+    context: Any,
+    page: Any,
+    account: str | None,
+    timer: "_StepTimer",
+) -> str:
+    import sys as _sys
+
+    _sys.stderr.write(
+        f"  Verifying rtunnel is reachable at: {redact_proxy_url(jupyter_proxy_url)}\n"
+    )
+    _sys.stderr.flush()
+    proxy_url, probe_diagnostics = _ensure_proxy_readiness_with_fallback(
+        proxy_url=jupyter_proxy_url,
+        port=port,
+        timeout=timeout,
+        context=context,
+        page=page,
+    )
+    if probe_diagnostics:
+        _sys.stderr.write("  Proxy readiness summary: " + " | ".join(probe_diagnostics) + "\n")
+        _sys.stderr.flush()
+    timer.mark("verify_proxy")
+
+    try:
+        save_rtunnel_proxy_state(
+            notebook_id=notebook_id,
+            proxy_url=proxy_url,
+            port=port,
+            ssh_port=ssh_port,
+            base_url=_get_base_url(),
+            account=account,
+        )
+    except OSError:
+        pass
+    timer.mark("save_state")
+    return proxy_url
 
 
 def _setup_notebook_rtunnel_sync(
@@ -1477,7 +1731,7 @@ def _setup_notebook_rtunnel_sync(
 
             try:
                 lab_frame.locator("text=加载中").first.wait_for(state="hidden", timeout=30000)
-            except Exception:
+            except (PlaywrightError, TimeoutError, RuntimeError, AttributeError, ValueError):
                 pass
             timer.mark("wait_spinner")
 
@@ -1488,99 +1742,30 @@ def _setup_notebook_rtunnel_sync(
                 ssh_runtime=ssh_runtime,
             )
             batch_cmd = _build_batch_setup_script(cmd_lines)
-
-            setup_sent_via_ws = False
-            try:
-                setup_sent_via_ws = _send_setup_command_via_terminal_ws(
-                    context=context,
-                    page=page,
-                    lab_frame=lab_frame,
-                    batch_cmd=batch_cmd,
-                )
-            except Exception:
-                setup_sent_via_ws = False
-
-            if setup_sent_via_ws:
-                _sys.stderr.write("  Sent setup script via Jupyter terminal WebSocket.\n")
-                _sys.stderr.flush()
-                timer.mark("open_terminal")
-                timer.mark("focus_xterm")
-                timer.mark("build_and_send_cmd")
-            else:
-                if not _open_or_create_terminal(context, page, lab_frame):
-                    raise ValueError("Failed to open Jupyter terminal")
-                timer.mark("open_terminal")
-
-                if not _focus_terminal_input(lab_frame, page):
-                    page.wait_for_timeout(350)
-                    if not _wait_for_terminal_surface(lab_frame, timeout_ms=2000):
-                        raise ValueError(
-                            "Failed to focus Jupyter terminal: xterm surface not ready"
-                        )
-                    if not _focus_terminal_input(lab_frame, page):
-                        raise ValueError("Failed to focus Jupyter terminal input")
-                timer.mark("focus_xterm")
-
-                _sys.stderr.write(
-                    f"  Executing setup script ({len(batch_cmd)} chars) "
-                    f"in notebook terminal...\n"
-                )
-                _sys.stderr.flush()
-                page.keyboard.insert_text(batch_cmd)
-                page.keyboard.press("Enter")
-                timer.mark("build_and_send_cmd")
-
-            # When the setup script was sent via WebSocket with a completion
-            # marker, the function already blocked until the script finished
-            # (or timed out).  Only use the fixed 3s delay for the DOM
-            # keyboard fallback where we can't observe terminal output.
-            if not setup_sent_via_ws:
-                # xterm.js renders to <canvas>, so Playwright text locators
-                # are blind to terminal output.  A short fixed delay lets
-                # the setup script finish; actual readiness is verified by
-                # _ensure_proxy_readiness_with_fallback() below.
-                page.wait_for_timeout(3000)
-            timer.mark("wait_marker")
-
-            try:
-                page.screenshot(path="/tmp/notebook_terminal_debug.png")
-            except Exception:
-                pass
-            timer.mark("screenshot")
-
-            proxy_url = jupyter_proxy_url
-            _sys.stderr.write(
-                f"  Verifying rtunnel is reachable at: {redact_proxy_url(proxy_url)}\n"
+            setup_sent_via_ws = _send_rtunnel_setup_script(
+                context=context,
+                page=page,
+                lab_frame=lab_frame,
+                batch_cmd=batch_cmd,
+                timer=timer,
             )
-            _sys.stderr.flush()
-            proxy_url, probe_diagnostics = _ensure_proxy_readiness_with_fallback(
-                proxy_url=proxy_url,
+            _wait_for_setup_completion(
+                page=page,
+                setup_sent_via_ws=setup_sent_via_ws,
+                timer=timer,
+            )
+            _capture_terminal_debug_artifact(page=page, timer=timer)
+            return _verify_and_cache_rtunnel_proxy(
+                notebook_id=notebook_id,
+                jupyter_proxy_url=jupyter_proxy_url,
                 port=port,
+                ssh_port=ssh_port,
                 timeout=timeout,
                 context=context,
                 page=page,
+                account=account,
+                timer=timer,
             )
-            if probe_diagnostics:
-                _sys.stderr.write(
-                    "  Proxy readiness summary: " + " | ".join(probe_diagnostics) + "\n"
-                )
-                _sys.stderr.flush()
-            timer.mark("verify_proxy")
-
-            try:
-                save_rtunnel_proxy_state(
-                    notebook_id=notebook_id,
-                    proxy_url=proxy_url,
-                    port=port,
-                    ssh_port=ssh_port,
-                    base_url=_get_base_url(),
-                    account=account,
-                )
-            except Exception:
-                pass
-            timer.mark("save_state")
-
-            return proxy_url
 
         finally:
             timer.summary()
