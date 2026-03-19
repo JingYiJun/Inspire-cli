@@ -3,7 +3,6 @@
 import json
 import pytest
 
-from inspire.bridge import forge as forge_module
 from inspire.config import Config
 from inspire.bridge.forge import (
     GitPlatform,
@@ -13,66 +12,6 @@ from inspire.bridge.forge import (
     _resolve_platform,
     _sanitize_token,
 )
-
-
-class DummyClient:
-    """Dummy client for testing."""
-
-    def __init__(self, request_id: str) -> None:
-        self.request_id = request_id
-        self.calls = []
-
-    def get_api_base(self, repo: str) -> str:  # noqa: ANN001
-        return f"https://example.test/repos/{repo}/actions"
-
-    def get_pagination_params(self, limit: int, page: int) -> str:  # noqa: ANN001
-        return f"limit={limit}&page={page}"
-
-    def request_json(self, method: str, url: str):  # noqa: ANN001
-        self.calls.append(url)
-        if "page=1" in url:
-            return {"total_count": 25, "workflow_runs": []}
-        if "page=2" in url:
-            payload = json.dumps({"inputs": {"request_id": self.request_id}})
-            return {
-                "workflow_runs": [
-                    {
-                        "event_payload": payload,
-                        "status": "success",
-                        "conclusion": "success",
-                        "id": 42,
-                        "html_url": "https://example.test/run/42",
-                    }
-                ]
-            }
-        return {"workflow_runs": []}
-
-
-def test_wait_for_bridge_action_completion_checks_last_page(monkeypatch: pytest.MonkeyPatch):
-    """Test that wait_for_bridge_action_completion checks the last page when total_count > limit."""
-    request_id = "req-123"
-    client = DummyClient(request_id=request_id)
-
-    def mock_get_active_repo(config):
-        return "org/repo"
-
-    monkeypatch.setattr(forge_module, "create_forge_client", lambda config: client)
-    monkeypatch.setattr(forge_module, "_get_active_repo", mock_get_active_repo)
-    monkeypatch.setattr(forge_module.time, "time", lambda: 0)
-    monkeypatch.setattr(forge_module.time, "sleep", lambda *_args, **_kwargs: None)
-
-    # Config needs gitea_repo set to avoid errors in _get_active_repo
-    config = Config(username="user", password="pass", gitea_repo="org/repo")
-
-    result = forge_module.wait_for_bridge_action_completion(
-        config=config,
-        request_id=request_id,
-        timeout=10,
-    )
-
-    assert result["run_id"] == 42
-    assert result["conclusion"] == "success"
-    assert any("page=2" in call for call in client.calls)
 
 
 class TestGiteaClient:

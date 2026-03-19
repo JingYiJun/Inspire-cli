@@ -47,7 +47,6 @@ repo = "owner/repo"
 # token - use INSP_GITEA_TOKEN env var
 log_workflow = "retrieve_job_log.yml"
 sync_workflow = "sync_code.yml"
-bridge_workflow = "run_bridge_action.yml"
 remote_timeout = 90
 
 [github]
@@ -56,14 +55,12 @@ repo = "owner/repo"
 # token - use INSP_GITHUB_TOKEN env var
 log_workflow = "retrieve_job_log.yml"
 sync_workflow = "sync_code.yml"
-bridge_workflow = "run_bridge_action.yml"
 
 [sync]
 default_remote = "origin"
 
 [bridge]
 action_timeout = 600
-denylist = ["*.tmp", ".git/*"]
 
 [workspaces]
 # cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)

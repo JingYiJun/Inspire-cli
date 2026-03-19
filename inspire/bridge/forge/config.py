@@ -115,24 +115,20 @@ def _get_active_workflow_file(config: Config, workflow_type: str) -> str:
 
     Args:
         config: CLI configuration
-        workflow_type: One of 'log', 'sync', 'bridge'
+        workflow_type: One of 'log' or 'sync'
     """
     platform = _resolve_platform(config)
 
     if platform == GitPlatform.GITHUB:
         if workflow_type == "log":
             return getattr(config, "github_log_workflow", "retrieve_job_log.yml")
-        elif workflow_type == "sync":
+        if workflow_type == "sync":
             return getattr(config, "github_sync_workflow", "sync_code.yml")
-        elif workflow_type == "bridge":
-            return getattr(config, "github_bridge_workflow", "run_bridge_action.yml")
     else:
         if workflow_type == "log":
             return config.gitea_log_workflow
-        elif workflow_type == "sync":
+        if workflow_type == "sync":
             return config.gitea_sync_workflow
-        elif workflow_type == "bridge":
-            return config.gitea_bridge_workflow
 
     # Default fallback
     return "workflow.yml"

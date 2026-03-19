@@ -53,7 +53,6 @@ class Config:
     gitea_server: str = "https://codeberg.org"
     gitea_log_workflow: str = "retrieve_job_log.yml"
     gitea_sync_workflow: str = "sync_code.yml"
-    gitea_bridge_workflow: str = "run_bridge_action.yml"
 
     # GitHub settings
     github_repo: Optional[str] = None
@@ -61,7 +60,6 @@ class Config:
     github_server: str = "https://github.com"
     github_log_workflow: str = "retrieve_job_log.yml"
     github_sync_workflow: str = "sync_code.yml"
-    github_bridge_workflow: str = "run_bridge_action.yml"
 
     log_cache_dir: str = "~/.inspire/logs"
     remote_timeout: int = 90
@@ -69,9 +67,8 @@ class Config:
     # Sync settings
     default_remote: str = "origin"
 
-    # Bridge action settings
+    # Bridge exec settings
     bridge_action_timeout: int = 600
-    bridge_action_denylist: list[str] = field(default_factory=list)
 
     # API settings (additional)
     skip_ssl_verify: bool = False

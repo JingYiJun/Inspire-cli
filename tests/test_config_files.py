@@ -135,8 +135,7 @@ class TestConfigSchema:
         assert "INSP_PRIORITY" in project_env_vars
         assert "INSPIRE_NOTEBOOK_RESOURCE" in project_env_vars
 
-        # Bridge/Sync settings should be project
-        assert "INSPIRE_BRIDGE_DENYLIST" in project_env_vars
+        # Sync settings should be project
         assert "INSPIRE_DEFAULT_REMOTE" in project_env_vars
 
     def test_get_options_by_scope(self) -> None:
@@ -1567,18 +1566,6 @@ class TestInitHelpers:
         all_content = _generate_toml_content(detected)
         assert 'base_url = "https://custom.example.com"' in all_content
         assert 'target_dir = "/shared/myproject"' in all_content
-
-    def test_generate_toml_list_values(
-        self, monkeypatch: pytest.MonkeyPatch, clean_env: None
-    ) -> None:
-        """Test TOML generation with list values."""
-        monkeypatch.setenv("INSPIRE_BRIDGE_DENYLIST", "*.pyc,__pycache__,*.log")
-
-        detected = _detect_env_vars()
-        toml_content = _generate_toml_content(detected)
-
-        assert "[bridge]" in toml_content
-        assert 'denylist = ["*.pyc", "__pycache__", "*.log"]' in toml_content
 
     def test_generate_toml_preserves_special_chars(
         self, monkeypatch: pytest.MonkeyPatch, clean_env: None

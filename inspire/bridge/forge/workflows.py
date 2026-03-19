@@ -136,28 +136,6 @@ def trigger_sync_workflow(
     return ""
 
 
-def trigger_bridge_action_workflow(
-    config: Config,
-    raw_command: str,
-    artifact_paths: list[str],
-    request_id: str,
-    denylist: Optional[list[str]] = None,
-) -> None:
-    """Trigger the Bridge action workflow for arbitrary command exec."""
-    denylist_str = "\n".join(denylist or [])
-    artifact_paths_str = "\n".join(artifact_paths)
-
-    inputs = {
-        "raw_command": raw_command,
-        "denylist": denylist_str,
-        "target_dir": config.target_dir or "",
-        "artifact_paths": artifact_paths_str,
-        "request_id": request_id,
-    }
-    workflow_file = _get_active_workflow_file(config, "bridge")
-    trigger_workflow_dispatch(config, workflow_file, inputs)
-
-
 def get_workflow_runs(config: Config, limit: int = 20) -> list:
     """Get recent workflow runs."""
     repo = _get_active_repo(config)

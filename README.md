@@ -58,7 +58,7 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 | `inspire job stop/wait` | Stop or wait for a job |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
 | `inspire sync` | Sync code to shared filesystem (via SSH tunnel) |
-| `inspire bridge exec "<cmd>"` | Run command on Bridge runner |
+| `inspire bridge exec "<cmd>"` | Run command on a Bridge profile via SSH tunnel |
 | `inspire bridge ssh [--bridge <name>]` | Interactive SSH shell to a Bridge profile |
 | `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
 | `inspire notebook list/create` | List or create notebook instances |

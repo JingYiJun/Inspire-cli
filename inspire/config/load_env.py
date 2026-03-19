@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from inspire.config.env import _parse_denylist, _parse_remote_timeout
+from inspire.config.env import _parse_remote_timeout
 from inspire.config.models import Config, ConfigError
 
 
@@ -89,19 +89,16 @@ def config_from_env(*, require_target_dir: bool = False) -> Config:
         gitea_server=os.getenv("INSP_GITEA_SERVER", "https://codeberg.org"),
         gitea_log_workflow=os.getenv("INSP_GITEA_LOG_WORKFLOW", "retrieve_job_log.yml"),
         gitea_sync_workflow=os.getenv("INSP_GITEA_SYNC_WORKFLOW", "sync_code.yml"),
-        gitea_bridge_workflow=os.getenv("INSP_GITEA_BRIDGE_WORKFLOW", "run_bridge_action.yml"),
         github_repo=os.getenv("INSP_GITHUB_REPO"),
         github_token=os.getenv("INSP_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN"),
         github_server=os.getenv("INSP_GITHUB_SERVER", "https://github.com"),
         github_log_workflow=os.getenv("INSP_GITHUB_LOG_WORKFLOW", "retrieve_job_log.yml"),
         github_sync_workflow=os.getenv("INSP_GITHUB_SYNC_WORKFLOW", "sync_code.yml"),
-        github_bridge_workflow=os.getenv("INSP_GITHUB_BRIDGE_WORKFLOW", "run_bridge_action.yml"),
         log_cache_dir=os.getenv("INSP_LOG_CACHE_DIR")
         or os.getenv("INSPIRE_LOG_CACHE_DIR", "~/.inspire/logs"),
         remote_timeout=_parse_remote_timeout(os.getenv("INSP_REMOTE_TIMEOUT", "90")),
         default_remote=os.getenv("INSPIRE_DEFAULT_REMOTE", "origin"),
         bridge_action_timeout=bridge_action_timeout,
-        bridge_action_denylist=_parse_denylist(os.getenv("INSPIRE_BRIDGE_DENYLIST")),
     )
 
 
@@ -162,15 +159,12 @@ def config_from_env_for_sync() -> Config:
         gitea_server=gitea_server,
         gitea_log_workflow=os.getenv("INSP_GITEA_LOG_WORKFLOW", "retrieve_job_log.yml"),
         gitea_sync_workflow=os.getenv("INSP_GITEA_SYNC_WORKFLOW", "sync_code.yml"),
-        gitea_bridge_workflow=os.getenv("INSP_GITEA_BRIDGE_WORKFLOW", "run_bridge_action.yml"),
         github_repo=github_repo,
         github_token=github_token,
         github_server=github_server,
         github_log_workflow=os.getenv("INSP_GITHUB_LOG_WORKFLOW", "retrieve_job_log.yml"),
         github_sync_workflow=os.getenv("INSP_GITHUB_SYNC_WORKFLOW", "sync_code.yml"),
-        github_bridge_workflow=os.getenv("INSP_GITHUB_BRIDGE_WORKFLOW", "run_bridge_action.yml"),
         default_remote=os.getenv("INSPIRE_DEFAULT_REMOTE", "origin"),
         remote_timeout=_parse_remote_timeout(os.getenv("INSP_REMOTE_TIMEOUT", "90")),
         bridge_action_timeout=bridge_action_timeout,
-        bridge_action_denylist=_parse_denylist(os.getenv("INSPIRE_BRIDGE_DENYLIST")),
     )
