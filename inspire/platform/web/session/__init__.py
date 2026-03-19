@@ -197,12 +197,14 @@ def fetch_workspace_availability(
     session: WebSession,
     base_url: str = "https://api.example.com",
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    workspace_id: Optional[str] = None,
 ) -> list[dict]:
     return _fetch_workspace_availability(
         session,
         request_json_fn=request_json,
         base_url=base_url,
         progress_callback=progress_callback,
+        workspace_id=workspace_id,
     )
 
 

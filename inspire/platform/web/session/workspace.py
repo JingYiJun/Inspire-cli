@@ -42,12 +42,13 @@ def fetch_workspace_availability(
     request_json_fn: Callable[..., dict],
     base_url: str = "https://api.example.com",
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    workspace_id: Optional[str] = None,
 ) -> list[dict]:
     """Fetch workspace-specific GPU availability.
 
-    Uses the browser API endpoint POST /api/v1/cluster_nodes/list which returns
-    nodes with complete task_list data for accurate free node counting.
-    This matches what the user sees in the browser.
+    Prefers the browser API endpoint GET /api/v1/cluster_nodes/workspace/<workspace_id>,
+    which matches the web UI's workspace-scoped node view. Falls back to
+    POST /api/v1/cluster_nodes/list with a workspace filter for older deployments.
 
     Args:
         session: Web session with storage_state and workspace_id
@@ -66,22 +67,36 @@ def fetch_workspace_availability(
         if not session.cookies:
             raise ValueError("Session expired or invalid (missing storage state)")
 
-    if not session.workspace_id:
+    effective_workspace_id = workspace_id or session.workspace_id
+    if not effective_workspace_id:
         raise ValueError("No workspace_id in session. Please login again.")
 
-    url = f"{base_url}/api/v1/cluster_nodes/list"
-    body = {
-        "page_num": 1,
-        "page_size": -1,  # Get all nodes
-        "filter": {},  # No filter to get all workspace nodes
-    }
+    referer = f"{base_url}/jobs/distributedTraining?spaceId={effective_workspace_id}"
+
+    try:
+        data = request_json_fn(
+            session,
+            "GET",
+            f"{base_url}/api/v1/cluster_nodes/workspace/{effective_workspace_id}",
+            headers={"Referer": referer},
+            timeout=30,
+        )
+        nodes = data.get("data", {}).get("nodes", [])
+        if isinstance(nodes, list):
+            return nodes
+    except Exception:
+        pass
 
     data = request_json_fn(
         session,
         "POST",
-        url,
-        body=body,
-        headers={"Referer": f"{base_url}/jobs/distributedTraining"},
+        f"{base_url}/api/v1/cluster_nodes/list",
+        body={
+            "page_num": 1,
+            "page_size": -1,
+            "filter": {"workspace_id": effective_workspace_id},
+        },
+        headers={"Referer": referer},
         timeout=30,
     )
     return data.get("data", {}).get("nodes", [])

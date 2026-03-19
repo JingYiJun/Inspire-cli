@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from inspire.config import Config
+from inspire.cli.commands.notebook import notebook_create_flow as notebook_flow_mod
 from inspire.platform.web import resources as resources_mod
 from inspire.platform.web.browser_api.availability import select as select_mod
 from inspire.platform.web.browser_api.availability.models import GPUAvailability
@@ -31,7 +32,7 @@ def test_fetch_resource_availability_known_only_uses_resolved_config(monkeypatch
     monkeypatch.setattr(
         resources_mod,
         "fetch_workspace_availability",
-        lambda session, base_url=None: [
+        lambda session, base_url=None, workspace_id=None: [
             {
                 "gpu_count": 8,
                 "logic_compute_group_id": "lcg-known",
@@ -87,7 +88,7 @@ def test_find_best_compute_group_uses_node_availability_without_explicit_config(
     monkeypatch.setattr(
         resources_mod,
         "fetch_workspace_availability",
-        lambda session, base_url=None: [
+        lambda session, base_url=None, workspace_id=None: [
             {
                 "gpu_count": 8,
                 "logic_compute_group_id": "lcg-h200-1",
@@ -138,7 +139,7 @@ def test_find_best_compute_group_prefers_actual_free_gpus_before_preemptible(
     monkeypatch.setattr(
         select_mod,
         "get_accurate_gpu_availability",
-        lambda: [
+        lambda workspace_id=None: [
             GPUAvailability(
                 group_id="lcg-h200-3",
                 group_name="H200-3号机房",
@@ -193,7 +194,7 @@ def test_fetch_resource_availability_excludes_broken_nodes(monkeypatch) -> None:
         lambda require_workspace=True: SimpleNamespace(workspace_id="ws-test"),
     )
 
-    def fake_nodes(session, base_url=None):
+    def fake_nodes(session, base_url=None, workspace_id=None):
         base = {
             "gpu_count": 8,
             "logic_compute_group_id": "lcg-test",
@@ -234,3 +235,85 @@ def test_fetch_resource_availability_excludes_broken_nodes(monkeypatch) -> None:
     assert group.ready_nodes == 6  # all have status=READY
     assert group.free_nodes == 1  # only the truly free node
     assert group.free_gpus == 8  # 1 free node * 8 GPUs
+
+
+def test_fetch_resource_availability_uses_explicit_workspace_id(monkeypatch) -> None:
+    cfg = Config(
+        username="user",
+        password="pass",
+        base_url="https://example.com",
+        compute_groups=[
+            {"id": "lcg-h200-1", "name": "H200-1号机房", "gpu_type": "H200"},
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        resources_mod.Config,
+        "from_files_and_env",
+        lambda *args, **kwargs: (cfg, {}),
+    )
+    monkeypatch.setattr(
+        resources_mod,
+        "get_web_session",
+        lambda require_workspace=True: SimpleNamespace(workspace_id="ws-session"),
+    )
+
+    def fake_nodes(session, base_url=None, workspace_id=None):
+        captured["workspace_id"] = workspace_id
+        return [
+            {
+                "gpu_count": 8,
+                "logic_compute_group_id": "lcg-h200-1",
+                "logic_compute_group_name": "H200-1号机房",
+                "gpu_info": {"gpu_type_display": "NVIDIA H200 (141GB)"},
+                "resource_pool": "online",
+                "status": "READY",
+                "task_list": [],
+            }
+        ]
+
+    monkeypatch.setattr(resources_mod, "fetch_workspace_availability", fake_nodes)
+
+    resources_mod.clear_availability_cache()
+    resources_mod.fetch_resource_availability(
+        config=cfg,
+        known_only=True,
+        workspace_id="ws-explicit",
+    )
+
+    assert captured["workspace_id"] == "ws-explicit"
+
+
+def test_auto_select_compute_group_passes_workspace_id(monkeypatch) -> None:
+    captured = {}
+    fake_best = SimpleNamespace(
+        group_id="lcg-h200-1",
+        group_name="H200-1号机房",
+        gpu_type="H200",
+        available_gpus=8,
+        free_nodes=1,
+        selection_source="nodes",
+    )
+
+    def fake_find_best_compute_group_accurate(**kwargs):
+        captured.update(kwargs)
+        return fake_best
+
+    monkeypatch.setattr(
+        notebook_flow_mod.browser_api_module,
+        "find_best_compute_group_accurate",
+        fake_find_best_compute_group_accurate,
+    )
+
+    result = notebook_flow_mod._auto_select_compute_group(
+        object(),
+        workspace_id="ws-gpu-explicit",
+        gpu_count=8,
+        gpu_pattern="H200",
+        auto=True,
+        json_output=True,
+    )
+
+    assert result is not None
+    assert captured["workspace_id"] == "ws-gpu-explicit"

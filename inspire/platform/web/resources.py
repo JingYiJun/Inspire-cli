@@ -72,6 +72,7 @@ def fetch_resource_availability(
     config: Optional[Config] = None,
     known_only: bool = False,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    workspace_id: Optional[str] = None,
 ) -> list[ComputeGroupAvailability]:
     """Fetch real-time GPU availability from compute groups.
 
@@ -82,6 +83,7 @@ def fetch_resource_availability(
         config: Optional CLI configuration (used for base_url override and compute_groups)
         known_only: If True, only return known compute groups (for auto-selection)
         progress_callback: Optional callback(fetched, total) for progress updates
+        workspace_id: Explicit workspace to scope node availability to
 
     Returns:
         List of ComputeGroupAvailability sorted by free_gpus (descending)
@@ -107,12 +109,6 @@ def fetch_resource_availability(
     # Update global for backward compatibility
     KNOWN_COMPUTE_GROUPS = known_groups_map
 
-    # Check cache
-    if _availability_cache and (time.time() - _cache_time < _CACHE_TTL):
-        cache_key = "known" if known_only else "all"
-        if cache_key in _availability_cache:
-            return _availability_cache[cache_key]
-
     base_url = None
     if resolved_config is not None:
         base_url = getattr(resolved_config, "base_url", None)
@@ -120,7 +116,19 @@ def fetch_resource_availability(
         base_url = os.environ.get("INSPIRE_BASE_URL", "https://api.example.com")
 
     session = get_web_session(require_workspace=True)
-    nodes = fetch_workspace_availability(session, base_url=base_url)
+    effective_workspace_id = workspace_id or getattr(session, "workspace_id", None)
+
+    # Check cache after resolving the effective workspace to avoid cross-workspace leakage.
+    cache_key = f"{effective_workspace_id or ''}|{'known' if known_only else 'all'}"
+    if _availability_cache and (time.time() - _cache_time < _CACHE_TTL):
+        if cache_key in _availability_cache:
+            return _availability_cache[cache_key]
+
+    nodes = fetch_workspace_availability(
+        session,
+        base_url=base_url,
+        workspace_id=effective_workspace_id,
+    )
 
     groups: dict[str, dict] = {}
     total = len(nodes)
@@ -217,7 +225,7 @@ def fetch_resource_availability(
     # Update cache
     if _availability_cache is None:
         _availability_cache = {}
-    _availability_cache["known" if known_only else "all"] = availability_list
+    _availability_cache[cache_key] = availability_list
     _cache_time = time.time()
 
     return availability_list

@@ -138,6 +138,7 @@ def resolve_notebook_workspace_id(
 def _auto_select_compute_group(
     ctx: Context,
     *,
+    workspace_id: str,
     gpu_count: int,
     gpu_pattern: str,
     auto: bool,
@@ -153,6 +154,7 @@ def _auto_select_compute_group(
             min_gpus=gpu_count,
             include_preemptible=True,
             prefer_full_nodes=True,
+            workspace_id=workspace_id,
         )
     except Exception as e:
         if not json_output:
@@ -296,6 +298,7 @@ def resolve_notebook_compute_group(
 ) -> tuple[str, str, str, str] | None:
     auto_selected = _auto_select_compute_group(
         ctx,
+        workspace_id=workspace_id,
         gpu_count=gpu_count,
         gpu_pattern=gpu_pattern,
         auto=auto,

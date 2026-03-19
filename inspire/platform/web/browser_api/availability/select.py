@@ -16,13 +16,17 @@ def find_best_compute_group_accurate(
     include_preemptible: bool = True,
     instance_count: int = 1,
     prefer_full_nodes: bool = True,
+    workspace_id: Optional[str] = None,
 ) -> Optional[GPUAvailability]:
     """Find the best compute group using accurate browser API data."""
     if prefer_full_nodes:
         try:
             from inspire.platform.web.resources import fetch_resource_availability
 
-            node_availability = fetch_resource_availability(known_only=not preferred_groups)
+            node_availability = fetch_resource_availability(
+                known_only=not preferred_groups,
+                workspace_id=workspace_id,
+            )
             gpu_type_upper = (gpu_type or "").upper()
             required_instances = max(1, int(instance_count))
             normalized_min_gpus = max(1, int(min_gpus))
@@ -78,7 +82,7 @@ def find_best_compute_group_accurate(
         except Exception:
             pass
 
-    availability = get_accurate_gpu_availability()
+    availability = get_accurate_gpu_availability(workspace_id=workspace_id)
     if not availability:
         return None
 
