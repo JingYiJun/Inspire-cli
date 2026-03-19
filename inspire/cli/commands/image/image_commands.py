@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -23,10 +24,14 @@ from inspire.cli.utils.id_resolver import (
     resolve_partial_id,
 )
 from inspire.cli.utils.notebook_cli import (
+    load_config,
     require_web_session,
     resolve_json_output,
 )
+from inspire.config import ConfigError
+from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import browser_api as browser_api_module
+from inspire.platform.web.session import DEFAULT_WORKSPACE_ID
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +39,18 @@ from inspire.platform.web import browser_api as browser_api_module
 # ---------------------------------------------------------------------------
 
 _SOURCE_CHOICES = ("official", "public", "private", "personal-visible", "all")
+_IMAGE_SEARCH_SOURCES = ("official", "public", "private", "personal-visible")
+
+
+@dataclass
+class _ImageLookupCandidate:
+    image_id: str
+    name: str
+    url: str
+    source: str
+    status: str
+    workspace_id: str
+    workspace_name: str
 
 
 def _image_to_dict(img: browser_api_module.CustomImageInfo) -> dict:
@@ -96,12 +113,264 @@ def _resolve_image_id(
     return resolve_partial_id(ctx, partial, "image", matches, json_output)
 
 
+def _append_unique_workspace_id(candidates: list[str], seen: set[str], workspace_id: Optional[str]) -> None:
+    value = str(workspace_id or "").strip()
+    if not value or value == DEFAULT_WORKSPACE_ID or value in seen:
+        return
+    seen.add(value)
+    candidates.append(value)
+
+
+def _workspace_label(config, session, workspace_id: str) -> str:
+    all_names = getattr(session, "all_workspace_names", None) or {}
+    name = str(all_names.get(workspace_id, "")).strip()
+    if name:
+        return name
+
+    if workspace_id == getattr(config, "workspace_cpu_id", None):
+        return "cpu"
+    if workspace_id == getattr(config, "workspace_gpu_id", None):
+        return "gpu"
+    if workspace_id == getattr(config, "workspace_internet_id", None):
+        return "internet"
+    if workspace_id == getattr(config, "job_workspace_id", None):
+        return "default"
+
+    for alias, value in (getattr(config, "workspaces", None) or {}).items():
+        if value == workspace_id:
+            return alias
+
+    return workspace_id
+
+
+def _resolve_detail_workspace_search_order(
+    config,
+    session,
+    *,
+    workspace: Optional[str],
+    workspace_id: Optional[str],
+) -> tuple[list[str], list[str]]:
+    if workspace_id:
+        validated = select_workspace_id(config, explicit_workspace_id=workspace_id)
+        return [validated], []
+
+    if workspace:
+        validated = select_workspace_id(config, explicit_workspace_name=workspace)
+        return [validated], []
+
+    primary: list[str] = []
+    fallback: list[str] = []
+    seen: set[str] = set()
+
+    try:
+        default_workspace_id = select_workspace_id(config)
+    except ConfigError:
+        default_workspace_id = None
+
+    _append_unique_workspace_id(primary, seen, default_workspace_id)
+    _append_unique_workspace_id(primary, seen, getattr(session, "workspace_id", None))
+
+    for candidate in (
+        getattr(config, "workspace_cpu_id", None),
+        getattr(config, "workspace_gpu_id", None),
+        getattr(config, "workspace_internet_id", None),
+        getattr(config, "job_workspace_id", None),
+    ):
+        _append_unique_workspace_id(fallback, seen, candidate)
+
+    for candidate in (getattr(config, "workspaces", None) or {}).values():
+        _append_unique_workspace_id(fallback, seen, candidate)
+
+    for candidate in getattr(session, "all_workspace_ids", None) or []:
+        _append_unique_workspace_id(fallback, seen, candidate)
+
+    return primary, fallback
+
+
+def _collect_image_lookup_matches(
+    *,
+    session,
+    config,
+    workspace_ids: list[str],
+    matcher,
+) -> list[_ImageLookupCandidate]:
+    matches_by_id: dict[str, _ImageLookupCandidate] = {}
+
+    for ws_id in workspace_ids:
+        ws_label = _workspace_label(config, session, ws_id)
+        for source in _IMAGE_SEARCH_SOURCES:
+            items = browser_api_module.list_images_by_source(
+                source=source,
+                workspace_id=ws_id,
+                session=session,
+            )
+            for img in items:
+                candidate = _ImageLookupCandidate(
+                    image_id=img.image_id,
+                    name=img.name,
+                    url=img.url,
+                    source=img.source,
+                    status=img.status,
+                    workspace_id=ws_id,
+                    workspace_name=ws_label,
+                )
+                if not matcher(candidate):
+                    continue
+                matches_by_id.setdefault(candidate.image_id, candidate)
+
+    return list(matches_by_id.values())
+
+
+def _choose_image_match(
+    ctx: Context,
+    query: str,
+    matches: list[_ImageLookupCandidate],
+    *,
+    json_output: bool,
+    lookup_kind: str,
+) -> str:
+    if not matches:
+        raise LookupError(f"No image matches {lookup_kind} '{query}'.")
+
+    if len(matches) == 1:
+        return matches[0].image_id
+
+    if json_output:
+        options = ", ".join(
+            f"{item.image_id} ({item.name or item.url} @ {item.workspace_name})" for item in matches
+        )
+        _handle_error(
+            ctx,
+            "AmbiguousImage",
+            f"{lookup_kind.capitalize()} '{query}' matches {len(matches)} images: {options}",
+            EXIT_VALIDATION_ERROR,
+            hint="Use --workspace/--workspace-id or provide a full image ID.",
+        )
+        raise click.Abort()
+
+    click.echo(f"{lookup_kind.capitalize()} '{query}' matches {len(matches)} images:")
+    for idx, item in enumerate(matches, start=1):
+        label = item.name or item.url or item.image_id
+        click.echo(
+            f"  [{idx}] {item.image_id}  {label}  {item.source}  {item.workspace_name}"
+        )
+
+    choice = click.prompt(
+        "Select image",
+        type=click.IntRange(1, len(matches)),
+        default=1,
+        show_default=True,
+    )
+    return matches[choice - 1].image_id
+
+
+def _resolve_image_ref_for_detail(
+    ctx: Context,
+    image_ref: str,
+    *,
+    json_output: bool,
+    session,
+    config,
+    workspace: Optional[str],
+    workspace_id: Optional[str],
+) -> tuple[str, Optional[browser_api_module.CustomImageInfo]]:
+    image_ref = image_ref.strip()
+
+    if is_full_uuid(image_ref):
+        return image_ref, None
+
+    primary_workspace_ids, fallback_workspace_ids = _resolve_detail_workspace_search_order(
+        config,
+        session,
+        workspace=workspace,
+        workspace_id=workspace_id,
+    )
+
+    if is_partial_id(image_ref):
+        partial = normalize_partial(image_ref)
+
+        def partial_match(candidate: _ImageLookupCandidate) -> bool:
+            return candidate.image_id.lower().startswith(partial)
+
+        matches = _collect_image_lookup_matches(
+            session=session,
+            config=config,
+            workspace_ids=primary_workspace_ids,
+            matcher=partial_match,
+        )
+        if not matches and fallback_workspace_ids:
+            matches = _collect_image_lookup_matches(
+                session=session,
+                config=config,
+                workspace_ids=fallback_workspace_ids,
+                matcher=partial_match,
+            )
+
+        resolved = _choose_image_match(
+            ctx,
+            partial,
+            matches,
+            json_output=json_output,
+            lookup_kind="partial id",
+        )
+        return resolved, None
+
+    try:
+        image = browser_api_module.get_image_detail(image_id=image_ref, session=session)
+        return image_ref, image
+    except Exception:
+        pass
+
+    lowered_ref = image_ref.lower()
+
+    def ref_match(candidate: _ImageLookupCandidate) -> bool:
+        name = (candidate.name or "").strip().lower()
+        url = (candidate.url or "").strip().lower()
+        url_tail = url.rsplit("/", 1)[-1] if url else ""
+        if lowered_ref == name or lowered_ref == url_tail:
+            return True
+        if "/" in lowered_ref and url.endswith(lowered_ref):
+            return True
+        return lowered_ref == url
+
+    matches = _collect_image_lookup_matches(
+        session=session,
+        config=config,
+        workspace_ids=primary_workspace_ids,
+        matcher=ref_match,
+    )
+    if not matches and fallback_workspace_ids:
+        matches = _collect_image_lookup_matches(
+            session=session,
+            config=config,
+            workspace_ids=fallback_workspace_ids,
+            matcher=ref_match,
+        )
+
+    resolved = _choose_image_match(
+        ctx,
+        image_ref,
+        matches,
+        json_output=json_output,
+        lookup_kind="image reference",
+    )
+    return resolved, None
+
+
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------
 
 
 @click.command("list")
+@click.option(
+    "--workspace",
+    help="Workspace name (from [workspaces])",
+)
+@click.option(
+    "--workspace-id",
+    help="Workspace ID (defaults to configured workspace)",
+)
 @click.option(
     "--source",
     "-s",
@@ -119,6 +388,8 @@ def _resolve_image_id(
 @pass_context
 def list_images_cmd(
     ctx: Context,
+    workspace: Optional[str],
+    workspace_id: Optional[str],
     source: str,
     json_output: bool,
 ) -> None:
@@ -127,6 +398,8 @@ def list_images_cmd(
     \b
     Examples:
         inspire image list                              # Official images
+        inspire image list --workspace gpu              # Resolve workspace alias from config
+        inspire image list --workspace-id ws-...        # Query a specific workspace directly
         inspire image list --source private             # Your custom images
         inspire image list --source personal-visible    # Web UI "personal visible" tab
         inspire image list --source all                 # All sources
@@ -142,16 +415,58 @@ def list_images_cmd(
             "INSPIRE_USERNAME/INSPIRE_PASSWORD."
         ),
     )
+    config = load_config(ctx)
+
+    resolved_workspace_id: Optional[str] = None
+    if workspace_id:
+        resolved_workspace_id = workspace_id
+    elif workspace:
+        try:
+            resolved_workspace_id = select_workspace_id(config, explicit_workspace_name=workspace)
+        except ConfigError as e:
+            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+            return
+    else:
+        try:
+            resolved_workspace_id = select_workspace_id(config)
+        except ConfigError as e:
+            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+            return
+
+        resolved_workspace_id = resolved_workspace_id or getattr(session, "workspace_id", None)
+        resolved_workspace_id = (
+            None if resolved_workspace_id == DEFAULT_WORKSPACE_ID else resolved_workspace_id
+        )
+        if not resolved_workspace_id:
+            _handle_error(
+                ctx,
+                "ConfigError",
+                "No workspace_id configured or provided.",
+                EXIT_CONFIG_ERROR,
+                hint=(
+                    "Use --workspace-id, set [workspaces].cpu/[workspaces].gpu in config.toml, "
+                    "or set INSPIRE_WORKSPACE_ID."
+                ),
+            )
+            return
 
     results: list[dict] = []
 
     try:
         if source == "all":
             for src_key in ("official", "public", "private"):
-                items = browser_api_module.list_images_by_source(source=src_key, session=session)
+                items = browser_api_module.list_images_by_source(
+                    source=src_key,
+                    workspace_id=resolved_workspace_id,
+                    session=session,
+                )
                 results.extend(_image_to_dict(img) for img in items)
         else:
-            items = browser_api_module.list_images_by_source(source=source, session=session)
+            items = browser_api_module.list_images_by_source(
+                source=source,
+                workspace_id=resolved_workspace_id,
+                session=session,
+            )
             results.extend(_image_to_dict(img) for img in items)
     except Exception as e:
         _handle_error(ctx, "APIError", f"Failed to list images: {e}", EXIT_API_ERROR)
@@ -172,6 +487,14 @@ def list_images_cmd(
 @click.command("detail")
 @click.argument("image_id")
 @click.option(
+    "--workspace",
+    help="Workspace name (from [workspaces])",
+)
+@click.option(
+    "--workspace-id",
+    help="Workspace ID (limits automatic image lookup to one workspace)",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -181,6 +504,8 @@ def list_images_cmd(
 def image_detail(
     ctx: Context,
     image_id: str,
+    workspace: Optional[str],
+    workspace_id: Optional[str],
     json_output: bool,
 ) -> None:
     """Show detailed information about an image.
@@ -188,6 +513,9 @@ def image_detail(
     \b
     Examples:
         inspire image detail <image-id>
+        inspire image detail kchen-slurm-ffmpeg:3.2
+        inspire image detail docker.sii.shaipower.online/inspire-studio/kchen-slurm-ffmpeg:3.2
+        inspire image detail kchen-slurm-ffmpeg:3.2 --workspace internet
         inspire image detail <image-id> --json
     """
     json_output = resolve_json_output(ctx, json_output)
@@ -200,11 +528,26 @@ def image_detail(
             "INSPIRE_USERNAME/INSPIRE_PASSWORD."
         ),
     )
-
-    image_id = _resolve_image_id(ctx, image_id, json_output, session)
+    config = load_config(ctx)
 
     try:
-        image = browser_api_module.get_image_detail(image_id=image_id, session=session)
+        image_id, prefetched_image = _resolve_image_ref_for_detail(
+            ctx,
+            image_id,
+            json_output=json_output,
+            session=session,
+            config=config,
+            workspace=workspace,
+            workspace_id=workspace_id,
+        )
+    except ConfigError as e:
+        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+        return
+
+    try:
+        image = prefetched_image or browser_api_module.get_image_detail(
+            image_id=image_id, session=session
+        )
     except Exception as e:
         _handle_error(ctx, "APIError", f"Failed to get image detail: {e}", EXIT_API_ERROR)
         return

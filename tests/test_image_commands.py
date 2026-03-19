@@ -27,8 +27,17 @@ from inspire.platform.web.browser_api.images import (
 
 
 class FakeWebSession:
-    workspace_id = "ws-test-workspace"
-    storage_state = {}
+    def __init__(
+        self,
+        workspace_id: str = "ws-test-workspace",
+        *,
+        all_workspace_ids: Optional[list[str]] = None,
+        all_workspace_names: Optional[dict[str, str]] = None,
+    ) -> None:
+        self.workspace_id = workspace_id
+        self.storage_state = {}
+        self.all_workspace_ids = all_workspace_ids
+        self.all_workspace_names = all_workspace_names or {}
 
 
 def _make_config(tmp_path: Path) -> config_module.Config:
@@ -210,6 +219,34 @@ def test_list_images_by_source_official(monkeypatch: pytest.MonkeyPatch):
     assert captured["body"]["filter"]["source"] == "SOURCE_OFFICIAL"
 
 
+def test_list_images_by_source_uses_explicit_workspace_id(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, Any] = {}
+
+    def fake_request_notebooks_data(
+        session,
+        method: str,
+        endpoint_path: str,
+        *,
+        body: Optional[dict] = None,
+        timeout: int = 30,
+        default_data: Any = None,
+    ) -> Any:
+        captured["body"] = body
+        return {"images": []}
+
+    from inspire.platform.web.browser_api import images as images_module
+
+    monkeypatch.setattr(images_module, "_request_notebooks_data", fake_request_notebooks_data)
+    monkeypatch.setattr(
+        images_module,
+        "_get_session_and_workspace_id",
+        lambda workspace_id, session: (FakeWebSession(), workspace_id or "ws-fallback"),
+    )
+
+    list_images_by_source(source="official", workspace_id="ws-explicit")
+    assert captured["body"]["filter"]["registry_hint"]["workspace_id"] == "ws-explicit"
+
+
 def test_list_images_by_source_public(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, Any] = {}
 
@@ -326,7 +363,7 @@ def test_image_list_human_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     monkeypatch.setattr(
         browser_api_module,
         "list_images_by_source",
-        lambda source="official", session=None: [
+        lambda source="official", workspace_id=None, session=None: [
             browser_api_module.CustomImageInfo(
                 image_id="img-001",
                 url="registry/pytorch:2.0",
@@ -357,7 +394,7 @@ def test_image_list_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     monkeypatch.setattr(
         browser_api_module,
         "list_images_by_source",
-        lambda source="official", session=None: [
+        lambda source="official", workspace_id=None, session=None: [
             browser_api_module.CustomImageInfo(
                 image_id="img-001",
                 url="registry/pytorch:2.0",
@@ -389,7 +426,7 @@ def test_image_list_private_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     monkeypatch.setattr(
         browser_api_module,
         "list_images_by_source",
-        lambda source="official", session=None: [
+        lambda source="official", workspace_id=None, session=None: [
             browser_api_module.CustomImageInfo(
                 image_id="img-priv-001",
                 url="registry/my-custom:v1",
@@ -416,7 +453,7 @@ def test_image_list_private_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 def test_image_list_all_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch_config_and_session(monkeypatch, tmp_path)
 
-    def fake_list_by_source(source="official", session=None):
+    def fake_list_by_source(source="official", workspace_id=None, session=None):
         if source == "official":
             return [
                 browser_api_module.CustomImageInfo(
@@ -463,6 +500,72 @@ def test_image_list_all_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     names = [img["name"] for img in payload["data"]["images"]]
     assert "official-img" in names
     assert "private-img" in names
+
+
+def test_image_list_defaults_to_notebook_list_workspace_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _patch_config_and_session(monkeypatch, tmp_path)
+    captured: dict[str, Any] = {}
+
+    def fake_list_by_source(source="official", workspace_id=None, session=None):
+        captured["source"] = source
+        captured["workspace_id"] = workspace_id
+        return []
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_by_source)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "image", "list"])
+    assert result.exit_code == 0
+    assert captured["source"] == "official"
+    assert captured["workspace_id"] == config.job_workspace_id
+
+
+def test_image_list_resolves_workspace_alias_like_notebook_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _patch_config_and_session(monkeypatch, tmp_path)
+    config.workspace_gpu_id = "ws-22222222-2222-2222-2222-222222222222"
+    captured: dict[str, Any] = {}
+
+    def fake_list_by_source(source="official", workspace_id=None, session=None):
+        captured["workspace_id"] = workspace_id
+        return []
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_by_source)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "image", "list", "--workspace", "gpu"])
+    assert result.exit_code == 0
+    assert captured["workspace_id"] == config.workspace_gpu_id
+
+
+def test_image_list_uses_explicit_workspace_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_config_and_session(monkeypatch, tmp_path)
+    captured: dict[str, Any] = {}
+
+    def fake_list_by_source(source="official", workspace_id=None, session=None):
+        captured["workspace_id"] = workspace_id
+        return []
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_by_source)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        [
+            "--json",
+            "image",
+            "list",
+            "--workspace-id",
+            "ws-33333333-3333-3333-3333-333333333333",
+        ],
+    )
+    assert result.exit_code == 0
+    assert captured["workspace_id"] == "ws-33333333-3333-3333-3333-333333333333"
 
 
 def test_image_detail_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -517,6 +620,258 @@ def test_image_detail_human(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     assert result.exit_code == 0
     assert "Image Detail" in result.output
     assert "detail-img" in result.output
+
+
+def test_image_detail_resolves_name_across_workspaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _patch_config_and_session(monkeypatch, tmp_path)
+    config.job_workspace_id = "ws-11111111-1111-1111-1111-111111111111"
+    config.workspace_internet_id = "ws-22222222-2222-2222-2222-222222222222"
+
+    session = FakeWebSession(
+        workspace_id=config.job_workspace_id,
+        all_workspace_ids=[config.job_workspace_id, config.workspace_internet_id],
+        all_workspace_names={
+            config.job_workspace_id: "gpu",
+            config.workspace_internet_id: "internet",
+        },
+    )
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: session)
+
+    captured_workspace_ids: list[str] = []
+
+    def fake_list_images_by_source(source="official", workspace_id=None, session=None):
+        captured_workspace_ids.append(workspace_id)
+        if workspace_id == config.workspace_internet_id and source == "personal-visible":
+            return [
+                browser_api_module.CustomImageInfo(
+                    image_id="image-kchen-001",
+                    url="docker.sii.shaipower.online/inspire-studio/kchen-slurm-ffmpeg:3.2",
+                    name="kchen-slurm-ffmpeg:3.2",
+                    framework="",
+                    version="3.2",
+                    source="SOURCE_PUBLIC",
+                    status="SUCCESS",
+                    description="",
+                    created_at="",
+                )
+            ]
+        return []
+
+    def fake_get_image_detail(image_id, session=None):
+        if image_id == "kchen-slurm-ffmpeg:3.2":
+            raise ValueError("not found")
+        return browser_api_module.CustomImageInfo(
+            image_id=image_id,
+            url="docker.sii.shaipower.online/inspire-studio/kchen-slurm-ffmpeg:3.2",
+            name="kchen-slurm-ffmpeg:3.2",
+            framework="",
+            version="3.2",
+            source="SOURCE_PUBLIC",
+            status="SUCCESS",
+            description="",
+            created_at="",
+        )
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_images_by_source)
+    monkeypatch.setattr(browser_api_module, "get_image_detail", fake_get_image_detail)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "image", "detail", "kchen-slurm-ffmpeg:3.2"])
+    assert result.exit_code == 0
+
+    payload = json.loads(result.output)
+    assert payload["data"]["image_id"] == "image-kchen-001"
+    assert payload["data"]["name"] == "kchen-slurm-ffmpeg:3.2"
+    assert captured_workspace_ids[:4] == [config.job_workspace_id] * 4
+    assert config.workspace_internet_id in captured_workspace_ids[4:]
+
+
+def test_image_detail_resolves_full_address(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _patch_config_and_session(monkeypatch, tmp_path)
+    config.job_workspace_id = "ws-11111111-1111-1111-1111-111111111111"
+    config.workspace_internet_id = "ws-22222222-2222-2222-2222-222222222222"
+
+    session = FakeWebSession(
+        workspace_id=config.job_workspace_id,
+        all_workspace_ids=[config.job_workspace_id, config.workspace_internet_id],
+    )
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: session)
+
+    full_address = "docker.sii.shaipower.online/inspire-studio/kchen-slurm-ffmpeg:3.2"
+
+    def fake_list_images_by_source(source="official", workspace_id=None, session=None):
+        if workspace_id == config.workspace_internet_id and source == "personal-visible":
+            return [
+                browser_api_module.CustomImageInfo(
+                    image_id="image-kchen-addr",
+                    url=full_address,
+                    name="kchen-slurm-ffmpeg:3.2",
+                    framework="",
+                    version="3.2",
+                    source="SOURCE_PUBLIC",
+                    status="SUCCESS",
+                    description="",
+                    created_at="",
+                )
+            ]
+        return []
+
+    def fake_get_image_detail(image_id, session=None):
+        if image_id == full_address:
+            raise ValueError("not found")
+        return browser_api_module.CustomImageInfo(
+            image_id=image_id,
+            url=full_address,
+            name="kchen-slurm-ffmpeg:3.2",
+            framework="",
+            version="3.2",
+            source="SOURCE_PUBLIC",
+            status="SUCCESS",
+            description="",
+            created_at="",
+        )
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_images_by_source)
+    monkeypatch.setattr(browser_api_module, "get_image_detail", fake_get_image_detail)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "image", "detail", full_address])
+    assert result.exit_code == 0
+
+    payload = json.loads(result.output)
+    assert payload["data"]["image_id"] == "image-kchen-addr"
+
+
+def test_image_detail_partial_id_still_works(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _patch_config_and_session(monkeypatch, tmp_path)
+    config.job_workspace_id = "ws-11111111-1111-1111-1111-111111111111"
+
+    session = FakeWebSession(workspace_id=config.job_workspace_id)
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: session)
+
+    def fake_list_images_by_source(source="official", workspace_id=None, session=None):
+        if workspace_id == config.job_workspace_id and source == "official":
+            return [
+                browser_api_module.CustomImageInfo(
+                    image_id="abcd1234-1111-2222-3333-444444444444",
+                    url="docker.sii.shaipower.online/inspire-studio/test:v1",
+                    name="test:v1",
+                    framework="",
+                    version="v1",
+                    source="SOURCE_OFFICIAL",
+                    status="SUCCESS",
+                    description="",
+                    created_at="",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_images_by_source)
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_image_detail",
+        lambda image_id, session=None: browser_api_module.CustomImageInfo(
+            image_id=image_id,
+            url="docker.sii.shaipower.online/inspire-studio/test:v1",
+            name="test:v1",
+            framework="",
+            version="v1",
+            source="SOURCE_OFFICIAL",
+            status="SUCCESS",
+            description="",
+            created_at="",
+        ),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "image", "detail", "abcd1234"])
+    assert result.exit_code == 0
+
+    payload = json.loads(result.output)
+    assert payload["data"]["image_id"] == "abcd1234-1111-2222-3333-444444444444"
+
+
+def test_image_detail_name_ambiguity_requires_disambiguation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _patch_config_and_session(monkeypatch, tmp_path)
+    config.job_workspace_id = "ws-11111111-1111-1111-1111-111111111111"
+    config.workspace_gpu_id = "ws-22222222-2222-2222-2222-222222222222"
+    config.workspace_internet_id = "ws-33333333-3333-3333-3333-333333333333"
+
+    session = FakeWebSession(
+        workspace_id=config.job_workspace_id,
+        all_workspace_ids=[
+            config.job_workspace_id,
+            config.workspace_gpu_id,
+            config.workspace_internet_id,
+        ],
+        all_workspace_names={
+            config.workspace_gpu_id: "gpu",
+            config.workspace_internet_id: "internet",
+        },
+    )
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: session)
+
+    def fake_list_images_by_source(source="official", workspace_id=None, session=None):
+        if workspace_id == config.workspace_gpu_id and source == "personal-visible":
+            return [
+                browser_api_module.CustomImageInfo(
+                    image_id="image-dup-001",
+                    url="docker.sii.shaipower.online/inspire-studio/shared:v1",
+                    name="shared:v1",
+                    framework="",
+                    version="v1",
+                    source="SOURCE_PUBLIC",
+                    status="SUCCESS",
+                    description="",
+                    created_at="",
+                )
+            ]
+        if workspace_id == config.workspace_internet_id and source == "personal-visible":
+            return [
+                browser_api_module.CustomImageInfo(
+                    image_id="image-dup-002",
+                    url="docker-t.sii.shaipower.online/inspire-studio/shared:v1",
+                    name="shared:v1",
+                    framework="",
+                    version="v1",
+                    source="SOURCE_PUBLIC",
+                    status="SUCCESS",
+                    description="",
+                    created_at="",
+                )
+            ]
+        return []
+
+    def fake_get_image_detail(image_id, session=None):
+        if image_id == "shared:v1":
+            raise ValueError("not found")
+        return browser_api_module.CustomImageInfo(
+            image_id=image_id,
+            url="docker.sii.shaipower.online/inspire-studio/shared:v1",
+            name="shared:v1",
+            framework="",
+            version="v1",
+            source="SOURCE_PUBLIC",
+            status="SUCCESS",
+            description="",
+            created_at="",
+        )
+
+    monkeypatch.setattr(browser_api_module, "list_images_by_source", fake_list_images_by_source)
+    monkeypatch.setattr(browser_api_module, "get_image_detail", fake_get_image_detail)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "image", "detail", "shared:v1"])
+    assert result.exit_code == EXIT_VALIDATION_ERROR
+    assert "AmbiguousImage" in result.output
 
 
 def test_image_register_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

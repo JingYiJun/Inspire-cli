@@ -57,6 +57,7 @@ def _image_from_api(item: dict[str, Any]) -> CustomImageInfo:
 
 def list_images_by_source(
     source: str = "official",
+    workspace_id: Optional[str] = None,
     session: Optional[WebSession] = None,
 ) -> list[CustomImageInfo]:
     """List Docker images for any source, returning full metadata.
@@ -69,6 +70,7 @@ def list_images_by_source(
     Args:
         source: One of ``"official"``, ``"public"``, ``"private"``,
             ``"personal-visible"``.
+        workspace_id: Workspace ID for filtering.
         session: Existing web session.
     """
     source_map = {
@@ -79,7 +81,9 @@ def list_images_by_source(
     }
     api_source = source_map.get(source.lower(), source)
 
-    session, workspace_id = _get_session_and_workspace_id(workspace_id=None, session=session)
+    session, workspace_id = _get_session_and_workspace_id(
+        workspace_id=workspace_id, session=session
+    )
 
     if api_source == "SOURCE_PUBLIC":
         body: dict[str, Any] = {
