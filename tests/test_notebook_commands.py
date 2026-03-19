@@ -6,6 +6,7 @@ from click.testing import CliRunner
 
 from inspire import config as config_module
 from inspire.bridge import tunnel as tunnel_module
+from inspire.cli.commands.notebook.notebook_lookup import _format_notebook_resource
 from inspire.cli.commands.notebook import notebook_commands as notebook_cmd_module
 from inspire.cli.commands.notebook import notebook_ssh_flow as ssh_flow_module
 from inspire.cli.context import Context, EXIT_API_ERROR, EXIT_CONFIG_ERROR, EXIT_SUCCESS
@@ -125,6 +126,34 @@ def test_notebook_create_rejects_post_start_and_script_together(
     assert result.exit_code != EXIT_SUCCESS
     assert "Use either --post-start or --post-start-script" in result.output
     assert called is False
+
+
+def test_format_notebook_resource_includes_cpu_gpu_and_memory() -> None:
+    item = {
+        "quota": {"cpu_count": 180, "gpu_count": 8, "memory_size": 500},
+        "resource_spec_price": {
+            "cpu_count": 180,
+            "gpu_count": 8,
+            "memory_size_gib": 500,
+            "gpu_info": {"gpu_product_simple": "H200"},
+        },
+    }
+
+    assert _format_notebook_resource(item) == "180x   8x H200   500 GB"
+
+
+def test_format_notebook_resource_omits_gpu_for_cpu_only_notebook() -> None:
+    item = {
+        "quota": {"cpu_count": 55, "gpu_count": 0, "memory_size": 220},
+        "resource_spec_price": {
+            "cpu_count": 55,
+            "gpu_count": 0,
+            "memory_size_gib": 220,
+            "gpu_info": {"gpu_product_simple": "CPU"},
+        },
+    }
+
+    assert _format_notebook_resource(item) == " 55x   220 GB"
 
 
 def test_notebook_start_accepts_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

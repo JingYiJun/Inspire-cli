@@ -60,19 +60,122 @@ def _notebook_id_from_item(item: dict) -> str | None:
     return str(notebook_id)
 
 
-def _format_notebook_resource(item: dict) -> str:
+def _positive_int(*values: Any) -> int | None:
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def _normalize_notebook_gpu_type(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    cleaned = re.sub(r"(?i)^nvidia[\s_-]*", "", text).strip()
+    cleaned = re.sub(r"\s*\([^)]*\)", "", cleaned).strip()
+    normalized = cleaned.replace("_", " ").replace("-", " ").upper()
+
+    if normalized == "CPU":
+        return ""
+
+    token_match = re.search(r"\b([A-Z]+\d+[A-Z]*)\b", normalized)
+    if token_match:
+        token = token_match.group(1)
+        digit_match = re.search(r"(\d{3,4})", token)
+        if token.startswith(("RTX", "GTX")) and digit_match:
+            return digit_match.group(1)
+        return token
+
+    digit_match = re.search(r"\b(\d{3,4})\b", normalized)
+    if digit_match:
+        return digit_match.group(1)
+
+    return cleaned
+
+
+def _extract_notebook_gpu_type(item: dict) -> str:
     quota = item.get("quota") or {}
-    gpu_count = quota.get("gpu_count", 0)
+    resource_spec_price = item.get("resource_spec_price") or {}
+    resource_spec = item.get("resource_spec") or {}
+    node = item.get("node") or {}
 
-    if gpu_count and gpu_count > 0:
-        gpu_info = (item.get("resource_spec_price") or {}).get("gpu_info") or {}
-        gpu_type = gpu_info.get("gpu_product_simple") or quota.get("gpu_type") or "GPU"
-        return f"{gpu_count}x{gpu_type}"
+    gpu_info_candidates = [
+        resource_spec_price.get("gpu_info") or {},
+        node.get("gpu_info") or {},
+    ]
+    scalar_candidates = [
+        resource_spec_price.get("gpu_type"),
+        quota.get("gpu_type"),
+        resource_spec.get("gpu_type"),
+        item.get("gpu_type"),
+    ]
 
-    cpu_count = quota.get("cpu_count", 0)
-    if cpu_count:
-        return f"{cpu_count}xCPU"
-    return "N/A"
+    for gpu_info in gpu_info_candidates:
+        gpu_type = _normalize_notebook_gpu_type(
+            gpu_info.get("gpu_product_simple") or gpu_info.get("gpu_type_display")
+        )
+        if gpu_type:
+            return gpu_type
+
+    for candidate in scalar_candidates:
+        gpu_type = _normalize_notebook_gpu_type(candidate)
+        if gpu_type:
+            return gpu_type
+
+    return ""
+
+
+def _extract_notebook_resource_fields(item: dict) -> tuple[str, str, str]:
+    quota = item.get("quota") or {}
+    resource_spec_price = item.get("resource_spec_price") or {}
+    resource_spec = item.get("resource_spec") or {}
+
+    cpu_count = _positive_int(
+        resource_spec_price.get("cpu_count"),
+        quota.get("cpu_count"),
+        resource_spec.get("cpu_count"),
+        item.get("cpu_count"),
+    )
+    gpu_count = _positive_int(
+        resource_spec_price.get("gpu_count"),
+        quota.get("gpu_count"),
+        resource_spec.get("gpu_count"),
+        item.get("gpu_count"),
+    )
+    memory_gb = _positive_int(
+        resource_spec_price.get("memory_size_gib"),
+        quota.get("memory_size"),
+        resource_spec.get("memory_size_gib"),
+        resource_spec.get("memory_size"),
+        item.get("memory_size_gib"),
+        item.get("memory_size"),
+    )
+    gpu_type = _extract_notebook_gpu_type(item)
+
+    cpu_display = f"{cpu_count:>3}x" if cpu_count else ""
+
+    gpu_display = ""
+    if gpu_count and gpu_type:
+        gpu_display = f"{gpu_count:>2}x {gpu_type}"
+    elif gpu_count:
+        gpu_display = f"{gpu_count:>2}x GPU"
+
+    memory_display = f"{memory_gb:>4} GB" if memory_gb else ""
+
+    return cpu_display, gpu_display, memory_display
+
+
+def _format_notebook_resource(item: dict) -> str:
+    cpu_display, gpu_display, memory_display = _extract_notebook_resource_fields(item)
+    parts = [value for value in (cpu_display, gpu_display, memory_display) if value]
+    return "  ".join(parts) if parts else "N/A"
 
 
 def _try_get_current_user_ids(
@@ -424,12 +527,19 @@ def _resolve_notebook_id(
         )
 
     click.echo(f"Multiple notebooks named '{identifier}' found:")
+    resource_width = max(
+        len("Resource"),
+        max(len(_format_notebook_resource(item)) for _, item in matches),
+    )
     for idx, (ws_id, item) in enumerate(matches, start=1):
         notebook_id = _notebook_id_from_item(item) or "N/A"
         status = str(item.get("status") or "Unknown")
         resource = _format_notebook_resource(item)
         created_at = str(item.get("created_at") or "")
-        click.echo(f"  [{idx}] {status:<12} {resource:<12} {notebook_id}  {created_at}  ws={ws_id}")
+        click.echo(
+            f"  [{idx}] {status:<12} {resource:<{resource_width}} {notebook_id}  "
+            f"{created_at}  ws={ws_id}"
+        )
 
     choice = click.prompt(
         "Select notebook",
@@ -452,6 +562,7 @@ def _resolve_notebook_id(
 __all__ = [
     "_ZERO_WORKSPACE_ID",
     "_collect_workspace_ids_for_lookup",
+    "_extract_notebook_resource_fields",
     "_format_notebook_resource",
     "_get_current_user_detail",
     "_list_notebooks_for_workspace",

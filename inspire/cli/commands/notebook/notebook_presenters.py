@@ -5,7 +5,7 @@ from __future__ import annotations
 import click
 
 from inspire.cli.formatters import json_formatter
-from .notebook_lookup import _format_notebook_resource
+from .notebook_lookup import _extract_notebook_resource_fields
 
 
 def _print_notebook_detail(notebook: dict) -> None:
@@ -87,17 +87,24 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
         click.echo("No notebook instances found.")
         return
 
+    resource_fields = [_extract_notebook_resource_fields(item) for item in items]
+    cpu_width = max(len("CPU"), max(len(cpu) for cpu, _, _ in resource_fields))
+    gpu_width = max(len("GPU"), max(len(gpu) for _, gpu, _ in resource_fields))
+    memory_width = max(len("Memory"), max(len(memory) for _, _, memory in resource_fields))
     lines = [
-        f"{'Name':<25} {'Status':<12} {'Resource':<12} {'ID':<38}",
-        "-" * 90,
+        f"{'Name':<25} {'Status':<12} {'CPU':>{cpu_width}} {'GPU':>{gpu_width}} "
+        f"{'Memory':>{memory_width}} {'ID':<38}",
+        "-" * (25 + 1 + 12 + 1 + cpu_width + 1 + gpu_width + 1 + memory_width + 1 + 38),
     ]
 
-    for item in items:
+    for item, (cpu_display, gpu_display, memory_display) in zip(items, resource_fields):
         name = item.get("name", "N/A")[:25]
         status = item.get("status", "Unknown")[:12]
         notebook_id = item.get("notebook_id", item.get("id", "N/A"))
-        resource_info = _format_notebook_resource(item)
-        lines.append(f"{name:<25} {status:<12} {resource_info:<12} {notebook_id:<38}")
+        lines.append(
+            f"{name:<25} {status:<12} {cpu_display:>{cpu_width}} {gpu_display:>{gpu_width}} "
+            f"{memory_display:>{memory_width}} {notebook_id:<38}"
+        )
 
     lines.append(f"\nShowing {len(items)} notebook(s)")
     click.echo("\n".join(lines))
