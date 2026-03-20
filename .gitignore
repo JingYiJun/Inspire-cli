@@ -48,6 +48,7 @@ internal/
 inspire/Inspire_OpenAPI_Reference.md
 config.toml.example
 **/CLAUDE.md
+AGENTS.md
 
 # Development/exploration scripts (contain hardcoded IDs)
 scripts/
