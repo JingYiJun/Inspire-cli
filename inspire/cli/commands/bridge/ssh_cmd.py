@@ -69,7 +69,10 @@ def bridge_ssh(ctx: Context, bridge: Optional[str]) -> None:
     logger.debug("bridge_ssh start bridge=%s", bridge_name)
 
     # Build interactive SSH command with env exports and cd to target dir
-    env_exports = build_env_exports(config.remote_env)
+    try:
+        env_exports = build_env_exports(config.remote_env)
+    except ConfigError as e:
+        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
     remote_command = f'{env_exports}cd "{config.target_dir}" && exec $SHELL -l'
     reconnect_limit = max(0, int(getattr(config, "tunnel_retries", 0)))
     reconnect_pause = float(getattr(config, "tunnel_retry_pause", 0.0) or 0.0)

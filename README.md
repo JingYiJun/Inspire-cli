@@ -58,7 +58,7 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 | `inspire job stop/wait` | Stop or wait for a job |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
 | `inspire sync` | Sync code to shared filesystem (via SSH tunnel) |
-| `inspire bridge exec "<cmd>"` | Run command on Bridge runner |
+| `inspire bridge exec "<cmd>" [--stdin]` | Run command on Bridge runner |
 | `inspire bridge ssh [--bridge <name>]` | Interactive SSH shell to a Bridge profile |
 | `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
 | `inspire notebook list/create` | List or create notebook instances |
@@ -87,6 +87,9 @@ inspire run "python train.py --epochs 100" --sync --watch
 # Sync code and verify
 inspire sync && inspire bridge exec "git log -1"
 
+# Stream local stdin to remote command (no heredoc quoting hacks)
+inspire bridge exec --bridge mybridge --stdin -- bash -s < scripts/watch_eval.sh
+
 # Set up SSH tunnel to a notebook
 inspire notebook ssh <notebook-id> --save-as mybridge
 ssh mybridge
@@ -108,6 +111,7 @@ inspire project list
 
 - There is no `inspire tunnel start` command. Create or refresh bridge profiles with `inspire notebook ssh <notebook-id> --save-as <name>` (or `inspire tunnel add` / `inspire tunnel update`), then validate with `inspire tunnel status`.
 - `inspire bridge ssh` and `inspire bridge scp` validate `--bridge` names before connectivity checks. If a profile is missing, run `inspire tunnel list`.
+- `inspire bridge exec --stdin -- <remote command>` forwards local stdin to the remote process over SSH.
 - Saved notebook profiles now store the source notebook ID. Reusing `--save-as <name>` for a different notebook refreshes the tunnel instead of reusing stale tunnel state.
 - `inspire bridge ssh`, `inspire bridge exec`, and interactive `inspire notebook ssh` auto-rebuild/reconnect dropped tunnels for notebook-backed profiles, using `tunnel.retries` / `tunnel.retry_pause` as retry controls.
 - Non-notebook tunnel profiles (for example, manually added profiles without `notebook_id`) cannot be auto-rebuilt and still require manual tunnel recovery.
@@ -152,6 +156,34 @@ base_url = "https://your-inspire-platform.com"
 # Timeout in seconds for `inspire bridge exec`
 action_timeout = 600
 
+[defaults]
+# Shared fallback settings for jobs and notebooks
+# resource = "1xH200"
+# image = "pytorch:latest"
+# priority = 6
+# shm_size = 32
+# project_order = ["cq", "ci"]
+
+[job]
+# resource = "4xH200"
+# project_id = "project-..."
+# image = "pytorch:latest"
+# priority = 6
+# shm_size = 32
+
+[notebook]
+# resource = "1xH200"
+# project_id = "project-..."
+# image = "pytorch:latest"
+# priority = 6
+# shm_size = 32
+# post_start = "bash /workspace/bootstrap.sh"
+
+[remote_env]
+# Exported before bridge exec, job commands, and notebook post-start commands/scripts.
+# PIP_INDEX_URL = "https://mirror.example/simple"
+# APT_MIRROR_URL = "http://nexus.example.com/repository/ubuntu/"
+
 [workspaces]
 # cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)
 # gpu = "ws-..."       # GPU workspace (H100/H200 jobs)
@@ -172,6 +204,8 @@ gpu_type = "H100"
 # dropbear_deb_dir = "/inspire/shared/debs/dropbear"
 ```
 
+Use `[remote_env]` for package-manager env vars such as `PIP_INDEX_URL` when your remote shell or notebook post-start installs packages. For notebook SSH bootstrap on offline GPU notebooks, `ssh.apt_mirror_url` remains the explicit setting, and `remote_env.APT_MIRROR_URL` is also accepted as a fallback.
+
 View current config:
 ```bash
 inspire config show
@@ -190,10 +224,17 @@ inspire init --json --template --project --force
 | `INSPIRE_PASSWORD` | Platform password |
 | `INSPIRE_BASE_URL` | API base URL |
 | `INSPIRE_TARGET_DIR` | Shared filesystem path |
-| `INSPIRE_WORKSPACE_ID` | Default workspace ID |
+| `INSPIRE_DEFAULT_RESOURCE` | Shared default resource for jobs and notebooks |
+| `INSPIRE_DEFAULT_IMAGE` | Shared default image for jobs and notebooks |
+| `INSPIRE_DEFAULT_PRIORITY` | Shared default priority for jobs and notebooks |
+| `INSPIRE_PROJECT_ORDER` | Project preference order for automatic selection |
+| `INSPIRE_SHM_SIZE` | Shared default shared memory size |
 | `INSPIRE_WORKSPACE_CPU_ID` | CPU workspace ID (default workspace) |
 | `INSPIRE_WORKSPACE_GPU_ID` | GPU workspace ID (H100/H200) |
 | `INSPIRE_WORKSPACE_INTERNET_ID` | Internet-enabled workspace ID (e.g. RTX 4090) |
+| `INSPIRE_JOB_RESOURCE` | Job-specific default resource |
 | `INSPIRE_PROJECT_ID` | Default project ID |
 | `INSP_IMAGE` | Default Docker image |
 | `INSP_PRIORITY` | Job priority (1-10) |
+| `INSPIRE_NOTEBOOK_PROJECT_ID` | Notebook-specific default project ID |
+| `INSPIRE_APT_MIRROR_URL` | APT mirror URL for offline notebook SSH bootstrap |

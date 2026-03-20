@@ -6,9 +6,6 @@ import os
 import subprocess
 import time
 from typing import Optional
-from urllib import error as urllib_error
-from urllib import parse as urllib_parse
-from urllib import request as urllib_request
 
 import click
 
@@ -21,6 +18,7 @@ from inspire.cli.utils.tunnel_reconnect import (
     attempt_notebook_bridge_rebuild,
     load_ssh_public_key_material,
     rebuild_notebook_bridge_profile,
+    resolve_ssh_identity_file,
     retry_pause_seconds,
     should_attempt_ssh_reconnect,
 )
@@ -28,41 +26,16 @@ from inspire.config import ConfigError
 from inspire.config.ssh_runtime import resolve_ssh_runtime_config
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web.browser_api import NotebookFailedError
-from inspire.platform.web.browser_api.rtunnel import redact_proxy_url
+from inspire.platform.web.browser_api.rtunnel.diagnostics import (
+    collect_notebook_rtunnel_diagnostics,
+)
+from inspire.platform.web.browser_api.rtunnel.logging import get_last_failure_summary
 
 from .notebook_lookup import (
     _get_current_user_detail,
     _resolve_notebook_id,
     _validate_notebook_account_access,
 )
-
-
-def _format_proxy_http_body(raw: bytes) -> str:
-    if not raw:
-        return ""
-    text = raw.decode("utf-8", errors="replace")
-    compact = " ".join(text.split())
-    return compact[:180]
-
-
-def _describe_proxy_http_status(proxy_url: str, timeout_s: float = 4.0) -> str:
-    parsed = urllib_parse.urlsplit(proxy_url)
-    if parsed.scheme not in {"http", "https"}:
-        return "n/a (non-http proxy URL)"
-
-    request = urllib_request.Request(proxy_url, method="GET")
-    try:
-        with urllib_request.urlopen(request, timeout=timeout_s) as response:
-            body = _format_proxy_http_body(response.read(220))
-            return f"{response.status} {body}".strip()
-    except urllib_error.HTTPError as error:
-        try:
-            body = _format_proxy_http_body(error.read(220))
-        except Exception:
-            body = ""
-        return f"{error.code} {body}".strip()
-    except Exception as error:
-        return str(error)
 
 
 def load_ssh_public_key(pubkey_path: Optional[str] = None) -> str:
@@ -77,6 +50,7 @@ def _run_interactive_notebook_ssh_with_reconnect(
     session,
     pubkey: Optional[str],
     rtunnel_bin: Optional[str],
+    rtunnel_upload_policy: Optional[str] = None,
     debug_playwright: bool,
     setup_timeout: int,
     tunnel_retries: int,
@@ -96,7 +70,10 @@ def _run_interactive_notebook_ssh_with_reconnect(
 
     def _runtime_loader() -> object:
         return resolve_ssh_runtime_config(
-            cli_overrides={"rtunnel_bin": rtunnel_bin},
+            cli_overrides={
+                "rtunnel_bin": rtunnel_bin,
+                "rtunnel_upload_policy": rtunnel_upload_policy,
+            },
         )
 
     def _runtime_validator(runtime: object) -> None:
@@ -247,11 +224,13 @@ def run_notebook_ssh(
     ssh_port: int,
     command: Optional[str],
     rtunnel_bin: Optional[str],
+    rtunnel_upload_policy: Optional[str] = None,
     debug_playwright: bool,
     setup_timeout: int,
 ) -> None:
     from inspire.bridge.tunnel import (
         BridgeProfile,
+        build_ssh_process_env,
         get_ssh_command_args,
         has_internet_for_gpu_type,
         is_tunnel_available,
@@ -359,6 +338,7 @@ def run_notebook_ssh(
                     capture_output=True,
                     timeout=10,
                     text=True,
+                    env=build_ssh_process_env(),
                 )
                 if result.returncode == 0 and "ok" in result.stdout:
                     click.echo("Using cached tunnel connection (fast path).", err=True)
@@ -370,6 +350,7 @@ def run_notebook_ssh(
                             session=session,
                             pubkey=pubkey,
                             rtunnel_bin=rtunnel_bin,
+                            rtunnel_upload_policy=rtunnel_upload_policy,
                             debug_playwright=debug_playwright,
                             setup_timeout=setup_timeout,
                             tunnel_retries=config.tunnel_retries,
@@ -381,7 +362,7 @@ def run_notebook_ssh(
                         config=cached_config,
                         remote_command=command,
                     )
-                    os.execvp("ssh", args)
+                    os.execvpe("ssh", args, build_ssh_process_env())
                     return
             except (subprocess.TimeoutExpired, Exception):
                 pass
@@ -405,13 +386,17 @@ def run_notebook_ssh(
 
     try:
         ssh_public_key = load_ssh_public_key(pubkey)
+        ssh_identity_file = resolve_ssh_identity_file(pubkey)
     except ValueError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
         return
 
     try:
         ssh_runtime = resolve_ssh_runtime_config(
-            cli_overrides={"rtunnel_bin": rtunnel_bin},
+            cli_overrides={
+                "rtunnel_bin": rtunnel_bin,
+                "rtunnel_upload_policy": rtunnel_upload_policy,
+            },
         )
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -429,7 +414,11 @@ def run_notebook_ssh(
             timeout=setup_timeout,
         )
     except Exception as e:
-        _handle_error(ctx, "APIError", f"Failed to set up notebook tunnel: {e}", EXIT_API_ERROR)
+        message = f"Failed to set up notebook tunnel: {e}"
+        failure_summary = get_last_failure_summary()
+        if failure_summary and failure_summary not in message:
+            message = f"{message}\n\n{failure_summary}"
+        _handle_error(ctx, "APIError", message, EXIT_API_ERROR)
         return
 
     bridge = BridgeProfile(
@@ -438,6 +427,7 @@ def run_notebook_ssh(
         ssh_user="root",
         ssh_port=ssh_port,
         has_internet=has_internet,
+        identity_file=str(ssh_identity_file),
         notebook_id=notebook_id,
         rtunnel_port=port,
     )
@@ -452,7 +442,17 @@ def run_notebook_ssh(
         retries=6,
         retry_pause=1.5,
     ):
-        proxy_status = _describe_proxy_http_status(proxy_url)
+        doctor = collect_notebook_rtunnel_diagnostics(
+            notebook_id=notebook_id,
+            port=port,
+            ssh_port=ssh_port,
+            ssh_runtime=ssh_runtime,
+            session=session,
+            headless=not debug_playwright,
+        )
+        extra_hint = ""
+        if doctor is not None:
+            extra_hint = f" Observed: {doctor.observed}."
         _handle_error(
             ctx,
             "APIError",
@@ -460,8 +460,8 @@ def run_notebook_ssh(
             EXIT_API_ERROR,
             hint=(
                 "Retry 'inspire notebook ssh <notebook-id>' in a few seconds, "
-                f"or run 'inspire tunnel test -b {profile_name}' to inspect connectivity. "
-                f"Proxy readiness report: {proxy_status} ({redact_proxy_url(proxy_url)})."
+                f"or run 'inspire tunnel test -b {profile_name}' to inspect connectivity."
+                f"{extra_hint}"
             ),
         )
         return
@@ -481,6 +481,7 @@ def run_notebook_ssh(
             session=session,
             pubkey=pubkey,
             rtunnel_bin=rtunnel_bin,
+            rtunnel_upload_policy=rtunnel_upload_policy,
             debug_playwright=debug_playwright,
             setup_timeout=setup_timeout,
             tunnel_retries=config.tunnel_retries,
@@ -493,7 +494,7 @@ def run_notebook_ssh(
         config=tunnel_config,
         remote_command=command,
     )
-    os.execvp("ssh", args)
+    os.execvpe("ssh", args, build_ssh_process_env())
 
 
 __all__ = ["load_ssh_public_key", "run_notebook_ssh"]

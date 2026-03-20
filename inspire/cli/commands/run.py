@@ -192,6 +192,7 @@ def _run_flow(
     image: str | None,
     nodes: int,
     project: str | None,
+    fault_tolerant: bool | None,
 ) -> None:
     _run_sync_if_requested(ctx, sync=sync, watch=watch)
 
@@ -201,21 +202,28 @@ def _run_flow(
 
         if priority is None:
             priority = config.job_priority
+            if priority is None:
+                priority = getattr(config, "default_priority", None)
+            if priority is None:
+                priority = 6
         if image is None:
-            image = config.job_image
+            image = config.job_image or getattr(config, "default_image", None)
 
         selected_workspace_id = select_workspace_id(
             config,
             gpu_type=gpu_type,
             explicit_workspace_id=workspace_id_override,
             explicit_workspace_name=workspace,
+            legacy_workspace_id=config.job_workspace_id
+            or getattr(config, "default_workspace_id", None),
         )
         if not selected_workspace_id:
             _handle_error(
                 ctx,
                 "ConfigError",
                 "No workspace_id configured for GPU workloads. "
-                "Set [workspaces].gpu or INSPIRE_WORKSPACE_ID.",
+                "Set [workspaces].gpu (or [workspaces].internet for 4090), "
+                "or pass --workspace/--workspace-id.",
                 EXIT_CONFIG_ERROR,
             )
             return
@@ -252,12 +260,39 @@ def _run_flow(
             return
         project_id = selected_project.project_id
 
+        # Auto-enable fault tolerance for LOW-priority projects
+        is_low_priority, auto_fault_tolerance = job_submit.resolve_fault_tolerance(
+            selected_project, fault_tolerant
+        )
+
         if not ctx.json_output and fallback_msg:
             click.echo(fallback_msg)
-        if ctx.debug and not ctx.json_output:
-            click.echo(
-                f"Using project: {selected_project.name}{selected_project.get_quota_status()}"
-            )
+        if not ctx.json_output:
+            if is_low_priority:
+                restart_note = " and auto-restarted" if auto_fault_tolerance else ""
+                click.echo(
+                    f"Using project: {selected_project.name} "
+                    f"(low priority — job may be preempted{restart_note})"
+                )
+            elif ctx.debug:
+                click.echo(
+                    f"Using project: "
+                    f"{selected_project.name}{selected_project.get_quota_status()}"
+                )
+
+        # Show compute-group availability diagnostics
+        if not ctx.json_output and location:
+            try:
+                from inspire.platform.web import browser_api as browser_api_module
+
+                all_avail = browser_api_module.get_accurate_gpu_availability(
+                    workspace_id=selected_workspace_id
+                )
+                summary = job_submit.format_gpu_availability_summary(all_avail, gpu_type)
+                if summary:
+                    click.echo(summary)
+            except Exception:
+                pass  # diagnostics are best-effort
 
         try:
             submission = job_submit.submit_training_job(
@@ -275,6 +310,7 @@ def _run_flow(
                 nodes=nodes,
                 max_time_hours=max_time,
                 project_name=selected_project.name,
+                auto_fault_tolerance=auto_fault_tolerance,
             )
         except ValueError as e:
             _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -357,29 +393,34 @@ def _run_flow(
     "--priority",
     type=int,
     default=None,
-    help="Task priority 1-10 (default from config [job].priority or 6)",
+    help="Task priority 1-10 (default from config [job].priority or [defaults].priority or 6)",
 )
 @click.option(
     "--project",
     "-p",
     default=None,
-    help="Project name or ID (default from config [context].project or [job].project_id)",
+    help="Project name or ID (default from config [job].project_id or [defaults].project_order)",
 )
 @click.option("--location", help="Preferred datacenter location (overrides auto-selection)")
 @click.option("--workspace", help="Workspace name (from [workspaces])")
 @click.option(
     "--workspace-id",
     "workspace_id_override",
-    help="Workspace ID override (highest precedence)",
+    help="Workspace ID override (escape hatch; highest precedence)",
 )
 @click.option("--max-time", type=float, default=100.0, help="Max runtime in hours (default: 100)")
 @click.option(
     "--image",
     default=None,
-    help="Custom Docker image (default from config [job].image)",
+    help="Custom Docker image (default from config [job].image or [defaults].image)",
 )
 @click.option(
     "--nodes", type=int, default=1, help="Number of nodes for multi-node training (default: 1)"
+)
+@click.option(
+    "--fault-tolerant/--no-fault-tolerant",
+    default=None,
+    help="Auto-restart on failure/preemption (auto-enabled for low-priority projects)",
 )
 @pass_context
 def run(
@@ -398,6 +439,7 @@ def run(
     max_time: float,
     image: str | None,
     nodes: int,
+    fault_tolerant: bool | None,
 ) -> None:
     """Quick job submission with smart resource allocation.
 
@@ -432,6 +474,7 @@ def run(
         max_time=max_time,
         image=image,
         nodes=nodes,
+        fault_tolerant=fault_tolerant,
     )
 
 

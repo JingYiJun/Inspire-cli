@@ -81,33 +81,14 @@ def list_images_by_source(
 
     session, workspace_id = _get_session_and_workspace_id(workspace_id=None, session=session)
 
-    if api_source == "SOURCE_PUBLIC":
+    if api_source in ("SOURCE_PUBLIC", "SOURCE_PERSONAL_VISIBLE"):
+        visibility = "VISIBILITY_PUBLIC" if api_source == "SOURCE_PUBLIC" else "VISIBILITY_PRIVATE"
         body: dict[str, Any] = {
             "page": 0,
             "page_size": -1,
             "filter": {
                 "source_list": ["SOURCE_PRIVATE", "SOURCE_PUBLIC"],
-                "visibility": "VISIBILITY_PUBLIC",
-                "registry_hint": {"workspace_id": workspace_id},
-            },
-        }
-    elif api_source == "SOURCE_PERSONAL_VISIBLE":
-        body = {
-            "page": 0,
-            "page_size": -1,
-            "filter": {
-                "source_list": ["SOURCE_PRIVATE", "SOURCE_PUBLIC"],
-                "visibility": "VISIBILITY_PRIVATE",
-                "registry_hint": {"workspace_id": workspace_id},
-            },
-        }
-    elif api_source == "SOURCE_PRIVATE":
-        body = {
-            "page": 0,
-            "page_size": -1,
-            "filter": {
-                "source": "SOURCE_PRIVATE",
-                "source_list": [],
+                "visibility": visibility,
                 "registry_hint": {"workspace_id": workspace_id},
             },
         }
@@ -203,14 +184,10 @@ def create_image(
     workspace_id: Optional[str] = None,
     description: str = "",
     visibility: str = "VISIBILITY_PRIVATE",
-    add_method: int = 0,
+    add_method: str = "DIRECT_PUSH",
     session: Optional[WebSession] = None,
 ) -> dict[str, Any]:
     """Register a custom Docker image.
-
-    The platform supports two add methods:
-      - 0: LOCAL_PUSH (user pushes via ``docker push``)
-      - 2: IMAGE_ADDRESS (register an existing image address)
 
     Args:
         name: Image name (lowercase, digits, dashes, dots, underscores).
@@ -218,7 +195,7 @@ def create_image(
         workspace_id: Workspace ID (determines registry).
         description: Optional description.
         visibility: ``"VISIBILITY_PRIVATE"`` or ``"VISIBILITY_PUBLIC"``.
-        add_method: 0 for local push, 2 for image address.
+        add_method: ``"DIRECT_PUSH"`` (create a slot, then ``docker push``).
         session: Existing web session.
 
     Returns:

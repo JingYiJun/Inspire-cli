@@ -3,30 +3,44 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 
 import pytest
 
 from inspire.platform.web.browser_api import rtunnel as rtunnel_module
+from inspire.platform.web.browser_api.rtunnel import terminal as terminal_module
+from inspire.platform.web.browser_api.rtunnel import upload as upload_module
 from inspire.platform.web.browser_api.rtunnel import (
     _CONTENTS_API_RTUNNEL_FILENAME,
+    SSH_SERVER_MISSING_MARKER,
+    SSHD_MISSING_MARKER,
     _StepTimer,
+    _attach_ws_output_listener,
     _build_batch_setup_script,
+    build_rtunnel_setup_commands,
     _build_terminal_websocket_url,
+    _compute_rtunnel_hash,
     _create_terminal_via_api,
     _delete_terminal_via_api,
+    _detach_ws_output_listener,
     _download_rtunnel_locally,
     _extract_jupyter_token,
     _focus_terminal_input,
     _jupyter_server_base,
     _open_or_create_terminal,
+    _poll_ws_capture,
+    _resolve_rtunnel_binary,
+    _rtunnel_matches_on_notebook,
     _send_setup_command_via_terminal_ws,
     _send_terminal_command_via_websocket,
+    _upload_rtunnel_hash_sidecar,
     _upload_rtunnel_via_contents_api,
     _verify_terminal_focus,
     _wait_for_setup_completion,
     _wait_for_terminal_surface,
     _wait_for_terminal_surface_progressive,
+    _wait_for_ws_capture,
 )
 
 
@@ -306,19 +320,19 @@ def test_send_setup_command_via_terminal_ws_cleans_up_terminal(
     class _Frame:
         url = "https://nb.example.com/lab"
 
-    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: "term-1")
+    monkeypatch.setattr(terminal_module, "_create_terminal_via_api", lambda *_a, **_k: "term-1")
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_build_terminal_websocket_url",
         lambda _url, _term: "wss://nb.example.com/terminals/websocket/term-1",
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_send_terminal_command_via_websocket",
         lambda *_a, **_k: events.append(("send", "ok")) or True,
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_delete_terminal_via_api",
         lambda _ctx, *, lab_url, term_name: events.append(("delete", f"{lab_url}|{term_name}"))
         or True,
@@ -340,17 +354,17 @@ def test_send_setup_command_via_terminal_ws_cleans_up_on_failure(
     class _Frame:
         url = "https://nb.example.com/lab"
 
-    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: "term-2")
+    monkeypatch.setattr(terminal_module, "_create_terminal_via_api", lambda *_a, **_k: "term-2")
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_build_terminal_websocket_url",
         lambda _url, _term: "wss://nb.example.com/terminals/websocket/term-2",
     )
     monkeypatch.setattr(
-        rtunnel_module, "_send_terminal_command_via_websocket", lambda *_a, **_k: False
+        terminal_module, "_send_terminal_command_via_websocket", lambda *_a, **_k: False
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_delete_terminal_via_api",
         lambda *_a, **_k: events.append("deleted") or True,
     )
@@ -369,7 +383,7 @@ def test_send_setup_command_via_terminal_ws_cleans_up_on_failure(
 def test_send_setup_command_via_terminal_ws_returns_false_when_terminal_create_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: None)
+    monkeypatch.setattr(terminal_module, "_create_terminal_via_api", lambda *_a, **_k: None)
 
     assert (
         _send_setup_command_via_terminal_ws(
@@ -476,9 +490,9 @@ def test_wait_for_terminal_surface_progressive_succeeds(monkeypatch: pytest.Monk
         attempts["count"] += 1
         return attempts["count"] >= 3
 
-    monkeypatch.setattr(rtunnel_module.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(rtunnel_module, "_wait_for_terminal_surface", fake_wait_surface)
-    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(terminal_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(terminal_module, "_wait_for_terminal_surface", fake_wait_surface)
+    monkeypatch.setattr(terminal_module, "_click_terminal_tab", lambda *_args, **_kwargs: False)
 
     class _ProgressPage:
         def __init__(self, now_ref: list[float]) -> None:
@@ -512,11 +526,11 @@ def test_wait_for_terminal_surface_progressive_timeout(monkeypatch: pytest.Monke
     def fake_monotonic() -> float:
         return fake_time[0]
 
-    monkeypatch.setattr(rtunnel_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(terminal_module.time, "monotonic", fake_monotonic)
     monkeypatch.setattr(
-        rtunnel_module, "_wait_for_terminal_surface", lambda *_args, **_kwargs: False
+        terminal_module, "_wait_for_terminal_surface", lambda *_args, **_kwargs: False
     )
-    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(terminal_module, "_click_terminal_tab", lambda *_args, **_kwargs: False)
 
     class _ProgressPage:
         def __init__(self, now_ref: list[float]) -> None:
@@ -600,7 +614,7 @@ def test_focus_terminal_input_returns_false_when_focus_never_verifies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Returns False when both focus strategies fail on all passes."""
-    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_a, **_kw: False)
+    monkeypatch.setattr(terminal_module, "_click_terminal_tab", lambda *_a, **_kw: False)
 
     # Per pass: .xterm verify consumes 2 evaluates, atomic JS consumes 1.
     # "div", "" → verify fails; False → atomic JS returns falsy.
@@ -618,7 +632,7 @@ def test_focus_terminal_input_succeeds_via_atomic_js_focus(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Atomic JS focus succeeds when .xterm click path fails."""
-    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_a, **_kw: False)
+    monkeypatch.setattr(terminal_module, "_click_terminal_tab", lambda *_a, **_kw: False)
 
     # .xterm count=0 (Try 1 skipped), atomic JS returns True
     textarea = _LocatorStub(wait_ok=True)
@@ -659,22 +673,22 @@ def test_open_or_create_terminal_returns_early_when_api_path_succeeds(
     calls: dict[str, int] = {"recover": 0, "entry": 0, "fallback": 0}
 
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_via_rest_api",
         lambda **_kwargs: (True, True, "api-1"),
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_recover_api_terminal_surface",
         lambda **_kwargs: calls.__setitem__("recover", calls["recover"] + 1) or False,
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_wait_for_terminal_entry_point",
         lambda **_kwargs: calls.__setitem__("entry", calls["entry"] + 1),
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_via_dom_fallback",
         lambda **_kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or True,
     )
@@ -695,12 +709,12 @@ def test_open_or_create_terminal_uses_dom_fallback_after_api_recovery_miss(
     events: list[tuple[str, object]] = []
 
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_via_rest_api",
         lambda **_kwargs: (False, True, "api-2"),
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_recover_api_terminal_surface",
         lambda **_kwargs: False,
     )
@@ -708,19 +722,19 @@ def test_open_or_create_terminal_uses_dom_fallback_after_api_recovery_miss(
     def fake_wait_entry(*, lab_frame, api_term_created: bool) -> None:  # noqa: ANN001
         events.append(("entry", api_term_created))
 
-    monkeypatch.setattr(rtunnel_module, "_wait_for_terminal_entry_point", fake_wait_entry)
+    monkeypatch.setattr(terminal_module, "_wait_for_terminal_entry_point", fake_wait_entry)
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_dismiss_terminal_dialog_once",
         lambda **kwargs: events.append(("dismiss", kwargs["settle_ms"])) or False,
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_via_dom_fallback",
         lambda **_kwargs: True,
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_click_terminal_tab",
         lambda *_args, **kwargs: events.append(("tab_click", kwargs["settle_ms"])) or True,
     )
@@ -740,16 +754,16 @@ def test_open_or_create_terminal_handles_api_full_failure(
     events: list[tuple[str, object]] = []
 
     monkeypatch.setattr(
-        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False, None)
+        terminal_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False, None)
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_wait_for_terminal_entry_point",
         lambda **kwargs: events.append(("entry", kwargs["api_term_created"])),
     )
-    monkeypatch.setattr(rtunnel_module, "_dismiss_terminal_dialog_once", lambda **_kwargs: False)
+    monkeypatch.setattr(terminal_module, "_dismiss_terminal_dialog_once", lambda **_kwargs: False)
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_via_dom_fallback",
         lambda **kwargs: events.append(("fallback", kwargs["api_term_created"])) or True,
     )
@@ -769,13 +783,13 @@ def test_open_or_create_terminal_returns_false_when_dom_fallback_fails(
     calls = {"tab_click": 0}
 
     monkeypatch.setattr(
-        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False, None)
+        terminal_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False, None)
     )
-    monkeypatch.setattr(rtunnel_module, "_wait_for_terminal_entry_point", lambda **_kwargs: None)
-    monkeypatch.setattr(rtunnel_module, "_dismiss_terminal_dialog_once", lambda **_kwargs: False)
-    monkeypatch.setattr(rtunnel_module, "_open_terminal_via_dom_fallback", lambda **_kwargs: False)
+    monkeypatch.setattr(terminal_module, "_wait_for_terminal_entry_point", lambda **_kwargs: None)
+    monkeypatch.setattr(terminal_module, "_dismiss_terminal_dialog_once", lambda **_kwargs: False)
+    monkeypatch.setattr(terminal_module, "_open_terminal_via_dom_fallback", lambda **_kwargs: False)
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_click_terminal_tab",
         lambda *_args, **_kwargs: calls.__setitem__("tab_click", calls["tab_click"] + 1) or True,
     )
@@ -794,16 +808,16 @@ def test_open_or_create_terminal_returns_true_when_api_recovery_succeeds(
     calls = {"entry": 0, "fallback": 0}
 
     monkeypatch.setattr(
-        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, True, "api-5")
+        terminal_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, True, "api-5")
     )
-    monkeypatch.setattr(rtunnel_module, "_recover_api_terminal_surface", lambda **_kwargs: True)
+    monkeypatch.setattr(terminal_module, "_recover_api_terminal_surface", lambda **_kwargs: True)
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_wait_for_terminal_entry_point",
         lambda **_kwargs: calls.__setitem__("entry", calls["entry"] + 1),
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_via_dom_fallback",
         lambda **_kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or True,
     )
@@ -820,7 +834,7 @@ def test_open_or_create_terminal_returns_true_when_api_recovery_succeeds(
 def test_open_terminal_via_rest_api_handles_playwright_navigation_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_args, **_kwargs: "1")
+    monkeypatch.setattr(terminal_module, "_create_terminal_via_api", lambda *_args, **_kwargs: "1")
 
     class _Frame:
         url = "https://nb.example.com/lab"
@@ -829,7 +843,7 @@ def test_open_terminal_via_rest_api_handles_playwright_navigation_error(
             raise rtunnel_module.PlaywrightError("navigation failed")
 
     terminal_ready, api_term_created, term_name = (
-        rtunnel_module._open_terminal_via_rest_api(  # noqa: SLF001
+        terminal_module._open_terminal_via_rest_api(  # noqa: SLF001
             context=object(),
             page=object(),
             lab_frame=_Frame(),
@@ -845,23 +859,23 @@ def test_recover_api_terminal_surface_waits_for_menu_before_file_menu_fallback(
 ) -> None:
     calls: dict[str, int] = {"file_menu": 0}
 
-    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(terminal_module, "_click_terminal_tab", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_wait_for_terminal_surface_progressive",
         lambda *_args, **_kwargs: False,
     )
     monkeypatch.setattr(
-        rtunnel_module, "_wait_for_file_menu_ready", lambda *_args, **_kwargs: False
+        terminal_module, "_wait_for_file_menu_ready", lambda *_args, **_kwargs: False
     )
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_module,
         "_open_terminal_from_file_menu",
         lambda *_args, **_kwargs: calls.__setitem__("file_menu", calls["file_menu"] + 1) or True,
     )
 
     assert (
-        rtunnel_module._recover_api_terminal_surface(  # noqa: SLF001
+        terminal_module._recover_api_terminal_surface(  # noqa: SLF001
             lab_frame=object(),
             page=object(),
         )
@@ -884,32 +898,138 @@ def test_build_batch_setup_script_roundtrip() -> None:
     ]
     result = _build_batch_setup_script(commands)
 
-    # Must be a single line
-    assert "\n" not in result
+    assert result.startswith("cat <<'__INSPIRE_RTUNNEL_B64__' | base64 -d | bash\n")
+    assert result.endswith("\n__INSPIRE_RTUNNEL_B64__")
 
-    # Must start with echo and end with bash
-    assert result.startswith("echo '")
-    assert result.endswith("' | base64 -d | bash")
+    lines = result.splitlines()
+    assert lines[0] == "cat <<'__INSPIRE_RTUNNEL_B64__' | base64 -d | bash"
+    assert lines[-1] == "__INSPIRE_RTUNNEL_B64__"
 
-    # Extract and decode the base64 payload
-    b64_payload = result[len("echo '") : result.index("' | base64 -d | bash")]
+    b64_payload = "".join(lines[1:-1])
     decoded = base64.b64decode(b64_payload).decode()
 
-    # Decoded script should contain all original commands
     for cmd in commands:
         assert cmd in decoded
 
-    # Lines should be newline-separated
-    lines = decoded.strip().split("\n")
-    assert lines == commands
+    decoded_lines = decoded.strip().split("\n")
+    assert decoded_lines == commands
 
 
 def test_build_batch_setup_script_empty() -> None:
     result = _build_batch_setup_script([])
-    assert result.startswith("echo '")
-    b64_payload = result[len("echo '") : result.index("' | base64 -d | bash")]
+    lines = result.splitlines()
+    assert lines[0] == "cat <<'__INSPIRE_RTUNNEL_B64__' | base64 -d | bash"
+    assert lines[-1] == "__INSPIRE_RTUNNEL_B64__"
+    b64_payload = "".join(lines[1:-1])
     decoded = base64.b64decode(b64_payload).decode()
     assert decoded == "\n"
+
+
+# ---------------------------------------------------------------------------
+# build_rtunnel_setup_commands
+# ---------------------------------------------------------------------------
+
+
+def test_build_rtunnel_setup_commands_gates_network_calls_on_inet_probe() -> None:
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    commands = build_rtunnel_setup_commands(
+        port=31337,
+        ssh_port=22222,
+        ssh_public_key=None,
+        ssh_runtime=SshRuntimeConfig(),
+    )
+    script = "\n".join(commands)
+
+    assert "_INET=0; timeout 3 bash -c 'exec 3<>/dev/tcp/archive.ubuntu.com/80'" in script
+    assert 'if [ ! -x "$RTUNNEL_BIN" ] && [ "$_INET" = 1 ]; then curl -fsSL ' in script
+    assert (
+        "timeout 30 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 " "update -qq"
+    ) in script
+    assert "timeout 30 apt-get install -y -qq openssh-server" in script
+
+
+def test_build_rtunnel_setup_commands_apt_mirror_path_skips_curl_and_time_bounds_dropbear() -> None:
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    commands = build_rtunnel_setup_commands(
+        port=31337,
+        ssh_port=22222,
+        ssh_public_key=None,
+        ssh_runtime=SshRuntimeConfig(
+            apt_mirror_url="http://mirror.example/ubuntu/",
+            rtunnel_bin="/shared/bin/rtunnel",
+        ),
+    )
+    script = "\n".join(commands)
+
+    assert "APT_MIRROR_URL=http://mirror.example/ubuntu/" in script
+    assert "timeout 60 apt-get update -qq >/dev/null 2>&1" in script
+    assert "timeout 60 apt-get install -y -qq dropbear-bin >/dev/null 2>&1 || true" in script
+    assert "no curl fallback for offline notebooks" in script
+    assert "curl -fsSL" not in script
+
+
+def test_build_rtunnel_setup_commands_repository_root_mirror_is_supported() -> None:
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    commands = build_rtunnel_setup_commands(
+        port=31337,
+        ssh_port=22222,
+        ssh_public_key=None,
+        ssh_runtime=SshRuntimeConfig(
+            apt_mirror_url="http://mirror.example/repository/",
+            rtunnel_bin="/shared/bin/rtunnel",
+        ),
+    )
+    script = "\n".join(commands)
+
+    assert "APT_MIRROR_URL=http://mirror.example/repository/" in script
+    assert 'MIRROR_URL="${APT_MIRROR_URL%/}"' in script
+    assert '*/repository) MIRROR_URL="$MIRROR_URL/$MIRROR_DISTRO" ;;' in script
+    assert 'echo "deb $MIRROR_URL $CODENAME $MIRROR_COMPONENTS" ' in script
+
+
+def test_build_rtunnel_setup_commands_sshd_deb_dir_stays_on_openssh_path() -> None:
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    commands = build_rtunnel_setup_commands(
+        port=31337,
+        ssh_port=22222,
+        ssh_public_key=None,
+        ssh_runtime=SshRuntimeConfig(
+            sshd_deb_dir="/shared/sshd-debs",
+        ),
+    )
+    script = "\n".join(commands)
+
+    assert "SSHD_DEB_DIR=/shared/sshd-debs" in script
+    assert 'dpkg -i "$SSHD_DEB_DIR"/*.deb >/dev/null 2>&1 || true;' in script
+    assert "dropbear-bin" not in script
+    assert SSHD_MISSING_MARKER in script
+    assert SSH_SERVER_MISSING_MARKER in script
+    assert (
+        'ss -ltnp 2>/dev/null | grep -Eq "127\\\\.0\\\\.0\\\\.1:${SSH_PORT}[[:space:]]|' in script
+    )
+    assert "[s]shd: .*-p ${SSH_PORT}([[:space:]]|$)|" in script
+
+
+def test_build_rtunnel_setup_commands_uses_configured_rtunnel_bin_in_place() -> None:
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    commands = build_rtunnel_setup_commands(
+        port=31337,
+        ssh_port=22222,
+        ssh_public_key=None,
+        ssh_runtime=SshRuntimeConfig(
+            rtunnel_bin="/shared/bin/rtunnel",
+        ),
+    )
+    script = "\n".join(commands)
+
+    assert 'if [ -x "$RTUNNEL_BIN_PATH" ]; then RTUNNEL_BIN="$RTUNNEL_BIN_PATH"; ' in script
+    assert 'nohup "$RTUNNEL_BIN" "$SSH_PORT" "$PORT" ' in script
+    assert 'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x "$RTUNNEL_BIN" ] ' in script
 
 
 # ---------------------------------------------------------------------------
@@ -937,7 +1057,7 @@ def test_wait_for_setup_completion_uses_short_settle_for_ws_path() -> None:
     page = _WaitPageStub()
     timer = _TimerStub()
 
-    _wait_for_setup_completion(page=page, setup_sent_via_ws=True, timer=timer)
+    _wait_for_setup_completion(page=page, setup_confirmed=True, timer=timer)
 
     assert page.wait_calls == [500]
     assert timer.labels == ["wait_marker"]
@@ -947,7 +1067,7 @@ def test_wait_for_setup_completion_uses_longer_settle_for_browser_path() -> None
     page = _WaitPageStub()
     timer = _TimerStub()
 
-    _wait_for_setup_completion(page=page, setup_sent_via_ws=False, timer=timer)
+    _wait_for_setup_completion(page=page, setup_confirmed=False, timer=timer)
 
     assert page.wait_calls == [3000]
     assert timer.labels == ["wait_marker"]
@@ -1192,3 +1312,740 @@ def test_download_rtunnel_locally_no_rtunnel_in_archive(tmp_path: Path) -> None:
 
     assert result is False
     assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# _compute_rtunnel_hash
+# ---------------------------------------------------------------------------
+
+
+def test_compute_rtunnel_hash(tmp_path: Path) -> None:
+    import hashlib
+
+    binary = tmp_path / "rtunnel"
+    binary.write_bytes(b"\x7fELF_test_binary")
+    expected = hashlib.sha256(b"\x7fELF_test_binary").hexdigest()
+    assert _compute_rtunnel_hash(binary) == expected
+
+
+def test_compute_rtunnel_hash_missing_file(tmp_path: Path) -> None:
+    missing = tmp_path / "no_such_file"
+    assert _compute_rtunnel_hash(missing) is None
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses file permissions")
+def test_compute_rtunnel_hash_permission_error(tmp_path: Path) -> None:
+    binary = tmp_path / "rtunnel"
+    binary.write_bytes(b"\x7fELF")
+    binary.chmod(0o000)
+    try:
+        assert _compute_rtunnel_hash(binary) is None
+    finally:
+        binary.chmod(0o644)
+
+
+# ---------------------------------------------------------------------------
+# _rtunnel_matches_on_notebook
+# ---------------------------------------------------------------------------
+
+
+class _MatchGetResponse:
+    def __init__(self, status: int, data: dict | None = None) -> None:
+        self.status = status
+        self._data = data
+
+    def json(self) -> dict:
+        return self._data or {}
+
+
+class _MatchGetRequest:
+    """Fake request that returns different responses per URL substring."""
+
+    def __init__(self, responses: dict[str, _MatchGetResponse]) -> None:
+        self._responses = responses
+
+    def get(self, url: str, timeout: int = 0) -> _MatchGetResponse:
+        for key, resp in self._responses.items():
+            if key in url:
+                return resp
+        return _MatchGetResponse(500)
+
+
+class _MatchContext:
+    def __init__(self, request: _MatchGetRequest) -> None:
+        self.request = request
+
+    def cookies(self) -> list[dict]:
+        return []
+
+
+def test_rtunnel_matches_on_notebook_hit() -> None:
+    import base64 as _b64
+
+    local_hash = "abc123"
+    sidecar_b64 = _b64.b64encode(local_hash.encode()).decode()
+    ctx = _MatchContext(
+        _MatchGetRequest(
+            {
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}?content=0": _MatchGetResponse(200),
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}.sha256": _MatchGetResponse(
+                    200, {"content": sidecar_b64}
+                ),
+            }
+        )
+    )
+    assert _rtunnel_matches_on_notebook(ctx, "https://nb.example.com/lab", local_hash) is True
+
+
+def test_rtunnel_matches_on_notebook_binary_missing() -> None:
+    ctx = _MatchContext(
+        _MatchGetRequest(
+            {
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}?content=0": _MatchGetResponse(404),
+            }
+        )
+    )
+    assert _rtunnel_matches_on_notebook(ctx, "https://nb.example.com/lab", "abc") is False
+
+
+def test_rtunnel_matches_on_notebook_hash_mismatch() -> None:
+    import base64 as _b64
+
+    sidecar_b64 = _b64.b64encode(b"old_hash").decode()
+    ctx = _MatchContext(
+        _MatchGetRequest(
+            {
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}?content=0": _MatchGetResponse(200),
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}.sha256": _MatchGetResponse(
+                    200, {"content": sidecar_b64}
+                ),
+            }
+        )
+    )
+    assert _rtunnel_matches_on_notebook(ctx, "https://nb.example.com/lab", "new_hash") is False
+
+
+def test_rtunnel_matches_on_notebook_sidecar_missing() -> None:
+    ctx = _MatchContext(
+        _MatchGetRequest(
+            {
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}?content=0": _MatchGetResponse(200),
+                f"contents/{_CONTENTS_API_RTUNNEL_FILENAME}.sha256": _MatchGetResponse(404),
+            }
+        )
+    )
+    assert _rtunnel_matches_on_notebook(ctx, "https://nb.example.com/lab", "abc") is False
+
+
+def test_rtunnel_matches_on_notebook_error() -> None:
+    class _BrokenGetRequest:
+        def get(self, url: str, timeout: int = 0) -> None:
+            raise ConnectionError("network failure")
+
+    ctx = _MatchContext(_BrokenGetRequest())  # type: ignore[arg-type]
+    assert _rtunnel_matches_on_notebook(ctx, "https://nb.example.com/lab", "abc") is False
+
+
+# ---------------------------------------------------------------------------
+# _upload_rtunnel_hash_sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_upload_rtunnel_hash_sidecar() -> None:
+    import base64 as _b64
+
+    resp = _DummyUploadResponse(201)
+    req = _DummyUploadRequest(resp)
+    ctx = _DummyUploadContext(req)
+
+    result = _upload_rtunnel_hash_sidecar(ctx, "https://nb.example.com/lab", "deadbeef")
+    assert result is True
+    assert len(req.calls) == 1
+
+    url, _headers, data, timeout = req.calls[0]
+    assert url == f"https://nb.example.com/api/contents/{_CONTENTS_API_RTUNNEL_FILENAME}.sha256"
+    assert data["type"] == "file"
+    assert data["format"] == "base64"
+    assert _b64.b64decode(data["content"]).decode("ascii") == "deadbeef"
+    assert timeout == 5000
+
+
+# ---------------------------------------------------------------------------
+# _resolve_rtunnel_binary
+# ---------------------------------------------------------------------------
+
+
+class _ResolveContext:
+    """Minimal Playwright browser-context stub for _resolve_rtunnel_binary tests."""
+
+    def __init__(self) -> None:
+        self.request = _MatchGetRequest({})
+
+    def cookies(self) -> list[dict]:
+        return []
+
+
+def test_resolve_rtunnel_binary_configured_hash_match(tmp_path, monkeypatch):
+    """rtunnel_bin set, local exists, hash matches → return FILENAME, no upload."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    local_bin = tmp_path / ".local" / "bin" / "rtunnel"
+    local_bin.parent.mkdir(parents=True)
+    local_bin.write_bytes(b"\x7fELF_rtunnel")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(rtunnel_bin="/shared/bin/rtunnel")
+    ctx = _ResolveContext()
+
+    monkeypatch.setattr(upload_module, "_compute_rtunnel_hash", lambda _p: "aaa111")
+    monkeypatch.setattr(
+        upload_module,
+        "_rtunnel_matches_on_notebook",
+        lambda _ctx, _url, _h: True,
+    )
+    upload_called = []
+    monkeypatch.setattr(
+        upload_module,
+        "_upload_rtunnel_via_contents_api",
+        lambda *a, **kw: upload_called.append(1) or True,
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result == _CONTENTS_API_RTUNNEL_FILENAME
+    assert upload_called == []
+
+
+def test_resolve_rtunnel_binary_configured_hash_mismatch(tmp_path, monkeypatch):
+    """rtunnel_bin set, local exists, hash mismatch → return None, no upload."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    local_bin = tmp_path / ".local" / "bin" / "rtunnel"
+    local_bin.parent.mkdir(parents=True)
+    local_bin.write_bytes(b"\x7fELF_rtunnel")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(rtunnel_bin="/shared/bin/rtunnel")
+    ctx = _ResolveContext()
+
+    hash_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_compute_rtunnel_hash",
+        lambda _p: (hash_calls.append(1), "aaa111")[1],
+    )
+    match_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_rtunnel_matches_on_notebook",
+        lambda _ctx, _url, _h: (match_calls.append(1), False)[1],
+    )
+    upload_called = []
+    monkeypatch.setattr(
+        upload_module,
+        "_upload_rtunnel_via_contents_api",
+        lambda *a, **kw: upload_called.append(1) or True,
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result is None
+    assert len(hash_calls) == 1
+    assert len(match_calls) == 1
+    assert upload_called == []
+
+
+def test_resolve_rtunnel_binary_configured_no_local(tmp_path, monkeypatch):
+    """rtunnel_bin set, no local binary → return None, no hash/match/upload calls."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(rtunnel_bin="/shared/bin/rtunnel")
+    ctx = _ResolveContext()
+
+    hash_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_compute_rtunnel_hash",
+        lambda _p: hash_calls.append(1) or "aaa111",
+    )
+    match_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_rtunnel_matches_on_notebook",
+        lambda _ctx, _url, _h: match_calls.append(1) or True,
+    )
+    upload_called = []
+    monkeypatch.setattr(
+        upload_module,
+        "_upload_rtunnel_via_contents_api",
+        lambda *a, **kw: upload_called.append(1) or True,
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result is None
+    assert hash_calls == []
+    assert match_calls == []
+    assert upload_called == []
+
+
+def test_resolve_rtunnel_binary_not_configured_downloads(tmp_path, monkeypatch):
+    """rtunnel_bin not set, no local binary → _download_rtunnel_locally called."""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ctx = _ResolveContext()
+
+    download_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_download_rtunnel_locally",
+        lambda _url, _dest: (download_calls.append(1), False)[1],
+    )
+    upload_called = []
+    monkeypatch.setattr(
+        upload_module,
+        "_upload_rtunnel_via_contents_api",
+        lambda *a, **kw: upload_called.append(1) or True,
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=None
+    )
+    assert result is None
+    assert len(download_calls) == 1
+    assert upload_called == []
+
+
+# ---------------------------------------------------------------------------
+# _resolve_rtunnel_binary — upload policy tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_rtunnel_binary_policy_never_returns_none(tmp_path, monkeypatch):
+    """policy=never → None, no side-effect calls regardless of local binary."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    local_bin = tmp_path / ".local" / "bin" / "rtunnel"
+    local_bin.parent.mkdir(parents=True)
+    local_bin.write_bytes(b"\x7fELF_rtunnel")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(rtunnel_upload_policy="never")
+    ctx = _ResolveContext()
+
+    hash_calls = []
+    monkeypatch.setattr(
+        upload_module, "_compute_rtunnel_hash", lambda _p: hash_calls.append(1) or "aaa111"
+    )
+    upload_called = []
+    monkeypatch.setattr(
+        upload_module,
+        "_upload_rtunnel_via_contents_api",
+        lambda *a, **kw: upload_called.append(1) or True,
+    )
+    download_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_download_rtunnel_locally",
+        lambda _url, _dest: (download_calls.append(1), False)[1],
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result is None
+    assert hash_calls == []
+    assert upload_called == []
+    assert download_calls == []
+
+
+def test_resolve_rtunnel_binary_policy_never_ignores_configured_bin(tmp_path, monkeypatch):
+    """policy=never + rtunnel_bin configured → still None."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(
+        rtunnel_bin="/shared/bin/rtunnel",
+        rtunnel_upload_policy="never",
+    )
+    ctx = _ResolveContext()
+
+    hash_calls = []
+    monkeypatch.setattr(
+        upload_module, "_compute_rtunnel_hash", lambda _p: hash_calls.append(1) or "aaa111"
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result is None
+    assert hash_calls == []
+
+
+def test_resolve_rtunnel_binary_policy_always_forces_upload(tmp_path, monkeypatch):
+    """policy=always + rtunnel_bin + local binary → upload called."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    local_bin = tmp_path / ".local" / "bin" / "rtunnel"
+    local_bin.parent.mkdir(parents=True)
+    local_bin.write_bytes(b"\x7fELF_rtunnel")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(
+        rtunnel_bin="/shared/bin/rtunnel",
+        rtunnel_upload_policy="always",
+    )
+    ctx = _ResolveContext()
+
+    monkeypatch.setattr(upload_module, "_compute_rtunnel_hash", lambda _p: "aaa111")
+    monkeypatch.setattr(upload_module, "_rtunnel_matches_on_notebook", lambda _ctx, _url, _h: False)
+    upload_called = []
+    monkeypatch.setattr(
+        upload_module,
+        "_upload_rtunnel_via_contents_api",
+        lambda *a, **kw: upload_called.append(1) or True,
+    )
+    monkeypatch.setattr(upload_module, "_upload_rtunnel_hash_sidecar", lambda *a, **kw: True)
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result == _CONTENTS_API_RTUNNEL_FILENAME
+    assert len(upload_called) == 1
+
+
+def test_resolve_rtunnel_binary_policy_always_downloads_when_no_local(tmp_path, monkeypatch):
+    """policy=always + no local → download attempted."""
+    from inspire.config.ssh_runtime import SshRuntimeConfig
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    ssh_rt = SshRuntimeConfig(
+        rtunnel_bin="/shared/bin/rtunnel",
+        rtunnel_upload_policy="always",
+    )
+    ctx = _ResolveContext()
+
+    download_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_download_rtunnel_locally",
+        lambda _url, _dest: (download_calls.append(1), False)[1],
+    )
+
+    result = _resolve_rtunnel_binary(
+        context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
+    )
+    assert result is None
+    assert len(download_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# _send_terminal_command_via_websocket — error marker detection
+# ---------------------------------------------------------------------------
+
+
+def _make_eval_page(return_value):  # noqa: ANN001, ANN202
+    """Create a mock page whose evaluate() returns a fixed value."""
+
+    class _EvalPage:
+        def evaluate(self, script: str, payload: dict):  # noqa: ANN201
+            return return_value
+
+    return _EvalPage()
+
+
+def test_send_terminal_command_via_websocket_populates_detected_errors() -> None:
+    """When evaluate returns a dict with errors, detected_errors should be populated."""
+    page = _make_eval_page({"ok": True, "errors": ["MARKER"]})
+    errors: list[str] = []
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+        error_markers=["MARKER"],
+        detected_errors=errors,
+    )
+    assert result is True
+    assert errors == ["MARKER"]
+
+
+def test_send_terminal_command_via_websocket_dict_ok_false() -> None:
+    """When evaluate returns a dict with ok=False and no errors, returns False."""
+    page = _make_eval_page({"ok": False, "errors": []})
+    errors: list[str] = []
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+        detected_errors=errors,
+    )
+    assert result is False
+    assert errors == []
+
+
+def test_send_terminal_command_via_websocket_dict_ok_false_with_errors() -> None:
+    """WS timeout with marker captured: ok=False but errors populated."""
+    page = _make_eval_page({"ok": False, "errors": ["MARKER"]})
+    errors: list[str] = []
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+        error_markers=["MARKER"],
+        detected_errors=errors,
+    )
+    assert result is False
+    assert errors == ["MARKER"]
+
+
+def test_send_terminal_command_via_websocket_plain_bool_still_works() -> None:
+    """Existing mock pages returning plain bool should still work."""
+    page = _make_eval_page(True)
+    errors: list[str] = []
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+        error_markers=["MARKER"],
+        detected_errors=errors,
+    )
+    assert result is True
+    assert errors == []
+
+
+def test_send_setup_command_via_terminal_ws_propagates_detected_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_send_setup_command_via_terminal_ws should propagate detected_errors."""
+
+    class _Frame:
+        url = "https://nb.example.com/lab"
+
+    monkeypatch.setattr(terminal_module, "_create_terminal_via_api", lambda *_a, **_k: "term-1")
+    monkeypatch.setattr(
+        terminal_module,
+        "_build_terminal_websocket_url",
+        lambda _url, _term: "wss://nb.example.com/terminals/websocket/term-1",
+    )
+
+    def fake_send(*_a, **kwargs):  # noqa: ANN202
+        detected = kwargs.get("detected_errors")
+        if detected is not None:
+            detected.append(SSHD_MISSING_MARKER)
+        return False
+
+    monkeypatch.setattr(terminal_module, "_send_terminal_command_via_websocket", fake_send)
+    monkeypatch.setattr(
+        terminal_module,
+        "_delete_terminal_via_api",
+        lambda *_a, **_k: True,
+    )
+
+    errors: list[str] = []
+    result = _send_setup_command_via_terminal_ws(
+        context=object(),
+        lab_frame=_Frame(),
+        batch_cmd="echo",
+        detected_errors=errors,
+    )
+    assert result is False
+    assert errors == [SSHD_MISSING_MARKER]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: WS diagnostics logging
+# ---------------------------------------------------------------------------
+
+
+def test_send_terminal_command_logs_diagnostics_on_failure(capsys: pytest.CaptureFixture) -> None:
+    """When WS returns {ok: False, diagnostics: {...}}, diagnostics are logged to stderr."""
+    diag = {
+        "wsConnected": True,
+        "promptDetected": False,
+        "commandSent": False,
+        "stdoutReceived": False,
+        "stdoutLen": 0,
+        "wsCloseCode": 1006,
+        "wsCloseReason": "",
+        "elapsed": 5000,
+    }
+    page = _make_eval_page({"ok": False, "errors": [], "diagnostics": diag})
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+    )
+    assert result is False
+    captured = capsys.readouterr()
+    assert "ws-diagnostics" in captured.err
+    assert "wsConnected=True" in captured.err
+    assert "promptDetected=False" in captured.err
+    assert "wsCloseCode=1006" in captured.err
+
+
+def test_send_terminal_command_no_diagnostics_on_success(capsys: pytest.CaptureFixture) -> None:
+    """When WS returns {ok: True, diagnostics: {...}}, no diagnostics are logged."""
+    diag = {
+        "wsConnected": True,
+        "promptDetected": True,
+        "commandSent": True,
+        "stdoutReceived": True,
+        "stdoutLen": 42,
+        "wsCloseCode": 1000,
+        "wsCloseReason": "",
+        "elapsed": 3000,
+    }
+    page = _make_eval_page({"ok": True, "errors": [], "diagnostics": diag})
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+    )
+    assert result is True
+    captured = capsys.readouterr()
+    assert "ws-diagnostics" not in captured.err
+
+
+def test_send_terminal_command_no_diagnostics_key_still_works() -> None:
+    """Backward compat: {ok: False, errors: []} without diagnostics key works silently."""
+    page = _make_eval_page({"ok": False, "errors": []})
+    result = _send_terminal_command_via_websocket(
+        page,
+        ws_url="wss://example.test/terminals/websocket/1",
+        command="echo hi",
+    )
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: WS output listener — unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_attach_ws_output_listener_returns_true() -> None:
+    """_attach_ws_output_listener returns True when evaluate succeeds."""
+
+    class _EvalFrame:
+        def evaluate(self, script, payload=None):  # noqa: ANN001, ANN201
+            return True
+
+    result = _attach_ws_output_listener(
+        _EvalFrame(),
+        ws_url="wss://example.test/terminals/websocket/1",
+        completion_marker="DONE",
+        error_markers=["ERROR"],
+    )
+    assert result is True
+
+
+def test_attach_ws_output_listener_returns_false_on_error() -> None:
+    """_attach_ws_output_listener returns False when evaluate raises."""
+
+    class _BrokenFrame:
+        def evaluate(self, script, payload=None):  # noqa: ANN001, ANN201
+            raise RuntimeError("evaluate failed")
+
+    result = _attach_ws_output_listener(
+        _BrokenFrame(),
+        ws_url="wss://example.test/terminals/websocket/1",
+        completion_marker="DONE",
+        error_markers=["ERROR"],
+    )
+    assert result is False
+
+
+def test_poll_ws_capture_returns_state() -> None:
+    """_poll_ws_capture returns the capture dict from window._inspireWsCapture."""
+    capture_state = {
+        "done": True,
+        "errors": ["SOME_ERROR"],
+        "markerFound": False,
+        "wsConnected": True,
+        "stdoutReceived": True,
+        "stdoutLen": 100,
+        "wsCloseCode": 1000,
+        "wsCloseReason": "",
+        "elapsed": 5000,
+    }
+
+    class _EvalFrame:
+        def evaluate(self, script):  # noqa: ANN001, ANN201
+            return capture_state
+
+    result = _poll_ws_capture(_EvalFrame())
+    assert result == capture_state
+
+
+def test_poll_ws_capture_returns_empty_on_error() -> None:
+    """_poll_ws_capture returns safe default dict when evaluate raises."""
+
+    class _BrokenFrame:
+        def evaluate(self, script):  # noqa: ANN001, ANN201
+            raise RuntimeError("evaluate failed")
+
+    result = _poll_ws_capture(_BrokenFrame())
+    assert result["done"] is False
+    assert result["errors"] == []
+    assert result["wsConnected"] is False
+
+
+def test_detach_ws_output_listener_does_not_raise() -> None:
+    """_detach_ws_output_listener does not raise even when evaluate fails."""
+
+    class _BrokenFrame:
+        def evaluate(self, script):  # noqa: ANN001, ANN201
+            raise RuntimeError("evaluate failed")
+
+    # Should not raise
+    _detach_ws_output_listener(_BrokenFrame())
+
+
+def test_wait_for_ws_capture_polls_until_done() -> None:
+    """_wait_for_ws_capture polls and returns when done=True."""
+    call_count = 0
+
+    class _PollingFrame:
+        def evaluate(self, script):  # noqa: ANN001, ANN201
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                return {
+                    "done": True,
+                    "errors": [],
+                    "markerFound": True,
+                    "wsConnected": True,
+                    "stdoutReceived": True,
+                    "stdoutLen": 50,
+                    "wsCloseCode": None,
+                    "wsCloseReason": "",
+                    "elapsed": 2000,
+                }
+            return {
+                "done": False,
+                "errors": [],
+                "markerFound": False,
+                "wsConnected": True,
+                "stdoutReceived": False,
+                "stdoutLen": 0,
+                "wsCloseCode": None,
+                "wsCloseReason": "",
+                "elapsed": 500,
+            }
+
+    class _DummyPage:
+        def wait_for_timeout(self, ms: int) -> None:
+            pass
+
+    result = _wait_for_ws_capture(
+        _PollingFrame(), _DummyPage(), timeout_ms=10000, poll_interval_ms=10
+    )
+    assert result["done"] is True
+    assert result["markerFound"] is True
+    assert call_count >= 3

@@ -15,6 +15,7 @@ from inspire.platform.web.browser_api.core import (
     _run_in_thread,
 )
 from inspire.platform.web.session import WebSession, get_web_session
+from inspire.platform.web.browser_api.rtunnel.logging import trace_event, update_trace_summary
 
 
 # ---------------------------------------------------------------------------
@@ -27,12 +28,13 @@ def _is_lab_like_url(url: str, *, notebook_lab_pattern: str) -> bool:
     if not value:
         return False
 
-    normalized = value.rstrip("/")
-    if "notebook-inspire" in value and normalized.endswith("/lab"):
+    parsed = urlsplit(value)
+    path = parsed.path.rstrip("/")
+    if "notebook-inspire" in parsed.netloc and path.endswith("/lab"):
         return True
-    if notebook_lab_pattern.lstrip("/") in value:
+    if notebook_lab_pattern.rstrip("/") in parsed.path and path.endswith("/lab"):
         return True
-    if "/jupyter/" in value and normalized.endswith("/lab"):
+    if "/jupyter/" in parsed.path and path.endswith("/lab"):
         return True
     return False
 
@@ -59,6 +61,11 @@ def _wait_for_lab_handle(
     while time.time() - start < timeout_s:
         handle = _find_lab_handle(page, notebook_lab_pattern=notebook_lab_pattern)
         if handle is not None:
+            trace_event(
+                "lab_handle_detected",
+                handle_type="page" if handle is page else "frame",
+                url=getattr(handle, "url", ""),
+            )
             return handle
         page.wait_for_timeout(500)
     return None
@@ -69,6 +76,7 @@ def open_notebook_lab(page, *, notebook_id: str, timeout: int = 60000):  # noqa:
     base_url = _get_base_url()
     timeout_ms = max(int(timeout), 10000)
     timeout_s = max(timeout_ms // 1000, 10)
+    trace_event("lab_navigation_start", notebook_id=notebook_id, timeout_ms=timeout_ms)
     page.goto(
         f"{base_url}/ide?notebook_id={notebook_id}",
         timeout=timeout_ms,
@@ -83,10 +91,12 @@ def open_notebook_lab(page, *, notebook_id: str, timeout: int = 60000):  # noqa:
         timeout_s=frame_probe_s,
     )
     if lab_handle is not None:
+        update_trace_summary(lab_resolution="ide_frame_probe")
         return lab_handle
 
     notebook_lab_prefix = _browser_api_path("/notebook/lab").rstrip("/")
     direct_lab_url = f"{base_url}{notebook_lab_prefix}/{notebook_id}/"
+    trace_event("lab_navigation_fallback", direct_lab_url=direct_lab_url)
     elapsed_ms = int(frame_probe_s * 1000)
     remaining_ms = max(10000, timeout_ms - elapsed_ms)
     direct_timeout_ms = min(remaining_ms, 20000)
@@ -101,9 +111,24 @@ def open_notebook_lab(page, *, notebook_id: str, timeout: int = 60000):  # noqa:
         timeout_s=min(5.0, max(1.0, remaining_ms / 1000.0)),
     )
     if lab_handle is not None:
+        update_trace_summary(lab_resolution="direct_lab_fallback")
         return lab_handle
 
-    return page
+    frame_urls = [fr.url for fr in getattr(page, "frames", []) if getattr(fr, "url", "")]
+    trace_event(
+        "lab_navigation_failed",
+        final_page_url=getattr(page, "url", "") or "(empty)",
+        frame_count=len(frame_urls),
+    )
+    update_trace_summary(
+        lab_resolution="failed",
+        last_error="Failed to resolve notebook JupyterLab to a usable frame or page.",
+    )
+    raise RuntimeError(
+        "Failed to resolve notebook JupyterLab to a usable frame or page.\n"
+        f"Final page URL: {getattr(page, 'url', '') or '(empty)'}\n"
+        f"Frame URLs: {frame_urls or ['(none)']}"
+    )
 
 
 def build_jupyter_proxy_url(lab_url: str, *, port: int) -> str:

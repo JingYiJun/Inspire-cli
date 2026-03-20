@@ -27,6 +27,10 @@ from inspire.config import ConfigError
 from inspire.cli.utils.job_cache import JobCache
 from inspire.platform.openapi import ResourceManager
 
+import importlib
+
+run_command_module = importlib.import_module("inspire.cli.commands.run")
+
 # Valid test job IDs (must match the format: job-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
 TEST_JOB_ID = "job-12345678-1234-1234-1234-123456789abc"
 TEST_JOB_ID_2 = "job-abcdef12-3456-7890-abcd-ef1234567890"
@@ -328,6 +332,86 @@ def test_job_create_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert data["data"]["job_id"] == TEST_JOB_ID
 
 
+def test_job_create_uses_shared_defaults_for_resource_and_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    config = make_test_config(tmp_path)
+    config.default_resource = "H200"
+    config.default_image = "shared-image"
+    config.default_priority = 7
+    config.workspace_gpu_id = "ws-22222222-2222-2222-2222-222222222222"
+    config.job_priority = None
+    config.job_image = None
+    config.job_workspace_id = None
+
+    def fake_from_files_and_env(
+        cls, require_target_dir: bool = False, require_credentials: bool = True
+    ):  # type: ignore[override]
+        if require_target_dir and not config.target_dir:
+            raise ConfigError("Missing INSPIRE_TARGET_DIR")
+        return config, {}
+
+    monkeypatch.setattr(
+        config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
+    )
+
+    api = DummyAPI()
+
+    def fake_get_api(self_or_cls, cfg: Optional[config_module.Config] = None) -> DummyAPI:  # type: ignore[override]
+        assert cfg is config or cfg is None
+        return api
+
+    monkeypatch.setattr(auth_module.AuthManager, "get_api", fake_get_api)
+    auth_module.AuthManager.clear_cache()
+
+    class FakeWebSession:
+        workspace_id = "ws-test-workspace"
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: FakeWebSession())
+
+    test_project = browser_api_module.ProjectInfo(
+        project_id="project-test-123",
+        name="Test Project",
+        workspace_id="ws-test-workspace",
+        member_gpu_limit=True,
+        member_remain_gpu_hours=100.0,
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "list_projects",
+        lambda workspace_id=None, session=None: [test_project],
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "select_project",
+        lambda projects, requested=None, **_: (test_project, None),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        [
+            "job",
+            "create",
+            "--name",
+            "test-job",
+            "--command",
+            "echo hi",
+            "--no-auto",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["resource"] == "H200"
+    assert api.calls["create_training_job_smart"]["image"] == "shared-image"
+    assert api.calls["create_training_job_smart"]["task_priority"] == 7
+    assert (
+        api.calls["create_training_job_smart"]["workspace_id"]
+        == "ws-22222222-2222-2222-2222-222222222222"
+    )
+
+
 def test_job_create_requires_target_dir(monkeypatch: pytest.MonkeyPatch):
     def fake_from_files_and_env(
         cls, require_target_dir: bool = False, require_credentials: bool = True
@@ -356,6 +440,193 @@ def test_job_create_requires_target_dir(monkeypatch: pytest.MonkeyPatch):
 
     assert result.exit_code == EXIT_CONFIG_ERROR
     assert "Missing INSPIRE_TARGET_DIR" in result.output
+
+
+def _patch_low_priority_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    priority_level: str = "LOW",
+) -> DummyAPI:
+    """Like patch_config_and_auth but with a LOW-priority project."""
+    api = patch_config_and_auth(monkeypatch, tmp_path)
+
+    low_project = browser_api_module.ProjectInfo(
+        project_id="project-low-001",
+        name="LowPrio",
+        workspace_id="ws-test-workspace",
+        priority_level=priority_level,
+        priority_name="0",
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "list_projects",
+        lambda workspace_id=None, session=None: [low_project],
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "select_project",
+        lambda projects, requested=None, **_: (low_project, None),
+    )
+    return api
+
+
+def test_job_create_low_priority_auto_enables_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    api = _patch_low_priority_project(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_main,
+        ["job", "create", "-n", "ft-test", "-r", "H200", "-c", "echo hi", "--no-auto"],
+    )
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is True
+    assert "low priority" in result.output
+    assert "auto-restarted" in result.output
+
+
+def test_job_create_no_fault_tolerant_overrides_low_priority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    api = _patch_low_priority_project(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_main,
+        [
+            "job",
+            "create",
+            "-n",
+            "ft-off",
+            "-r",
+            "H200",
+            "-c",
+            "echo hi",
+            "--no-auto",
+            "--no-fault-tolerant",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is False
+    assert "low priority" in result.output
+    assert "auto-restarted" not in result.output
+
+
+def test_job_create_low_priority_case_insensitive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """priority_level from the API may arrive in any case."""
+    api = _patch_low_priority_project(monkeypatch, tmp_path, priority_level="low")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_main,
+        ["job", "create", "-n", "case-test", "-r", "H200", "-c", "echo hi", "--no-auto"],
+    )
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is True
+    assert "low priority" in result.output
+
+
+def test_job_create_normal_priority_no_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """NORMAL-priority projects should not auto-enable fault tolerance."""
+    api = patch_config_and_auth(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_main,
+        ["job", "create", "-n", "normal-test", "-r", "H200", "-c", "echo hi", "--no-auto"],
+    )
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is False
+    assert "low priority" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# `inspire run` — fault-tolerant / LOW-priority behavioral tests
+# ---------------------------------------------------------------------------
+
+_FAKE_BEST = type("FakeBest", (), {"available_gpus": 64, "low_priority_gpus": 0})()
+
+
+def _patch_run_autoselect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub out compute-group auto-selection and availability diagnostics for `run`."""
+    monkeypatch.setattr(
+        run_command_module,
+        "find_best_compute_group_location",
+        lambda api, *, gpu_type, min_gpus, include_preemptible, instance_count: (
+            _FAKE_BEST,
+            "TestRoom",
+            "H200 TestRoom",
+        ),
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        lambda workspace_id=None, session=None: [],
+    )
+
+
+def test_run_low_priority_auto_enables_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    api = _patch_low_priority_project(monkeypatch, tmp_path)
+    _patch_run_autoselect(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_main, ["run", "echo hi"])
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is True
+    assert "low priority" in result.output
+    assert "auto-restarted" in result.output
+
+
+def test_run_no_fault_tolerant_overrides_low_priority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    api = _patch_low_priority_project(monkeypatch, tmp_path)
+    _patch_run_autoselect(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_main, ["run", "echo hi", "--no-fault-tolerant"])
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is False
+    assert "low priority" in result.output
+    assert "auto-restarted" not in result.output
+
+
+def test_run_low_priority_case_insensitive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """priority_level from the API may arrive in any case."""
+    api = _patch_low_priority_project(monkeypatch, tmp_path, priority_level="low")
+    _patch_run_autoselect(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_main, ["run", "echo hi"])
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is True
+    assert "low priority" in result.output
+
+
+def test_run_normal_priority_no_fault_tolerance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """NORMAL-priority projects should not auto-enable fault tolerance."""
+    api = patch_config_and_auth(monkeypatch, tmp_path)
+    _patch_run_autoselect(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_main, ["run", "echo hi"])
+
+    assert result.exit_code == 0
+    assert api.calls["create_training_job_smart"]["auto_fault_tolerance"] is False
+    assert "low priority" not in result.output
 
 
 def test_wrap_in_bash():
@@ -1068,10 +1339,11 @@ def test_tunnel_list_places_connected_bridges_first(monkeypatch: pytest.MonkeyPa
     result = runner.invoke(cli_main, ["tunnel", "list"])
 
     assert result.exit_code == EXIT_SUCCESS
-    alpha_pos = result.output.find("  alpha:")
-    beta_pos = result.output.find("* beta:")
-    zeta_pos = result.output.find("  zeta:")
+    alpha_pos = result.output.find("alpha")
+    beta_pos = result.output.find("beta")
+    zeta_pos = result.output.find("zeta")
     assert alpha_pos != -1 and beta_pos != -1 and zeta_pos != -1
+    # Connected bridge (alpha) should appear before disconnected ones
     assert alpha_pos < beta_pos
     assert alpha_pos < zeta_pos
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -55,34 +56,34 @@ from inspire.platform.web.browser_api import NotebookFailedError
 )
 @click.option(
     "--workspace-id",
-    help="Workspace ID (overrides auto-selection)",
+    help="Workspace ID override (escape hatch; overrides auto-selection)",
 )
 @click.option(
     "--resource",
     "-r",
     default=None,
-    help="Resource spec (e.g., 1xH200, 4xH100, 4CPU) (default from config [notebook].resource)",
+    help="Resource spec (e.g., 1xH200, 4xH100, 4CPU) (default from config [notebook].resource or [defaults].resource)",
 )
 @click.option(
     "--project",
     "-p",
     default=None,
-    help="Project name or ID (default from config [context].project or [job].project_id)",
+    help="Project name or ID (default from config [notebook].project_id or [defaults].project_order)",
 )
 @click.option(
     "--image",
     "-i",
     default=None,
     help=(
-        "Image name/URL (default from config [notebook].image or [job].image; prompts interactively "
-        "if still omitted)"
+        "Image name/URL (default from config [notebook].image or [defaults].image; prompts "
+        "interactively if still omitted)"
     ),
 )
 @click.option(
     "--shm-size",
     type=int,
     default=None,
-    help="Shared memory size in GB (default: INSPIRE_SHM_SIZE/job.shm_size, else 32)",
+    help="Shared memory size in GB (default from config [notebook].shm_size or [defaults].shm_size, else 32)",
 )
 @click.option(
     "--auto-stop/--no-auto-stop",
@@ -124,7 +125,7 @@ from inspire.platform.web.browser_api import NotebookFailedError
     "--priority",
     type=click.IntRange(1, 10),
     default=None,
-    help="Task priority (1-10, default from config [job].priority or 6)",
+    help="Task priority (1-10, default from config [notebook].priority or [defaults].priority or 6)",
 )
 @pass_context
 def create_notebook_cmd(
@@ -317,6 +318,9 @@ def start_notebook_cmd(
             post_start=post_start,
             post_start_script=post_start_script,
         )
+    except ConfigError as e:
+        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+        return
     except ValueError as e:
         _handle_error(ctx, "ValidationError", str(e), EXIT_CONFIG_ERROR)
         return
@@ -583,7 +587,6 @@ def list_notebooks(
             config.workspace_cpu_id,
             config.workspace_gpu_id,
             config.workspace_internet_id,
-            config.job_workspace_id,
         ):
             if ws_id:
                 candidates.append(ws_id)
@@ -602,7 +605,12 @@ def list_notebooks(
 
     if not workspace_ids:
         try:
-            resolved = select_workspace_id(config)
+            resolved = select_workspace_id(
+                config,
+                legacy_workspace_id=config.job_workspace_id
+                or getattr(config, "default_workspace_id", None)
+                or getattr(config, "notebook_workspace_id", None),
+            )
         except ConfigError as e:
             _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
             return
@@ -616,8 +624,8 @@ def list_notebooks(
                 "No workspace_id configured or provided.",
                 EXIT_CONFIG_ERROR,
                 hint=(
-                    "Use --workspace-id, set [workspaces].cpu/[workspaces].gpu in config.toml, "
-                    "or set INSPIRE_WORKSPACE_ID."
+                    "Use --workspace-id, pass --workspace cpu/gpu/internet, or set "
+                    "[workspaces].cpu/[workspaces].gpu in config.toml."
                 ),
             )
             return
@@ -717,6 +725,12 @@ def list_notebooks(
     help="Path to pre-cached rtunnel binary (e.g., /inspire/.../rtunnel)",
 )
 @click.option(
+    "--rtunnel-upload-policy",
+    type=click.Choice(["auto", "never", "always"], case_sensitive=False),
+    default=None,
+    help="Rtunnel upload fallback: auto (default), never, or always",
+)
+@click.option(
     "--debug-playwright",
     is_flag=True,
     help="Run browser automation with visible window for debugging",
@@ -728,6 +742,7 @@ def list_notebooks(
     show_default=True,
     help="Timeout in seconds for rtunnel setup to complete",
 )
+@click.argument("ssh_command", nargs=-1, type=click.UNPROCESSED)
 @pass_context
 def ssh_notebook_cmd(
     ctx: Context,
@@ -739,10 +754,24 @@ def ssh_notebook_cmd(
     ssh_port: int,
     command: Optional[str],
     rtunnel_bin: Optional[str],
+    rtunnel_upload_policy: Optional[str],
     debug_playwright: bool,
     setup_timeout: int,
+    ssh_command: tuple[str, ...],
 ) -> None:
-    """SSH into a running notebook instance via rtunnel ProxyCommand."""
+    """SSH into a running notebook instance via rtunnel ProxyCommand.
+
+    \b
+    Examples:
+        inspire notebook ssh abc123
+        inspire notebook ssh abc123 --command "echo hello"
+        inspire notebook ssh abc123 -- echo 'connected'
+        inspire notebook ssh abc123 -- python train.py --epochs 100
+    """
+    if ssh_command and command:
+        raise click.UsageError("Provide a remote command via --command or after '--', not both.")
+    if ssh_command:
+        command = shlex.join(ssh_command)
     run_notebook_ssh(
         ctx,
         notebook_id=notebook,
@@ -753,6 +782,7 @@ def ssh_notebook_cmd(
         ssh_port=ssh_port,
         command=command,
         rtunnel_bin=rtunnel_bin,
+        rtunnel_upload_policy=rtunnel_upload_policy,
         debug_playwright=debug_playwright,
         setup_timeout=setup_timeout,
     )

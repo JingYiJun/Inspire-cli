@@ -7,7 +7,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from inspire.config.models import Config
+from inspire.config import Config, build_env_exports
 
 POST_START_LOG = "/tmp/inspire-notebook-post-start.log"
 POST_START_PID_FILE = "/tmp/inspire-notebook-post-start.pid"
@@ -84,13 +84,17 @@ def _build_script_command(
     log_path: str,
     pid_file: str,
     completion_marker: str,
+    env_exports: str = "",
 ) -> str:
     encoded_script = base64.b64encode(script_text.encode("utf-8")).decode("ascii")
+    launch_script = (
+        f'{env_exports}exec bash "$SCRIPT_PATH"' if env_exports else 'exec bash "$SCRIPT_PATH"'
+    )
     command_text = (
         f"SCRIPT_PATH={shlex.quote(POST_START_SCRIPT_PATH)}; "
         f'printf %s {shlex.quote(encoded_script)} | base64 -d > "$SCRIPT_PATH"; '
         'chmod +x "$SCRIPT_PATH"; '
-        'exec bash "$SCRIPT_PATH"'
+        f"{launch_script}"
     )
     return _build_background_command(
         command_text,
@@ -101,10 +105,15 @@ def _build_script_command(
 
 
 def _build_command_spec(command_text: str) -> NotebookPostStartSpec:
+    return _build_command_spec_with_env(command_text, env_exports="")
+
+
+def _build_command_spec_with_env(command_text: str, *, env_exports: str) -> NotebookPostStartSpec:
+    full_command = f"{env_exports}{command_text}" if env_exports else command_text
     return NotebookPostStartSpec(
         label="notebook post-start command",
         command=_build_background_command(
-            command_text,
+            full_command,
             log_path=POST_START_LOG,
             pid_file=POST_START_PID_FILE,
             completion_marker=POST_START_STARTED_MARKER,
@@ -116,6 +125,10 @@ def _build_command_spec(command_text: str) -> NotebookPostStartSpec:
 
 
 def _build_script_spec(script_path: Path) -> NotebookPostStartSpec:
+    return _build_script_spec_with_env(script_path, env_exports="")
+
+
+def _build_script_spec_with_env(script_path: Path, *, env_exports: str) -> NotebookPostStartSpec:
     try:
         script_text = script_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -131,6 +144,7 @@ def _build_script_spec(script_path: Path) -> NotebookPostStartSpec:
             log_path=POST_START_LOG,
             pid_file=POST_START_PID_FILE,
             completion_marker=POST_START_STARTED_MARKER,
+            env_exports=env_exports,
         ),
         log_path=POST_START_LOG,
         pid_file=POST_START_PID_FILE,
@@ -145,6 +159,8 @@ def resolve_notebook_post_start_spec(
     post_start_script: Path | None,
     keepalive: bool | None = None,
 ) -> NotebookPostStartSpec | None:
+    remote_env = getattr(config, "remote_env", {}) or {}
+
     if keepalive is not None:
         raise ValueError(
             "The keepalive notebook post-start preset has been removed. "
@@ -153,7 +169,8 @@ def resolve_notebook_post_start_spec(
         )
 
     if post_start_script is not None:
-        return _build_script_spec(post_start_script)
+        env_exports = build_env_exports(remote_env)
+        return _build_script_spec_with_env(post_start_script, env_exports=env_exports)
 
     resolved_value = _normalize_post_start_value(post_start)
     if resolved_value is None:
@@ -169,7 +186,8 @@ def resolve_notebook_post_start_spec(
         )
     if resolved_value is None:
         return None
-    return _build_command_spec(resolved_value)
+    env_exports = build_env_exports(remote_env)
+    return _build_command_spec_with_env(resolved_value, env_exports=env_exports)
 
 
 __all__ = [

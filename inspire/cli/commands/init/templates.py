@@ -45,6 +45,8 @@ platform = "gitea"
 server = "https://codeberg.org"
 repo = "owner/repo"
 # token - use INSP_GITEA_TOKEN env var
+# Workflow settings are fallback-only. Prefer SSH tunnel/bridge transport when available.
+# These workflow keys are expected to be deprecated in the future.
 log_workflow = "retrieve_job_log.yml"
 sync_workflow = "sync_code.yml"
 bridge_workflow = "run_bridge_action.yml"
@@ -54,6 +56,8 @@ remote_timeout = 90
 server = "https://github.com"
 repo = "owner/repo"
 # token - use INSP_GITHUB_TOKEN env var
+# Workflow settings are fallback-only. Prefer SSH tunnel/bridge transport when available.
+# These workflow keys are expected to be deprecated in the future.
 log_workflow = "retrieve_job_log.yml"
 sync_workflow = "sync_code.yml"
 bridge_workflow = "run_bridge_action.yml"
@@ -65,6 +69,14 @@ default_remote = "origin"
 action_timeout = 600
 denylist = ["*.tmp", ".git/*"]
 
+[defaults]
+# Shared fallback settings for jobs and notebooks.
+# resource = "1xH200"
+# image = "pytorch:latest"
+# priority = 6
+# shm_size = 32
+# project_order = ["cq", "ci"]
+
 [workspaces]
 # cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)
 # gpu = "ws-..."       # GPU workspace (H100/H200 jobs)
@@ -72,20 +84,26 @@ denylist = ["*.tmp", ".git/*"]
 # special = "ws-..."   # Custom alias (use with --workspace special)
 
 [job]
+# resource = "4xH200"
 # project_id = "project-..."
-# workspace_id = "ws-..."
 # image = "pytorch:latest"
 # priority = 6
-# shm_size = 32  # Default shared memory (GiB) for notebooks; jobs use it when set
+# shm_size = 32
 
 [notebook]
-resource = "1xH200"
+# resource = "1xH200"
 # image = "pytorch:latest"
+# project_id = "project-..."
+# priority = 6
+# shm_size = 32
 # post_start = "bash /workspace/bootstrap.sh"  # none | shell command
 
 [remote_env]
-# Environment variables exported before remote commands run.
+# Environment variables exported before bridge exec, job commands,
+# and notebook post-start commands/scripts run.
 # Tip: use "$VARNAME" or "${{VARNAME}}" to pull from your *local* env at runtime.
+# PIP_INDEX_URL = "https://mirror.example/simple"
+# APT_MIRROR_URL = "http://nexus.example.com/repository/ubuntu/"  # fallback for notebook ssh bootstrap
 # WANDB_API_KEY = "$WANDB_API_KEY"
 # HF_TOKEN = "$HF_TOKEN"
 """

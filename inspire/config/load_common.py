@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from inspire.config.models import SOURCE_DEFAULT
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
 
 _ACCOUNT_OVERRIDE_FIELDS = {
     "base_url",
@@ -25,6 +24,8 @@ _ACCOUNT_OVERRIDE_FIELDS = {
     "dropbear_deb_dir",
     "setup_script",
     "rtunnel_download_url",
+    "apt_mirror_url",
+    "rtunnel_upload_policy",
 }
 
 _ACCOUNT_SECTION_KEY_MAP = {
@@ -46,15 +47,19 @@ _ACCOUNT_SECTION_KEY_MAP = {
         "dropbear_deb_dir": "dropbear_deb_dir",
         "setup_script": "setup_script",
         "rtunnel_download_url": "rtunnel_download_url",
+        "apt_mirror_url": "apt_mirror_url",
+        "rtunnel_upload_policy": "rtunnel_upload_policy",
     },
 }
 
 _DEFAULTS_FIELD_MAP = {
-    "image": "job_image",
+    "resource": "default_resource",
+    "image": "default_image",
+    "workspace_id": "default_workspace_id",
+    "priority": "default_priority",
     "notebook_image": "notebook_image",
     "notebook_resource": "notebook_resource",
     "notebook_post_start": "notebook_post_start",
-    "priority": "job_priority",
     "shm_size": "shm_size",
     "target_dir": "target_dir",
     "log_pattern": "log_pattern",
@@ -81,6 +86,8 @@ class _ProjectLayerState:
 
 
 def _default_config_values() -> dict[str, Any]:
+    from inspire.config.rtunnel_defaults import DEFAULT_RTUNNEL_DOWNLOAD_URL
+
     return {
         "username": "",
         "password": "",
@@ -115,10 +122,16 @@ def _default_config_values() -> dict[str, Any]:
         "browser_api_prefix": None,
         "auth_endpoint": None,
         "docker_registry": None,
-        "job_priority": 6,
+        "job_resource": None,
+        "job_priority": None,
         "job_image": None,
         "job_project_id": None,
         "job_workspace_id": None,
+        "job_shm_size": None,
+        "default_resource": None,
+        "default_image": None,
+        "default_priority": None,
+        "default_workspace_id": None,
         "workspace_cpu_id": None,
         "workspace_gpu_id": None,
         "workspace_internet_id": None,
@@ -130,15 +143,20 @@ def _default_config_values() -> dict[str, Any]:
         "account_shared_path_group": None,
         "account_train_job_workdir": None,
         "context_account": None,
-        "notebook_resource": "1xH200",
+        "notebook_resource": None,
         "notebook_image": None,
+        "notebook_project_id": None,
+        "notebook_priority": None,
+        "notebook_workspace_id": None,
+        "notebook_shm_size": None,
         "notebook_post_start": None,
         "rtunnel_bin": None,
         "sshd_deb_dir": None,
         "dropbear_deb_dir": None,
         "setup_script": None,
-        "rtunnel_download_url": default_rtunnel_download_url(),
+        "rtunnel_download_url": DEFAULT_RTUNNEL_DOWNLOAD_URL,
         "apt_mirror_url": None,
+        "rtunnel_upload_policy": "auto",
         "tunnel_retries": 3,
         "tunnel_retry_pause": 2.0,
         "shm_size": None,
@@ -253,9 +271,12 @@ def _resolve_alias(value: Any, mapping: dict[str, str], *, id_prefix: str) -> st
 
 
 def _coerce_project_default(field_name: str, raw_value: Any) -> Any:
-    if field_name in {"job_priority", "shm_size"}:
+    if field_name in {"job_priority", "default_priority", "job_shm_size", "shm_size"}:
         return int(raw_value)
     if field_name in {
+        "default_resource",
+        "default_image",
+        "default_workspace_id",
         "target_dir",
         "job_image",
         "notebook_image",

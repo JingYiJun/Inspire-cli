@@ -32,6 +32,21 @@ def test_resolve_notebook_post_start_spec_defaults_to_none() -> None:
     assert spec is None
 
 
+def test_resolve_notebook_post_start_spec_ignores_remote_env_when_disabled() -> None:
+    spec = resolve_notebook_post_start_spec(
+        config=Config(
+            username="user",
+            password="pass",
+            notebook_post_start=None,
+            remote_env={"NOT-VALID": "value"},
+        ),
+        post_start=None,
+        post_start_script=None,
+    )
+
+    assert spec is None
+
+
 def test_resolve_notebook_post_start_spec_can_disable_default() -> None:
     spec = resolve_notebook_post_start_spec(
         config=_config(post_start="none"),
@@ -56,6 +71,21 @@ def test_resolve_notebook_post_start_spec_prefers_explicit_command() -> None:
     assert "nohup bash -lc " in spec.command
 
 
+def test_resolve_notebook_post_start_spec_injects_remote_env_into_command() -> None:
+    spec = resolve_notebook_post_start_spec(
+        config=Config(
+            username="user",
+            password="pass",
+            remote_env={"PIP_INDEX_URL": "https://mirror.example/simple"},
+        ),
+        post_start="pip install uv",
+        post_start_script=None,
+    )
+
+    assert spec is not None
+    assert "export PIP_INDEX_URL=https://mirror.example/simple && pip install uv" in spec.command
+
+
 def test_resolve_notebook_post_start_spec_builds_script_from_file(tmp_path: Path) -> None:
     script_path = tmp_path / "bootstrap.sh"
     script_path.write_text("#!/usr/bin/env bash\necho hello\n", encoding="utf-8")
@@ -71,6 +101,29 @@ def test_resolve_notebook_post_start_spec_builds_script_from_file(tmp_path: Path
     assert spec.label.endswith(f"({script_path.name})")
     assert "base64 -d" in spec.command
     assert spec.log_path == POST_START_LOG
+
+
+def test_resolve_notebook_post_start_spec_injects_remote_env_before_script_launch(
+    tmp_path: Path,
+) -> None:
+    script_path = tmp_path / "bootstrap.sh"
+    script_path.write_text("#!/usr/bin/env bash\necho hello\n", encoding="utf-8")
+
+    spec = resolve_notebook_post_start_spec(
+        config=Config(
+            username="user",
+            password="pass",
+            remote_env={"PIP_INDEX_URL": "https://mirror.example/simple"},
+        ),
+        post_start=None,
+        post_start_script=script_path,
+    )
+
+    assert spec is not None
+    assert (
+        'export PIP_INDEX_URL=https://mirror.example/simple && exec bash "$SCRIPT_PATH"'
+        in spec.command
+    )
 
 
 def test_resolve_notebook_post_start_spec_rejects_removed_keepalive_cli_value() -> None:

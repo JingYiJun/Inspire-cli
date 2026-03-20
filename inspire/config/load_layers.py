@@ -10,8 +10,9 @@ from inspire.config.toml import (
     _find_project_config,
     _flatten_toml,
     _load_toml,
-    _toml_key_to_field,
+    _validate_toml_value,
 )
+from inspire.config.schema import get_option_by_toml
 
 from .load_accounts import _parse_global_accounts
 from .load_common import (
@@ -19,6 +20,27 @@ from .load_common import (
     _apply_defaults_overrides,
     _parse_alias_map,
 )
+
+
+def _apply_legacy_workspace_id_section(
+    *,
+    raw_data: dict[str, Any],
+    config_dict: dict[str, Any],
+    sources: dict[str, str],
+    source_name: str,
+) -> None:
+    for section_name, field_name in (
+        ("job", "job_workspace_id"),
+        ("notebook", "notebook_workspace_id"),
+    ):
+        section = raw_data.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        raw_value = section.get("workspace_id")
+        if raw_value is None or raw_value == "":
+            continue
+        config_dict[field_name] = str(raw_value)
+        sources[field_name] = source_name
 
 
 def _apply_global_layer(
@@ -52,10 +74,11 @@ def _apply_global_layer(
 
     flat_global = _flatten_toml(global_raw)
     for toml_key, value in flat_global.items():
-        field_name = _toml_key_to_field(toml_key)
-        if field_name and field_name in config_dict:
-            config_dict[field_name] = value
-            sources[field_name] = SOURCE_GLOBAL
+        option = get_option_by_toml(toml_key)
+        if not option or option.field_name not in config_dict:
+            continue
+        config_dict[option.field_name] = _validate_toml_value(option, value)
+        sources[option.field_name] = SOURCE_GLOBAL
 
     if global_compute_groups:
         config_dict["compute_groups"] = global_compute_groups
@@ -69,6 +92,13 @@ def _apply_global_layer(
     if global_accounts:
         config_dict["accounts"] = global_accounts
         sources["accounts"] = SOURCE_GLOBAL
+
+    _apply_legacy_workspace_id_section(
+        raw_data=global_raw,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_GLOBAL,
+    )
 
     _apply_defaults_overrides(
         defaults=global_defaults,
@@ -131,10 +161,11 @@ def _apply_project_layer(
 
     flat_project = _flatten_toml(project_raw)
     for toml_key, value in flat_project.items():
-        field_name = _toml_key_to_field(toml_key)
-        if field_name and field_name in config_dict:
-            config_dict[field_name] = value
-            sources[field_name] = SOURCE_PROJECT
+        option = get_option_by_toml(toml_key)
+        if not option or option.field_name not in config_dict:
+            continue
+        config_dict[option.field_name] = _validate_toml_value(option, value)
+        sources[option.field_name] = SOURCE_PROJECT
 
     if project_compute_groups:
         config_dict["compute_groups"] = project_compute_groups
@@ -154,6 +185,13 @@ def _apply_project_layer(
         merged_accounts.update(project_accounts)
         config_dict["accounts"] = merged_accounts
         sources["accounts"] = SOURCE_PROJECT
+
+    _apply_legacy_workspace_id_section(
+        raw_data=project_raw,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_PROJECT,
+    )
 
     return layer_state
 

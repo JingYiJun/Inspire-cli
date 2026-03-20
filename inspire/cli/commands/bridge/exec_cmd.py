@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import logging
+import shlex
 import subprocess
 import sys
 import time
@@ -68,9 +69,27 @@ def split_denylist(items: tuple[str, ...]) -> list[str]:
     return parts
 
 
-def _build_remote_command(*, command: str, target_dir: str, remote_env: dict[str, str]) -> str:
-    env_exports = build_env_exports(remote_env)
+def _build_remote_command(*, command: str, target_dir: str, env_exports: str) -> str:
     return f'{env_exports}cd "{target_dir}" && {command}'
+
+
+def _normalize_exec_command(command_parts: tuple[str, ...]) -> str:
+    if not command_parts:
+        raise click.UsageError("Provide a command to execute.")
+    if len(command_parts) == 1:
+        # Preserve legacy behavior when users pass a single quoted command string.
+        return command_parts[0]
+    return shlex.join(command_parts)
+
+
+def _should_auto_passthrough_stdin() -> bool:
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None:
+        return False
+    try:
+        return not stdin.isatty()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _verbose_output(ctx: Context) -> bool:
@@ -86,7 +105,9 @@ def try_exec_via_ssh_tunnel(
     *,
     command: str,
     bridge_name: Optional[str],
+    stdin_mode: bool,
     config: Config,
+    env_exports: str,
     timeout_s: int,
     is_tunnel_available_fn: Callable[..., bool],
     run_ssh_command_fn: Callable[..., object],
@@ -111,7 +132,7 @@ def try_exec_via_ssh_tunnel(
     full_command = _build_remote_command(
         command=command,
         target_dir=str(config.target_dir),
-        remote_env=config.remote_env,
+        env_exports=env_exports,
     )
 
     def _require_rebuild(
@@ -319,11 +340,16 @@ def try_exec_via_ssh_tunnel(
 
             if ctx.json_output:
                 ssh_execution_started = True
+                run_kwargs: dict[str, object] = {
+                    "command": full_command,
+                    "bridge_name": resolved_bridge_name,
+                    "timeout": timeout_s,
+                    "capture_output": True,
+                }
+                if stdin_mode:
+                    run_kwargs["pass_stdin"] = True
                 result = run_ssh_command_fn(
-                    command=full_command,
-                    bridge_name=resolved_bridge_name,
-                    timeout=timeout_s,
-                    capture_output=True,
+                    **run_kwargs,
                 )
                 returncode = getattr(result, "returncode", 1)
                 if returncode == 0:
@@ -355,15 +381,20 @@ def try_exec_via_ssh_tunnel(
                 click.echo(f"Bridge: {resolved_bridge_name}")
                 click.echo(f"Command: {command}")
                 click.echo(f"Working dir: {config.target_dir}")
+                if stdin_mode:
+                    click.echo("Stdin: passthrough")
                 click.echo("--- Command Output ---")
                 opened_once = True
 
             ssh_execution_started = True
-            exit_code = run_ssh_command_streaming_fn(
-                command=full_command,
-                bridge_name=resolved_bridge_name,
-                timeout=timeout_s,
-            )
+            stream_kwargs: dict[str, object] = {
+                "command": full_command,
+                "bridge_name": resolved_bridge_name,
+                "timeout": timeout_s,
+            }
+            if stdin_mode:
+                stream_kwargs["pass_stdin"] = True
+            exit_code = run_ssh_command_streaming_fn(**stream_kwargs)
             if _verbose_output(ctx):
                 click.echo("--- End Output ---")
 
@@ -417,6 +448,7 @@ def exec_via_workflow(
     ctx: Context,
     *,
     command: str,
+    env_exports: str,
     denylist: tuple[str, ...],
     artifact_path: tuple[str, ...],
     download: Optional[str],
@@ -428,7 +460,6 @@ def exec_via_workflow(
     fetch_bridge_output_log_fn: Callable[..., Optional[str]],
     download_bridge_artifact_fn: Callable[..., None],
 ) -> int:
-    env_exports = build_env_exports(config.remote_env)
     workflow_command = f"{env_exports}{command}" if env_exports else command
 
     merged_denylist: list[str] = []
@@ -586,7 +617,7 @@ def exec_via_workflow(
 
 
 @click.command("exec")
-@click.argument("command")
+@click.argument("command_parts", nargs=-1, type=click.UNPROCESSED, required=True)
 @click.option(
     "denylist",
     "--denylist",
@@ -619,21 +650,29 @@ def exec_via_workflow(
     "-b",
     help="Bridge profile to use for SSH tunnel execution",
 )
+@click.option(
+    "stdin_mode",
+    "--stdin",
+    "--bash-stdin",
+    is_flag=True,
+    help="Force stdin passthrough to remote command over SSH (auto when stdin is piped)",
+)
 @pass_context
 def exec_command(
     ctx: Context,
-    command: str,
+    command_parts: tuple[str, ...],
     denylist: tuple[str, ...],
     artifact_path: tuple[str, ...],
     download: Optional[str],
     wait: bool,
     timeout: Optional[int],
     bridge: Optional[str],
+    stdin_mode: bool,
 ) -> None:
     """Execute a command on the Bridge runner.
 
-    Uses SSH tunnel for command execution. Workflow transport is only used when
-    artifact options are requested.
+    Uses SSH tunnel for command execution. Workflow transport is fallback-only
+    and is only used when artifact options are requested.
 
     COMMAND is the shell command to run on Bridge (in INSPIRE_TARGET_DIR).
     Command output (stdout/stderr) is automatically displayed after completion.
@@ -642,11 +681,14 @@ def exec_command(
     Examples:
         inspire bridge exec "uv venv .venv"
         inspire bridge exec "pip install torch" --timeout 600
+        inspire bridge exec --stdin -- bash -s < scripts/watch_eval.sh
         inspire bridge exec "uv venv .venv" \\
             --artifact-path .venv --download ./local
         inspire bridge exec "python train.py" --no-wait
         inspire bridge exec "hostname" --bridge qz-bridge
     """
+
+    command = _normalize_exec_command(command_parts)
 
     try:
         config, _ = Config.from_files_and_env(require_target_dir=True, require_credentials=False)
@@ -660,15 +702,42 @@ def exec_command(
         )
         sys.exit(EXIT_CONFIG_ERROR)
 
+    try:
+        env_exports = build_env_exports(config.remote_env)
+    except ConfigError as e:
+        emit_output_error(
+            ctx,
+            error_type="ConfigError",
+            message=str(e),
+            exit_code=EXIT_CONFIG_ERROR,
+            human_lines=[f"Configuration error: {e}"],
+        )
+        sys.exit(EXIT_CONFIG_ERROR)
+
     action_timeout = int(timeout) if timeout is not None else int(config.bridge_action_timeout)
+
+    if stdin_mode and (artifact_path or download):
+        emit_output_error(
+            ctx,
+            error_type="UsageError",
+            message="--stdin/--bash-stdin is only supported for SSH execution (no artifacts).",
+            exit_code=EXIT_GENERAL_ERROR,
+            human_lines=[
+                "--stdin/--bash-stdin cannot be combined with --artifact-path/--download."
+            ],
+        )
+        sys.exit(EXIT_GENERAL_ERROR)
 
     # SSH tunnel is the default command transport when artifacts are not requested.
     if not artifact_path and not download:
+        effective_stdin_mode = stdin_mode or _should_auto_passthrough_stdin()
         ssh_exit_code = try_exec_via_ssh_tunnel(
             ctx,
             command=command,
             bridge_name=bridge,
+            stdin_mode=effective_stdin_mode,
             config=config,
+            env_exports=env_exports,
             timeout_s=action_timeout,
             is_tunnel_available_fn=is_tunnel_available,
             run_ssh_command_fn=run_ssh_command,
@@ -679,6 +748,7 @@ def exec_command(
     workflow_exit_code = exec_via_workflow(
         ctx,
         command=command,
+        env_exports=env_exports,
         denylist=denylist,
         artifact_path=artifact_path,
         download=download,

@@ -7,8 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
-
 # Config file paths
 CONFIG_FILENAME = "config.toml"
 PROJECT_CONFIG_DIR = ".inspire"  # ./.inspire/config.toml
@@ -18,11 +16,21 @@ class ConfigError(Exception):
     """Configuration error - missing or invalid settings."""
 
 
+class ConfigDeprecationWarning(UserWarning):
+    """Configuration deprecation warning."""
+
+
 # Source tracking for config values
 SOURCE_DEFAULT = "default"
 SOURCE_GLOBAL = "global"
 SOURCE_PROJECT = "project"
 SOURCE_ENV = "env"
+
+
+def _default_rtunnel_download_url() -> str:
+    from inspire.config.rtunnel_defaults import DEFAULT_RTUNNEL_DOWNLOAD_URL
+
+    return DEFAULT_RTUNNEL_DOWNLOAD_URL
 
 
 @dataclass
@@ -84,10 +92,18 @@ class Config:
     docker_registry: Optional[str] = None
 
     # Job settings
-    job_priority: int = 6
+    job_resource: Optional[str] = None
+    job_priority: Optional[int] = None
     job_image: Optional[str] = None
     job_project_id: Optional[str] = None
     job_workspace_id: Optional[str] = None
+    job_shm_size: Optional[int] = None
+
+    # Shared command defaults ([defaults])
+    default_resource: Optional[str] = None
+    default_image: Optional[str] = None
+    default_priority: Optional[int] = None
+    default_workspace_id: Optional[str] = None
 
     # Workspace routing (optional)
     workspace_cpu_id: Optional[str] = None
@@ -112,12 +128,16 @@ class Config:
     # Account-level train job workdir (if available)
     account_train_job_workdir: Optional[str] = None
 
-    # Project context account binding (from [context].account)
+    # Legacy project context account binding (from deprecated [context].account)
     context_account: Optional[str] = None
 
     # Notebook settings
-    notebook_resource: str = "1xH200"
+    notebook_resource: Optional[str] = None
     notebook_image: Optional[str] = None
+    notebook_project_id: Optional[str] = None
+    notebook_priority: Optional[int] = None
+    notebook_workspace_id: Optional[str] = None
+    notebook_shm_size: Optional[int] = None
     notebook_post_start: Optional[str] = None
 
     # SSH settings
@@ -125,8 +145,9 @@ class Config:
     sshd_deb_dir: Optional[str] = None
     dropbear_deb_dir: Optional[str] = None
     setup_script: Optional[str] = None
-    rtunnel_download_url: str = field(default_factory=default_rtunnel_download_url)
+    rtunnel_download_url: str = field(default_factory=_default_rtunnel_download_url)
     apt_mirror_url: Optional[str] = None
+    rtunnel_upload_policy: str = "auto"
 
     # Tunnel retry settings
     tunnel_retries: int = 3

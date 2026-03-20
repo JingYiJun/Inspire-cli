@@ -17,6 +17,14 @@ from .load_common import (
     _parse_alias_map,
     _resolve_alias,
 )
+from inspire.config.schema import get_option_by_field
+from inspire.config.toml import _validate_toml_value
+
+
+def _validated_override(field_name: str, value: Any) -> Any:
+    """Validate a TOML account override value against its schema option."""
+    opt = get_option_by_field(field_name)
+    return _validate_toml_value(opt, value) if opt else value
 
 
 def _parse_global_accounts(raw_accounts: Any) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
@@ -51,7 +59,7 @@ def _parse_global_accounts(raw_accounts: Any) -> tuple[dict[str, str], dict[str,
             value = raw_value.get(field_name)
             if value is None or value == "":
                 continue
-            account_data["overrides"][field_name] = value
+            account_data["overrides"][field_name] = _validated_override(field_name, value)
 
         for section_name, key_map in _ACCOUNT_SECTION_KEY_MAP.items():
             section = raw_value.get(section_name)
@@ -61,7 +69,7 @@ def _parse_global_accounts(raw_accounts: Any) -> tuple[dict[str, str], dict[str,
                 value = section.get(key)
                 if value is None or value == "":
                     continue
-                account_data["overrides"][field_name] = value
+                account_data["overrides"][field_name] = _validated_override(field_name, value)
 
         catalogs[username] = account_data
 
@@ -143,8 +151,8 @@ def _apply_account_catalog_layer(
     project_account_catalogs: dict[str, dict[str, Any]],
 ) -> None:
     selected_account = (
-        context_account
-        or str(config_dict.get("username") or "").strip()
+        str(config_dict.get("username") or "").strip()
+        or context_account
         or str(os.getenv("INSPIRE_USERNAME") or "").strip()
     )
     merged_account_catalogs = _merge_account_catalogs(
@@ -255,7 +263,7 @@ def _apply_project_context_and_defaults(
         config_dict.get("projects", {}),
         id_prefix="project-",
     )
-    if project_ref:
+    if project_ref and not config_dict.get("job_project_id"):
         config_dict["job_project_id"] = project_ref
         sources["job_project_id"] = SOURCE_PROJECT
 

@@ -15,12 +15,14 @@ from inspire.config.schema_models import (  # noqa: F401
     _parse_float,
     _parse_int,
     _parse_list,
+    _parse_upload_policy,
     parse_value,
 )
 from inspire.config.options.api import API_OPTIONS, AUTH_OPTIONS
 from inspire.config.options.forge import GITEA_OPTIONS, GITHUB_OPTIONS, GIT_PLATFORM_OPTIONS
 from inspire.config.options.infra import SSH_OPTIONS, TUNNEL_OPTIONS, BRIDGE_OPTIONS, PATHS_OPTIONS
 from inspire.config.options.project import (
+    DEFAULTS_OPTIONS,
     JOB_OPTIONS,
     NOTEBOOK_OPTIONS,
     SYNC_OPTIONS,
@@ -37,6 +39,7 @@ CONFIG_OPTIONS: list[ConfigOption] = [
     *GITHUB_OPTIONS,
     *SYNC_OPTIONS,
     *BRIDGE_OPTIONS,
+    *DEFAULTS_OPTIONS,
     *WORKSPACES_OPTIONS,
     *JOB_OPTIONS,
     *NOTEBOOK_OPTIONS,
@@ -62,6 +65,14 @@ def get_option_by_toml(toml_key: str) -> ConfigOption | None:
     """Get configuration option by TOML key."""
     for opt in CONFIG_OPTIONS:
         if opt.toml_key == toml_key:
+            return opt
+    return None
+
+
+def get_option_by_field(field_name: str) -> ConfigOption | None:
+    """Get configuration option by field name."""
+    for opt in CONFIG_OPTIONS:
+        if opt.field_name == field_name:
             return opt
     return None
 

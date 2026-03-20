@@ -438,6 +438,34 @@ def test_notebook_start_warns_when_no_wait_conflicts_with_configured_post_start(
     assert "Waiting for notebook to reach RUNNING status..." in result.output
 
 
+def test_notebook_start_handles_post_start_remote_env_config_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_test_config(tmp_path)
+    config.remote_env = {"NOT-VALID": "value"}
+
+    class FakeSession:
+        workspace_id = "ws-test"
+        storage_state = {}
+
+    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
+    monkeypatch.setattr(notebook_cmd_module, "get_base_url", lambda: "https://example.invalid")
+    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: config)
+    monkeypatch.setattr(
+        notebook_cmd_module,
+        "_resolve_notebook_id",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main, ["notebook", "start", "notebook-123", "--post-start", "echo hi"]
+    )
+
+    assert result.exit_code == EXIT_CONFIG_ERROR
+    assert "Invalid remote_env key" in result.output
+
+
 def test_run_notebook_ssh_validates_dropbear_setup_script(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -802,6 +830,9 @@ def test_run_notebook_ssh_refreshes_saved_profile_on_notebook_mismatch(
         "get_ssh_command_args",
         lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
     )
+    monkeypatch.setattr(
+        ssh_flow_module, "resolve_ssh_identity_file", lambda pubkey: tmp_path / "id_ed25519"
+    )
 
     monkeypatch.setattr(ssh_flow_module.subprocess, "call", lambda args: 0)
 
@@ -822,6 +853,7 @@ def test_run_notebook_ssh_refreshes_saved_profile_on_notebook_mismatch(
     assert setup_called["value"] is True
     saved_profile = fake_tunnel_config.bridges["shared-profile"]
     assert getattr(saved_profile, "notebook_id", None) == "notebook-12345678"
+    assert getattr(saved_profile, "identity_file", None) == str(tmp_path / "id_ed25519")
 
 
 def test_run_notebook_ssh_interactive_reconnects_after_drop(
@@ -1019,9 +1051,16 @@ def test_run_notebook_ssh_reports_when_tunnel_not_ready(
         lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
     )
     monkeypatch.setattr(
+        ssh_flow_module,
+        "collect_notebook_rtunnel_diagnostics",
+        lambda **kwargs: __import__("types").SimpleNamespace(
+            observed="distro=debian bookworm | strategy=dropbear_mirror",
+        ),
+    )
+    monkeypatch.setattr(
         ssh_flow_module.os,
-        "execvp",
-        lambda file, args: (_ for _ in ()).throw(AssertionError("execvp should not run")),
+        "execvpe",
+        lambda file, args, env: (_ for _ in ()).throw(AssertionError("execvpe should not run")),
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -1042,4 +1081,207 @@ def test_run_notebook_ssh_reports_when_tunnel_not_ready(
     assert exc.value.code == EXIT_API_ERROR
     assert captured["type"] == "APIError"
     assert "SSH preflight failed" in captured["message"]
-    assert "Proxy readiness report:" in captured["hint"]
+    assert "Observed:" in captured["hint"]
+    assert "distro=debian bookworm" in captured["hint"]
+
+
+def test_notebook_ssh_double_dash_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_notebook_ssh(ctx: Context, **kwargs: Any) -> None:
+        assert ctx is not None
+        captured.update(kwargs)
+
+    monkeypatch.setattr(notebook_cmd_module, "run_notebook_ssh", fake_run_notebook_ssh)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["notebook", "ssh", "abc123", "--", "python", "train.py", "--epochs", "100"],
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert captured["command"] == "python train.py --epochs 100"
+
+
+def test_notebook_ssh_rejects_command_and_double_dash(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = False
+
+    def fake_run_notebook_ssh(ctx: Context, **kwargs: Any) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(notebook_cmd_module, "run_notebook_ssh", fake_run_notebook_ssh)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["notebook", "ssh", "abc123", "--command", "echo hi", "--", "echo", "hello"],
+    )
+
+    assert result.exit_code != EXIT_SUCCESS
+    assert "not both" in result.output
+    assert called is False
+
+
+def test_notebook_ssh_command_option_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_notebook_ssh(ctx: Context, **kwargs: Any) -> None:
+        assert ctx is not None
+        captured.update(kwargs)
+
+    monkeypatch.setattr(notebook_cmd_module, "run_notebook_ssh", fake_run_notebook_ssh)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["notebook", "ssh", "abc123", "--command", "echo hello"],
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert captured["command"] == "echo hello"
+
+
+def test_notebook_ssh_double_dash_empty_is_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_notebook_ssh(ctx: Context, **kwargs: Any) -> None:
+        assert ctx is not None
+        captured.update(kwargs)
+
+    monkeypatch.setattr(notebook_cmd_module, "run_notebook_ssh", fake_run_notebook_ssh)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["notebook", "ssh", "abc123", "--"],
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert captured["command"] is None
+
+
+def test_notebook_ssh_help_documents_double_dash_syntax() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["notebook", "ssh", "--help"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert "-- echo 'connected'" in result.output
+    assert "-- python train.py --epochs 100" in result.output
+
+
+def test_run_notebook_ssh_passes_upload_policy_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured_overrides: dict[str, Any] = {}
+
+    def fake_resolve_ssh_runtime_config(cli_overrides=None):
+        captured_overrides.update(cli_overrides or {})
+        return SshRuntimeConfig()
+
+    class FakeSession:
+        workspace_id = "ws-test"
+        storage_state = {}
+
+    monkeypatch.setattr(ssh_flow_module, "require_web_session", lambda ctx, hint: FakeSession())
+    monkeypatch.setattr(ssh_flow_module, "load_config", lambda ctx: make_test_config(tmp_path))
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_resolve_notebook_id",
+        lambda *args, **kwargs: ("notebook-12345678", None),
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "wait_for_notebook_running",
+        lambda notebook_id, session=None: {
+            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
+        },
+    )
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_get_current_user_detail",
+        lambda session, base_url: {"id": "user-1", "username": "user"},
+    )
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_validate_notebook_account_access",
+        lambda current_user, notebook_detail: (True, ""),
+    )
+    monkeypatch.setattr(ssh_flow_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA")
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "resolve_ssh_runtime_config",
+        fake_resolve_ssh_runtime_config,
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "setup_notebook_rtunnel",
+        lambda **kwargs: "wss://proxy.example/notebook/",
+    )
+
+    from inspire.bridge import tunnel as tunnel_module_local
+
+    class FakeTunnelConfig:
+        def __init__(self) -> None:
+            self.bridges: dict[str, object] = {}
+            self.default_bridge = None
+
+        def add_bridge(self, profile: object) -> None:
+            name = str(getattr(profile, "name", "default"))
+            self.bridges[name] = profile
+            if self.default_bridge is None:
+                self.default_bridge = name
+
+        def get_bridge(self, name: Optional[str] = None) -> object | None:
+            if name:
+                return self.bridges.get(name)
+            if self.default_bridge:
+                return self.bridges.get(self.default_bridge)
+            return None
+
+    fake_tunnel_config = FakeTunnelConfig()
+    monkeypatch.setattr(
+        tunnel_module_local, "load_tunnel_config", lambda account=None: fake_tunnel_config
+    )
+    monkeypatch.setattr(tunnel_module_local, "save_tunnel_config", lambda config: None)
+    monkeypatch.setattr(tunnel_module_local, "has_internet_for_gpu_type", lambda gpu_type: True)
+    monkeypatch.setattr(
+        tunnel_module_local,
+        "is_tunnel_available",
+        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: True,
+    )
+    monkeypatch.setattr(
+        tunnel_module_local,
+        "get_ssh_command_args",
+        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
+    )
+    monkeypatch.setattr(ssh_flow_module.subprocess, "call", lambda args: 0)
+    exec_call: dict[str, Any] = {}
+
+    def fake_execvpe(file: str, args: list[str], env: dict[str, str]) -> None:
+        exec_call["file"] = file
+        exec_call["args"] = args
+        exec_call["env"] = env
+
+    monkeypatch.setattr(ssh_flow_module.os, "execvpe", fake_execvpe)
+
+    ssh_flow_module.run_notebook_ssh(
+        Context(),
+        notebook_id="nb-name",
+        wait=True,
+        pubkey=None,
+        save_as=None,
+        port=31337,
+        ssh_port=22222,
+        command="echo test",
+        rtunnel_bin=None,
+        rtunnel_upload_policy="never",
+        debug_playwright=False,
+        setup_timeout=60,
+    )
+
+    assert captured_overrides.get("rtunnel_upload_policy") == "never"
+    assert exec_call["file"] == "ssh"
+    assert exec_call["env"]["LC_ALL"] == "C"
+    assert exec_call["env"]["LANG"] == "C"

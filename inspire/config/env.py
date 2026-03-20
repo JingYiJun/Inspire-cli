@@ -10,6 +10,12 @@ from typing import Optional
 from inspire.config.models import ConfigError
 
 
+_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_REF_RE = re.compile(
+    r"^\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))$"
+)
+
+
 def _parse_remote_timeout(value: str) -> int:
     """Parse INSP_REMOTE_TIMEOUT environment variable."""
     try:
@@ -37,20 +43,17 @@ def _parse_denylist(value: Optional[str]) -> list[str]:
     return parts
 
 
-def build_env_exports(env_dict: dict[str, str]) -> str:
-    """Build shell export commands for remote environment variables."""
+def resolve_remote_env(env_dict: dict[str, str]) -> dict[str, str]:
+    """Resolve ``remote_env`` values, expanding local env references."""
     if not env_dict:
-        return ""
+        return {}
 
-    var_name_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-    env_ref_re = re.compile(
-        r"^\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))$"
-    )
-
-    exports: list[str] = []
+    resolved: dict[str, str] = {}
     for key, raw_value in env_dict.items():
-        if not var_name_re.match(key):
-            raise ConfigError(f"Invalid remote_env key: {key!r} (must match {var_name_re.pattern})")
+        if not _VAR_NAME_RE.match(key):
+            raise ConfigError(
+                f"Invalid remote_env key: {key!r} (must match {_VAR_NAME_RE.pattern})"
+            )
 
         value = raw_value
         if value == "":
@@ -61,7 +64,7 @@ def build_env_exports(env_dict: dict[str, str]) -> str:
                 )
             value = os.environ[env_var]
         else:
-            match = env_ref_re.match(value)
+            match = _ENV_REF_RE.match(value)
             if match is not None:
                 env_var = match.group("braced") or match.group("bare")
                 if env_var not in os.environ:
@@ -70,6 +73,19 @@ def build_env_exports(env_dict: dict[str, str]) -> str:
                     )
                 value = os.environ[env_var]
 
+        resolved[key] = value
+
+    return resolved
+
+
+def build_env_exports(env_dict: dict[str, str]) -> str:
+    """Build shell export commands for remote environment variables."""
+    resolved = resolve_remote_env(env_dict)
+    if not resolved:
+        return ""
+
+    exports: list[str] = []
+    for key, value in resolved.items():
         exports.append(f"export {key}={shlex.quote(value)}")
 
     return " && ".join(exports) + " && "

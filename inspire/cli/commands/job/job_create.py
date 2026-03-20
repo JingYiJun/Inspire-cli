@@ -27,7 +27,7 @@ def run_job_create(
     ctx: Context,
     *,
     name: str,
-    resource: str,
+    resource: Optional[str],
     command: str,
     framework: str,
     priority: int | None,
@@ -39,6 +39,7 @@ def run_job_create(
     image: str | None,
     project: str | None,
     nodes: int,
+    fault_tolerant: bool | None,
 ) -> None:
     """Run the job creation flow."""
     try:
@@ -47,8 +48,21 @@ def run_job_create(
 
         if priority is None:
             priority = config.job_priority
+            if priority is None:
+                priority = getattr(config, "default_priority", None)
+            if priority is None:
+                priority = 6
         if image is None:
-            image = config.job_image
+            image = config.job_image or getattr(config, "default_image", None)
+        if not resource:
+            resource = getattr(config, "job_resource", None) or getattr(
+                config, "default_resource", None
+            )
+        if not resource:
+            raise ConfigError(
+                "Missing resource specification.\n"
+                "Pass --resource or set [job].resource or [defaults].resource in config.toml."
+            )
 
         try:
             requested_gpu_type, requested_gpu_count = api.resource_manager.parse_resource_request(
@@ -68,13 +82,16 @@ def run_job_create(
             gpu_type=requested_gpu_type.value,
             explicit_workspace_id=workspace_id_override,
             explicit_workspace_name=workspace,
+            legacy_workspace_id=config.job_workspace_id
+            or getattr(config, "default_workspace_id", None),
         )
         if not selected_workspace_id:
             _handle_error(
                 ctx,
                 "ConfigError",
                 "No workspace_id configured for GPU workloads. "
-                "Set [workspaces].gpu or INSPIRE_WORKSPACE_ID.",
+                "Set [workspaces].gpu (or [workspaces].internet for 4090), "
+                "or pass --workspace/--workspace-id.",
                 EXIT_CONFIG_ERROR,
             )
             return
@@ -146,10 +163,38 @@ def run_job_create(
             except ValueError:
                 pass
 
+        # Auto-enable fault tolerance for LOW-priority projects
+        is_low_priority, auto_fault_tolerance = job_submit.resolve_fault_tolerance(
+            selected, fault_tolerant
+        )
+
         if not ctx.json_output:
             if fallback_msg:
                 click.echo(fallback_msg)
-            click.echo(f"Using project: {selected.name}{selected.get_quota_status()}")
+            if is_low_priority:
+                restart_note = " and auto-restarted" if auto_fault_tolerance else ""
+                click.echo(
+                    f"Using project: {selected.name} "
+                    f"(low priority — job may be preempted{restart_note})"
+                )
+            else:
+                click.echo(f"Using project: {selected.name}{selected.get_quota_status()}")
+
+        # Show compute-group availability diagnostics
+        if not ctx.json_output and auto and location:
+            try:
+                from inspire.platform.web import browser_api as browser_api_module
+
+                all_avail = browser_api_module.get_accurate_gpu_availability(
+                    workspace_id=selected_workspace_id
+                )
+                summary = job_submit.format_gpu_availability_summary(
+                    all_avail, requested_gpu_type.value
+                )
+                if summary:
+                    click.echo(summary)
+            except Exception:
+                pass  # diagnostics are best-effort
 
         try:
             submission = job_submit.submit_training_job(
@@ -167,6 +212,7 @@ def run_job_create(
                 nodes=nodes,
                 max_time_hours=max_time,
                 project_name=selected.name,
+                auto_fault_tolerance=auto_fault_tolerance,
             )
         except ValueError as e:
             _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -222,14 +268,19 @@ def run_job_create(
 
 @click.command("create")
 @click.option("--name", "-n", required=True, help="Job name")
-@click.option("--resource", "-r", required=True, help="Resource spec (e.g., '4xH200')")
+@click.option(
+    "--resource",
+    "-r",
+    required=False,
+    help="Resource spec (e.g., '4xH200') (default from config [job].resource or [defaults].resource)",
+)
 @click.option("--command", "-c", required=True, help="Start command")
 @click.option("--framework", default="pytorch", help="Training framework (default: pytorch)")
 @click.option(
     "--priority",
     type=int,
     default=None,
-    help="Task priority 1-10 (default from config [job].priority or 6)",
+    help="Task priority 1-10 (default from config [job].priority or [defaults].priority or 6)",
 )
 @click.option("--max-time", type=float, default=100.0, help="Max runtime in hours (default: 100)")
 @click.option("--location", help="Preferred datacenter location")
@@ -237,7 +288,7 @@ def run_job_create(
 @click.option(
     "--workspace-id",
     "workspace_id_override",
-    help="Workspace ID override (highest precedence)",
+    help="Workspace ID override (escape hatch; highest precedence)",
 )
 @click.option(
     "--auto/--no-auto",
@@ -247,13 +298,13 @@ def run_job_create(
 @click.option(
     "--image",
     default=None,
-    help="Custom Docker image (default from config [job].image)",
+    help="Custom Docker image (default from config [job].image or [defaults].image)",
 )
 @click.option(
     "--project",
     "-p",
     default=None,
-    help="Project name or ID (default from config [context].project or [job].project_id)",
+    help="Project name or ID (default from config [job].project_id or [defaults].project_order)",
 )
 @click.option(
     "--nodes",
@@ -261,11 +312,16 @@ def run_job_create(
     default=1,
     help="Number of nodes for multi-node training (default: 1)",
 )
+@click.option(
+    "--fault-tolerant/--no-fault-tolerant",
+    default=None,
+    help="Auto-restart on failure/preemption (auto-enabled for low-priority projects)",
+)
 @pass_context
 def create(
     ctx: Context,
     name: str,
-    resource: str,
+    resource: Optional[str],
     command: str,
     framework: str,
     priority: Optional[int],
@@ -277,6 +333,7 @@ def create(
     image: Optional[str],
     project: Optional[str],
     nodes: int,
+    fault_tolerant: Optional[bool],
 ) -> None:
     """Create a new training job.
 
@@ -319,4 +376,5 @@ def create(
         image=image,
         project=project,
         nodes=nodes,
+        fault_tolerant=fault_tolerant,
     )

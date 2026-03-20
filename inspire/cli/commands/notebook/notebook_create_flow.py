@@ -110,6 +110,8 @@ def resolve_notebook_workspace_id(
             cpu_only=(gpu_count == 0),
             explicit_workspace_id=workspace_id,
             explicit_workspace_name=workspace,
+            legacy_workspace_id=getattr(config, "notebook_workspace_id", None)
+            or getattr(config, "default_workspace_id", None),
         )
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -123,9 +125,10 @@ def resolve_notebook_workspace_id(
 
     if not auto_workspace_id:
         hint = (
-            "Use --workspace-id, set [workspaces].cpu in config.toml, or set INSPIRE_WORKSPACE_ID."
+            "Use --workspace-id, pass --workspace cpu, or set [workspaces].cpu in config.toml."
             if gpu_count == 0
-            else "Use --workspace-id, set [workspaces].gpu in config.toml, or set INSPIRE_WORKSPACE_ID."
+            else "Use --workspace-id, pass --workspace gpu, or set [workspaces].gpu "
+            "in config.toml."
         )
         _handle_error(
             ctx, "ConfigError", "No workspace_id configured.", EXIT_CONFIG_ERROR, hint=hint
@@ -875,13 +878,17 @@ def _resolve_create_inputs(
     shm_size: int | None,
 ) -> tuple[str, str | None, str | None, int]:
     if not resource:
-        resource = config.notebook_resource
-    if not project and not config.project_order:
-        project = config.job_project_id
+        resource = config.notebook_resource or getattr(config, "default_resource", None) or "1xH200"
+    if not project:
+        project = getattr(config, "notebook_project_id", None)
     if not image:
-        image = config.notebook_image or config.job_image
+        image = config.notebook_image or getattr(config, "default_image", None)
     if shm_size is None:
-        shm_size = config.shm_size if config.shm_size is not None else 32
+        notebook_shm_size = getattr(config, "notebook_shm_size", None)
+        if notebook_shm_size is not None:
+            shm_size = notebook_shm_size
+        else:
+            shm_size = config.shm_size if config.shm_size is not None else 32
     if shm_size < 1:
         raise ValueError("Shared memory size must be >= 1.")
     return resource, project, image, shm_size
@@ -925,7 +932,13 @@ def _fetch_resource_prices(
 def _resolve_task_priority(priority: Optional[int], config: Config) -> Optional[int]:
     if priority is not None:
         return priority
-    return config.job_priority if hasattr(config, "job_priority") else None
+    notebook_priority = getattr(config, "notebook_priority", None)
+    if notebook_priority is not None:
+        return notebook_priority
+    default_priority = getattr(config, "default_priority", None)
+    if default_priority is not None:
+        return default_priority
+    return 6
 
 
 def _fetch_workspace_projects(
@@ -1053,6 +1066,9 @@ def run_notebook_create(
             post_start_script=post_start_script,
             keepalive=keepalive,
         )
+    except ConfigError as e:
+        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+        return
     except ValueError as e:
         _handle_error(ctx, "ValidationError", str(e), EXIT_CONFIG_ERROR)
         return

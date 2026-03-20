@@ -66,6 +66,7 @@ class _DiscoveryPersistRequest:
     probe_pubkey: str | None
     probe_timeout: int
     prompted_credentials: tuple[str, str, str] | None
+    prompted_password: bool
     cli_target_dir: str | None
 
 
@@ -597,7 +598,7 @@ def _resolve_credentials_interactive(
     cli_username: str | None,
     cli_base_url: str | None,
     allow_config_password: bool = False,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, bool]:
     """Resolve base_url, username, and password, prompting when missing."""
     placeholder = "https://api.example.com"
 
@@ -631,15 +632,17 @@ def _resolve_credentials_interactive(
     # --force mode.  In the session-failed fallback path the old password may be
     # stale, so always prompt for a fresh one.
     password = ""
+    prompted_password = False
     if allow_config_password:
         password = str(getattr(config, "password", "") or "").strip()
     if not password:
         password = click.prompt("Password", type=str, hide_input=True)
+        prompted_password = True
     if not password:
         click.echo(click.style("Password is required.", fg="red"))
         raise SystemExit(1)
 
-    return username, password, base_url
+    return username, password, base_url, prompted_password
 
 
 def _ensure_ssh_key() -> None:
@@ -787,15 +790,16 @@ def _resolve_discover_runtime(
     default_workspace_id: str,
     cli_username: str | None,
     cli_base_url: str | None,
-) -> tuple[object, tuple[str, str, str] | None, str, str]:
+) -> tuple[object, tuple[str, str, str] | None, bool, str, str]:
     # When the caller explicitly provides credentials via CLI flags, skip the
     # cached-session fast path so we honour the override instead of silently
     # using a session that belongs to a different user / base-url.
     session = None
     prompted_credentials: tuple[str, str, str] | None = None
+    prompted_password = False
     if cli_username or cli_base_url:
         _ensure_playwright_browser()
-        username, password, base_url = _resolve_credentials_interactive(
+        username, password, base_url, prompted_password = _resolve_credentials_interactive(
             config,
             cli_username=cli_username,
             cli_base_url=cli_base_url,
@@ -814,7 +818,7 @@ def _resolve_discover_runtime(
             session = web_session_module.get_web_session(require_workspace=True)
         except (ValueError, RuntimeError):
             _ensure_playwright_browser()
-            username, password, base_url = _resolve_credentials_interactive(
+            username, password, base_url, prompted_password = _resolve_credentials_interactive(
                 config,
                 cli_username=cli_username,
                 cli_base_url=cli_base_url,
@@ -856,7 +860,7 @@ def _resolve_discover_runtime(
         )
         raise SystemExit(1)
 
-    return session, prompted_credentials, account_key, workspace_id
+    return session, prompted_credentials, prompted_password, account_key, workspace_id
 
 
 def _candidate_workspace_ids_for_discovery(
@@ -1737,16 +1741,26 @@ def _populate_project_defaults_from_config(
         defaults.setdefault("target_dir", config.target_dir)
     if config.log_pattern:
         defaults.setdefault("log_pattern", config.log_pattern)
-    if config.job_image:
+    if getattr(config, "default_image", None):
+        defaults.setdefault("image", config.default_image)
+    elif config.notebook_image:
+        defaults.setdefault("image", config.notebook_image)
+    elif config.job_image:
         defaults.setdefault("image", config.job_image)
-    if config.notebook_image:
-        defaults.setdefault("notebook_image", config.notebook_image)
-    if config.notebook_resource:
-        defaults.setdefault("notebook_resource", config.notebook_resource)
-    if config.job_priority is not None:
+    if getattr(config, "default_resource", None):
+        defaults.setdefault("resource", config.default_resource)
+    elif config.notebook_resource:
+        defaults.setdefault("resource", config.notebook_resource)
+    if getattr(config, "default_priority", None) is not None:
+        defaults.setdefault("priority", int(config.default_priority))
+    elif config.job_priority is not None:
         defaults.setdefault("priority", int(config.job_priority))
+    elif getattr(config, "notebook_priority", None) is not None:
+        defaults.setdefault("priority", int(config.notebook_priority))
     if config.shm_size is not None:
         defaults.setdefault("shm_size", int(config.shm_size))
+    if config.project_order:
+        defaults.setdefault("project_order", list(config.project_order))
 
 
 def _prompt_target_dir(
@@ -1785,7 +1799,6 @@ def _write_discovered_project_config(
     project_path: Path,
     config: Config,
     account_key: str,
-    selected_alias: str,
     target_dir: str | None = None,
 ) -> None:
     project_data: dict[str, Any] = {}
@@ -1795,16 +1808,19 @@ def _write_discovered_project_config(
     auth_section = _get_or_create_dict_table(container=project_data, key="auth")
     auth_section["username"] = account_key
 
-    context = _get_or_create_dict_table(container=project_data, key="context")
-    context.update(
-        {
-            "account": account_key,
-            "project": selected_alias,
-            "workspace_cpu": "cpu",
-            "workspace_gpu": "gpu",
-            "workspace_internet": "internet",
-        }
-    )
+    context = project_data.get("context")
+    if isinstance(context, dict):
+        for key in (
+            "account",
+            "project",
+            "workspace",
+            "workspace_cpu",
+            "workspace_gpu",
+            "workspace_internet",
+        ):
+            context.pop(key, None)
+        if not context:
+            project_data.pop("context", None)
 
     defaults = _get_or_create_dict_table(container=project_data, key="defaults")
     _populate_project_defaults_from_config(defaults=defaults, config=config)
@@ -1819,14 +1835,14 @@ def _print_discover_completion(
     *,
     global_path: Path,
     project_path: Path,
-    prompted_credentials: tuple[str, str, str] | None,
+    prompted_password: bool,
 ) -> None:
     click.echo()
     click.echo(click.style("Wrote configuration:", bold=True))
     click.echo(f"  - {global_path}")
     click.echo(f"  - {project_path}")
     click.echo()
-    if prompted_credentials:
+    if prompted_password:
         click.echo("Note: prompted account password was stored in global config for this account.")
         click.echo(f"  Location: {global_path}")
         click.echo()
@@ -1854,6 +1870,7 @@ def _persist_discovery_catalog(request: _DiscoveryPersistRequest) -> None:
     probe_pubkey = request.probe_pubkey
     probe_timeout = request.probe_timeout
     prompted_credentials = request.prompted_credentials
+    prompted_password = request.prompted_password
     cli_target_dir = request.cli_target_dir
 
     global_path = Config.resolve_global_config_path()
@@ -1982,9 +1999,6 @@ def _persist_discovery_catalog(request: _DiscoveryPersistRequest) -> None:
         except OSError:
             pass
 
-    selected_alias = alias_for_id.get(selected_project.project_id)
-    if not selected_alias:
-        selected_alias = _slugify_alias(selected_project.name) or "default"
     target_dir = _prompt_target_dir(
         force=force,
         cli_target_dir=cli_target_dir,
@@ -1995,20 +2009,14 @@ def _persist_discovery_catalog(request: _DiscoveryPersistRequest) -> None:
         project_path=project_path,
         config=config,
         account_key=account_key,
-        selected_alias=selected_alias,
         target_dir=target_dir,
     )
-
-    resolved, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
-    if not str(getattr(resolved, "job_project_id", "") or "").startswith("project-"):
-        click.echo(click.style("Wrote config, but could not resolve a project_id", fg="red"))
-        raise SystemExit(1)
 
     _ensure_ssh_key()
     _print_discover_completion(
         global_path=global_path,
         project_path=project_path,
-        prompted_credentials=prompted_credentials,
+        prompted_password=prompted_password,
     )
 
 
@@ -2030,12 +2038,14 @@ def _init_discover_mode(
     from inspire.platform.web.session import DEFAULT_WORKSPACE_ID
 
     config, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
-    session, prompted_credentials, account_key, workspace_id = _resolve_discover_runtime(
-        config=config,
-        web_session_module=web_session_module,
-        default_workspace_id=DEFAULT_WORKSPACE_ID,
-        cli_username=cli_username,
-        cli_base_url=cli_base_url,
+    session, prompted_credentials, prompted_password, account_key, workspace_id = (
+        _resolve_discover_runtime(
+            config=config,
+            web_session_module=web_session_module,
+            default_workspace_id=DEFAULT_WORKSPACE_ID,
+            cli_username=cli_username,
+            cli_base_url=cli_base_url,
+        )
     )
 
     click.echo(click.style("Discovering account catalog...", bold=True))
@@ -2065,6 +2075,7 @@ def _init_discover_mode(
             probe_pubkey=probe_pubkey,
             probe_timeout=probe_timeout,
             prompted_credentials=prompted_credentials,
+            prompted_password=prompted_password,
             cli_target_dir=cli_target_dir,
         )
     )

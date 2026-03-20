@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from inspire.config.env import _parse_denylist, _parse_remote_timeout, build_env_exports
+from inspire.config.env import (
+    _parse_denylist,
+    _parse_remote_timeout,
+    build_env_exports,
+    resolve_remote_env,
+)
 from inspire.config.load import config_from_files_and_env, get_config_paths
 from inspire.config.load_env import config_from_env, config_from_env_for_sync
 from inspire.config.models import (
     CONFIG_FILENAME,
     PROJECT_CONFIG_DIR,
+    ConfigDeprecationWarning,
     SOURCE_DEFAULT,
     SOURCE_ENV,
     SOURCE_GLOBAL,
@@ -43,6 +49,7 @@ from inspire.config.schema_models import (  # noqa: F401
 __all__ = [
     "CATEGORY_ORDER",
     "CONFIG_FILENAME",
+    "ConfigDeprecationWarning",
     "CONFIG_OPTIONS",
     "PROJECT_CONFIG_DIR",
     "SOURCE_DEFAULT",
@@ -73,5 +80,6 @@ __all__ = [
     "get_required_options",
     "get_secret_options",
     "parse_value",
+    "resolve_remote_env",
     "resolve_ssh_runtime_config",
 ]

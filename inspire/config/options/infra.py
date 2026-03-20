@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
+from inspire.config.rtunnel_defaults import DEFAULT_RTUNNEL_DOWNLOAD_URL
 from inspire.config.schema_models import (
     ConfigOption,
     _parse_float,
     _parse_int,
     _parse_list,
+    _parse_upload_policy,
 )
 
 SSH_OPTIONS: list[ConfigOption] = [
@@ -53,7 +54,7 @@ SSH_OPTIONS: list[ConfigOption] = [
         toml_key="ssh.rtunnel_download_url",
         field_name="rtunnel_download_url",
         description="Download URL for rtunnel binary",
-        default=default_rtunnel_download_url(),
+        default=DEFAULT_RTUNNEL_DOWNLOAD_URL,
         category="SSH",
         scope="global",
     ),
@@ -65,6 +66,17 @@ SSH_OPTIONS: list[ConfigOption] = [
         default=None,
         category="SSH",
         scope="global",
+    ),
+    ConfigOption(
+        env_var="INSPIRE_RTUNNEL_UPLOAD_POLICY",
+        toml_key="ssh.rtunnel_upload_policy",
+        field_name="rtunnel_upload_policy",
+        description="Rtunnel upload fallback policy: auto (default), never, or always",
+        default="auto",
+        category="SSH",
+        scope="global",
+        parser=_parse_upload_policy,
+        value_type=str,
     ),
 ]
 
