@@ -796,7 +796,7 @@ def test_bridge_exec_fails_fast_when_notebook_is_stopped(
 
     assert result.exit_code == EXIT_GENERAL_ERROR
     assert "notebook 'notebook-1' is STOPPED" in result.output
-    assert "inspire notebook start notebook-1" in result.output
+    assert "inspire notebook status notebook-1" in result.output
     assert calls["rebuild"] == 0
 
 
@@ -849,6 +849,53 @@ def test_bridge_exec_json_fails_fast_when_notebook_is_stopped(
     assert payload["success"] is False
     assert payload["error"]["type"] == "TunnelError"
     assert "notebook 'notebook-1' is STOPPED" in payload["error"]["message"]
+    assert calls["rebuild"] == 0
+
+
+def test_bridge_exec_fails_fast_when_notebook_is_not_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_sync_config(tmp_path)
+    config.tunnel_retries = 3
+    config.tunnel_retry_pause = 0.0
+    calls: Dict[str, int] = {"rebuild": 0}
+
+    monkeypatch.setattr(
+        Config,
+        "from_files_and_env",
+        classmethod(lambda cls, require_target_dir=False, require_credentials=True: (config, {})),
+    )
+
+    tunnel_config = TunnelConfig()
+    tunnel_config.add_bridge(
+        BridgeProfile(
+            name="gpu-main",
+            proxy_url="https://proxy.example.com/proxy/31337/",
+            notebook_id="notebook-1",
+        )
+    )
+
+    monkeypatch.setattr(exec_cmd_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(exec_cmd_module, "load_tunnel_config", lambda: tunnel_config)
+    monkeypatch.setattr(exec_cmd_module, "require_web_session", lambda ctx, hint: object())
+    monkeypatch.setattr(
+        exec_cmd_module.browser_api_module,
+        "get_notebook_detail",
+        lambda notebook_id, session=None: {"notebook_id": notebook_id, "status": "PENDING"},
+    )
+
+    def fake_rebuild(*args: Any, **kwargs: Any) -> BridgeProfile:
+        calls["rebuild"] += 1
+        return tunnel_config.bridges["gpu-main"]
+
+    monkeypatch.setattr(exec_cmd_module, "rebuild_notebook_bridge_profile", fake_rebuild)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["bridge", "exec", "echo hi", "--bridge", "gpu-main"])
+
+    assert result.exit_code == EXIT_GENERAL_ERROR
+    assert "notebook 'notebook-1' is PENDING" in result.output
+    assert "inspire notebook status notebook-1" in result.output
     assert calls["rebuild"] == 0
 
 
@@ -1374,6 +1421,100 @@ def test_bridge_ssh_rebuilds_notebook_tunnel_before_connect(
     assert result.exit_code == 0
     assert calls["rebuild"] == 1
     assert calls["ssh"] == 1
+
+
+def test_bridge_ssh_fails_fast_when_notebook_is_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_sync_config(tmp_path)
+    config.target_dir = str(tmp_path / "project")
+    config.tunnel_retries = 3
+    config.tunnel_retry_pause = 0.0
+    calls: Dict[str, int] = {"rebuild": 0}
+
+    monkeypatch.setattr(
+        Config,
+        "from_files_and_env",
+        classmethod(lambda cls, require_target_dir=False, require_credentials=True: (config, {})),
+    )
+
+    tunnel_config = TunnelConfig()
+    tunnel_config.add_bridge(
+        BridgeProfile(
+            name="gpu-main",
+            proxy_url="https://proxy.example.com/proxy/31337/",
+            notebook_id="notebook-1",
+        )
+    )
+    monkeypatch.setattr(ssh_cmd_module, "load_tunnel_config", lambda: tunnel_config)
+    monkeypatch.setattr(ssh_cmd_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ssh_cmd_module, "require_web_session", lambda ctx, hint: object())
+    monkeypatch.setattr(
+        ssh_cmd_module.browser_api_module,
+        "get_notebook_detail",
+        lambda notebook_id, session=None: {"notebook_id": notebook_id, "status": "STOPPED"},
+    )
+
+    def fake_rebuild(*args: Any, **kwargs: Any) -> BridgeProfile:
+        calls["rebuild"] += 1
+        return tunnel_config.bridges["gpu-main"]
+
+    monkeypatch.setattr(ssh_cmd_module, "rebuild_notebook_bridge_profile", fake_rebuild)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["bridge", "ssh", "--bridge", "gpu-main"])
+
+    assert result.exit_code == EXIT_GENERAL_ERROR
+    assert "notebook 'notebook-1' is STOPPED" in result.output
+    assert "inspire notebook status notebook-1" in result.output
+    assert calls["rebuild"] == 0
+
+
+def test_bridge_ssh_fails_fast_when_notebook_is_not_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_sync_config(tmp_path)
+    config.target_dir = str(tmp_path / "project")
+    config.tunnel_retries = 3
+    config.tunnel_retry_pause = 0.0
+    calls: Dict[str, int] = {"rebuild": 0}
+
+    monkeypatch.setattr(
+        Config,
+        "from_files_and_env",
+        classmethod(lambda cls, require_target_dir=False, require_credentials=True: (config, {})),
+    )
+
+    tunnel_config = TunnelConfig()
+    tunnel_config.add_bridge(
+        BridgeProfile(
+            name="gpu-main",
+            proxy_url="https://proxy.example.com/proxy/31337/",
+            notebook_id="notebook-1",
+        )
+    )
+    monkeypatch.setattr(ssh_cmd_module, "load_tunnel_config", lambda: tunnel_config)
+    monkeypatch.setattr(ssh_cmd_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ssh_cmd_module, "require_web_session", lambda ctx, hint: object())
+    monkeypatch.setattr(
+        ssh_cmd_module.browser_api_module,
+        "get_notebook_detail",
+        lambda notebook_id, session=None: {"notebook_id": notebook_id, "status": "PENDING"},
+    )
+
+    def fake_rebuild(*args: Any, **kwargs: Any) -> BridgeProfile:
+        calls["rebuild"] += 1
+        return tunnel_config.bridges["gpu-main"]
+
+    monkeypatch.setattr(ssh_cmd_module, "rebuild_notebook_bridge_profile", fake_rebuild)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["bridge", "ssh", "--bridge", "gpu-main"])
+
+    assert result.exit_code == EXIT_GENERAL_ERROR
+    assert "notebook 'notebook-1' is PENDING" in result.output
+    assert "inspire notebook status notebook-1" in result.output
+    assert calls["rebuild"] == 0
 
 
 def test_bridge_ssh_reconnects_after_disconnect(

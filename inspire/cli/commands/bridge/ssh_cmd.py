@@ -26,8 +26,10 @@ from inspire.cli.utils.tunnel_reconnect import (
 )
 from inspire.config import Config, ConfigError, build_env_exports
 from inspire.config.ssh_runtime import resolve_ssh_runtime_config
+from inspire.platform.web import browser_api as browser_api_module
 
 logger = logging.getLogger(__name__)
+_RUNNING_NOTEBOOK_STATUS = "RUNNING"
 
 
 @click.command("ssh")
@@ -124,6 +126,44 @@ def bridge_ssh(ctx: Context, bridge: Optional[str]) -> None:
                         "automatically. Re-create it via "
                         "'inspire notebook ssh <notebook-id> --save-as <name>'."
                     ),
+                )
+
+            try:
+                if web_session is None:
+                    web_session = require_web_session(
+                        ctx,
+                        hint=(
+                            "Automatic tunnel rebuild needs web authentication. "
+                            "Set [auth].username and configure password via INSPIRE_PASSWORD "
+                            'or [accounts."<username>"].password.'
+                        ),
+                    )
+                notebook_detail = browser_api_module.get_notebook_detail(
+                    notebook_id=notebook_id,
+                    session=web_session,
+                )
+                notebook_status = str((notebook_detail or {}).get("status") or "").strip().upper()
+                if notebook_status != _RUNNING_NOTEBOOK_STATUS:
+                    rendered_status = notebook_status or "UNKNOWN"
+                    _handle_error(
+                        ctx,
+                        "TunnelError",
+                        (
+                            "SSH tunnel not available. "
+                            f"Bridge '{bridge_name}' notebook '{notebook_id}' "
+                            f"is {rendered_status}."
+                        ),
+                        hint=(
+                            "Wait until it reports RUNNING via "
+                            f"'inspire notebook status {notebook_id}', then retry."
+                        ),
+                    )
+            except Exception as status_error:  # noqa: BLE001
+                logger.debug(
+                    "Skipping notebook status preflight bridge=%s notebook_id=%s error=%s",
+                    bridge_name,
+                    notebook_id,
+                    status_error,
                 )
 
             reconnect_attempt += 1
