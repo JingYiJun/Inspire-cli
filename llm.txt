@@ -2,6 +2,8 @@
 
 > Quick reference for AI assistants working with the Inspire CLI codebase.
 
+As of: 2026-03-21
+
 ## Project Overview
 
 Inspire CLI is a command-line tool for the Inspire HPC platform:
@@ -15,18 +17,11 @@ Inspire CLI is a command-line tool for the Inspire HPC platform:
 
 Treat `.gitignore` as the source of truth for public-sync boundaries.
 
-Ignored/internal paths currently include:
-- `.inspire/`
-- `internal/`
-- `scripts/`
-- `API_ENDPOINTS.md`
-- `CLAUDE.md`
-- `config.toml.example`
-- `docs/rtunnel-ssh-setup.md`
+Do not enumerate private/internal file paths in this document. Keep private scope details in local `.gitignore` only.
 
-When preparing `github-public` sync, avoid adding docs/tests/examples that depend on ignored files.
+When preparing `github-public` sync, verify changed files against `.gitignore` and avoid adding docs/tests/examples that depend on private-only files.
 
-## Architecture (Current)
+## Architecture (As of 2026-03-21)
 
 ```text
 inspire-cli/
@@ -61,7 +56,6 @@ inspire-cli/
 │   └── api/                     # Legacy compatibility surface
 ├── tests/
 ├── examples/
-├── AGENTS.md
 └── pyproject.toml
 ```
 
@@ -86,6 +80,21 @@ inspire init
 - There is no `inspire tunnel start` command in this CLI.
 - `BridgeProfile` supports optional `notebook_id`; notebook SSH fast-path reuse is only valid when cached `notebook_id` matches the requested notebook.
 - `generate_ssh_config()` must reuse `_get_proxy_command()` so `ProxyCommand` remains shell-quoted and safe for URLs/paths with special characters.
+
+## Sync Semantics (As of 2026-03-21)
+
+- `inspire sync` defaults to `--transport ssh --source bundle`.
+- Push is skipped by default (`--push-mode skip`); `--no-push` is an explicit alias.
+- Push occurs only when `--push-mode required` or `--push-mode best-effort` is provided.
+- `--source auto` is removed.
+- `--branch` is removed.
+- `--source remote` is only valid with `--transport ssh`.
+- `--transport workflow` is explicit fallback mode only (no automatic SSH->workflow fallback).
+- Bridge selection is deterministic, then availability-checked with `is_tunnel_available(...)`.
+- For `--source bundle`, bridge priority is: offline CPU -> offline non-CPU -> internet CPU -> internet non-CPU.
+- For `--source remote`, bridge priority is: internet CPU -> internet non-CPU -> offline CPU -> offline non-CPU.
+- `default_bridge` is only a tie-breaker inside the same priority bucket.
+- If `--source remote` selects a bridge with no internet, sync fails with a hint to use `--source bundle`.
 
 ## Configuration Model
 
