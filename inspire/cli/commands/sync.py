@@ -1,11 +1,11 @@
-"""Sync command - Push local branch and sync code on Bridge.
+"""Sync command - Sync code on Bridge (with optional git push).
 
 Usage:
     inspire sync [--remote <remote>] [--transport <ssh|workflow>]
 
 This command:
-1. Pushes the current branch to the remote
-2. Syncs code on Bridge via selected transport
+1. Syncs code on Bridge via selected transport
+2. Optionally pushes the current branch to the remote (disabled by default)
 3. Returns the synced commit SHA
 
 SSH tunnel is the preferred transport. Workflow transport is retained as a
@@ -150,26 +150,48 @@ def _is_cpu_bridge_name(name: str) -> bool:
     return "cpu" in normalized.split()
 
 
-def _ordered_bridges_for_sync(tunnel_config: TunnelConfig) -> list[BridgeProfile]:
+def _ordered_bridges_for_sync(
+    tunnel_config: TunnelConfig,
+    *,
+    source: str = "bundle",
+) -> list[BridgeProfile]:
     """Return all configured bridges ordered for sync preference.
 
     Priority:
-    1) internet + CPU
-    2) internet + non-CPU
-    3) no-internet + CPU
-    4) no-internet + non-CPU
+    - source=remote:
+      1) internet + CPU
+      2) internet + non-CPU
+      3) no-internet + CPU
+      4) no-internet + non-CPU
+
+    - source=bundle:
+      1) no-internet + CPU
+      2) no-internet + non-CPU
+      3) internet + CPU
+      4) internet + non-CPU
     """
     bridges = tunnel_config.list_bridges()
     if not bridges:
         return []
 
     default_bridge = tunnel_config.default_bridge
+    source = source.lower().strip()
+    prefer_internet = source != "bundle"
 
-    def _priority(bridge: BridgeProfile) -> int:
+    def _source_priority(bridge: BridgeProfile) -> int:
         is_cpu = _is_cpu_bridge_name(bridge.name)
-        if bridge.has_internet and is_cpu:
+        if prefer_internet:
+            if bridge.has_internet and is_cpu:
+                return 0
+            if bridge.has_internet:
+                return 1
+            if is_cpu:
+                return 2
+            return 3
+
+        if (not bridge.has_internet) and is_cpu:
             return 0
-        if bridge.has_internet:
+        if not bridge.has_internet:
             return 1
         if is_cpu:
             return 2
@@ -179,37 +201,23 @@ def _ordered_bridges_for_sync(tunnel_config: TunnelConfig) -> list[BridgeProfile
     return sorted(
         bridges,
         key=lambda bridge: (
-            _priority(bridge),
+            _source_priority(bridge),
             0 if bridge.name == default_bridge else 1,
         ),
     )
 
 
-def _effective_ssh_source(source: str, bridge: BridgeProfile) -> str:
-    """Resolve SSH sync source based on user preference and bridge capability."""
-    if source == "auto":
-        return "remote" if bridge.has_internet else "bundle"
-    return source
-
-
 def _effective_push_mode(
     *,
     no_push: bool,
-    force: bool,
     push_mode: Optional[str],
-    transport: str,
-    ssh_source: Optional[str],
 ) -> str:
     """Resolve git push behavior before sync."""
     if no_push:
         return "skip"
     if push_mode:
         return push_mode
-    if force and transport == "ssh":
-        return "best-effort"
-    if transport == "ssh" and ssh_source == "bundle":
-        return "best-effort"
-    return "required"
+    return "skip"
 
 
 def _is_locale_warning(line: str) -> bool:
@@ -503,7 +511,7 @@ def sync_via_workflow(
 @click.option(
     "--no-push",
     is_flag=True,
-    help="Skip git push before sync (same as --push-mode skip)",
+    help="Skip git push before sync (default behavior; same as --push-mode skip)",
 )
 @click.option(
     "--allow-dirty",
@@ -514,8 +522,7 @@ def sync_via_workflow(
     "--force",
     is_flag=True,
     help=(
-        "Force sync mode: imply --allow-dirty, default push mode to best-effort, "
-        "and hard-reset diverged Bridge branch on SSH sync"
+        "Force sync mode: imply --allow-dirty, " "and hard-reset diverged Bridge branch on SSH sync"
     ),
 )
 @click.option(
@@ -537,16 +544,16 @@ def sync_via_workflow(
 )
 @click.option(
     "--source",
-    type=click.Choice(["auto", "remote", "bundle"], case_sensitive=False),
-    default="auto",
+    type=click.Choice(["remote", "bundle"], case_sensitive=False),
+    default="bundle",
     show_default=True,
-    help="For SSH transport: choose sync source (auto uses remote on internet bridges, bundle otherwise)",
+    help="For SSH transport: choose sync source (bundle is default and recommended)",
 )
 @click.option(
     "--push-mode",
     type=click.Choice(["required", "best-effort", "skip"], case_sensitive=False),
     default=None,
-    help="Git push policy before sync (default: required for remote/workflow, best-effort for bundle)",
+    help="Git push policy before sync (default: skip; use required/best-effort to enable push)",
 )
 @pass_context
 def sync(
@@ -563,9 +570,9 @@ def sync(
 ) -> None:
     """Sync local code to the Bridge shared filesystem.
 
-    This command pushes your local branch to the remote, then syncs to Bridge
-    using the selected transport:
-    - ssh: direct SSH tunnel sync (default; preferred; uses offline bundle mode if bridge has no internet)
+    This command syncs to Bridge using the selected transport.
+    Git push is skipped by default unless --push-mode is set:
+    - ssh: direct SSH tunnel sync (default; preferred; source is controlled by --source)
     - workflow: fallback Git Actions workflow sync (planned for future deprecation)
 
     \b
@@ -574,8 +581,9 @@ def sync(
         inspire sync --transport workflow     # Use fallback workflow transport
         inspire sync --remote upstream        # Sync via upstream remote
         inspire sync --source bundle          # Force local bundle sync over SSH
+        inspire sync --push-mode required     # Push before sync (fail if push fails)
         inspire sync --push-mode best-effort  # Continue even if git push fails
-        inspire sync --no-push                # Skip git push (equivalent to --push-mode skip)
+        inspire sync --no-push                # Explicitly skip git push (default)
         inspire sync --allow-dirty            # Sync committed branch tip even if worktree is dirty
         inspire sync --allow-dirty --no-push --source bundle --force
                                              # Also force-resets Bridge branch to selected commit
@@ -608,13 +616,13 @@ def sync(
     source = source.lower().strip()
     push_mode = push_mode.lower().strip() if push_mode else None
 
-    if transport == "workflow" and source != "auto":
+    if transport == "workflow" and source == "remote":
         emit_output_error(
             ctx,
             error_type="ValidationError",
-            message="--source is only supported with '--transport ssh'",
+            message="--source remote is only supported with '--transport ssh'",
             exit_code=EXIT_CONFIG_ERROR,
-            human_lines=["Error: --source is only supported with '--transport ssh'."],
+            human_lines=["Error: --source remote is only supported with '--transport ssh'."],
         )
         sys.exit(EXIT_CONFIG_ERROR)
 
@@ -640,12 +648,11 @@ def sync(
 
     tunnel_config = None
     selected_bridge = None
-    ssh_source = None
     use_offline_bundle = False
     candidate_bridges: list[BridgeProfile] = []
     if transport == "ssh":
         tunnel_config = load_tunnel_config()
-        candidate_bridges = _ordered_bridges_for_sync(tunnel_config)
+        candidate_bridges = _ordered_bridges_for_sync(tunnel_config, source=source)
         if not candidate_bridges:
             hint = "Use 'inspire tunnel list' or 'inspire notebook ssh <id>' first."
             emit_output_error(
@@ -691,9 +698,8 @@ def sync(
             )
             sys.exit(EXIT_GENERAL_ERROR)
 
-        ssh_source = _effective_ssh_source(source, selected_bridge)
-        if ssh_source == "remote" and not selected_bridge.has_internet:
-            hint = "Use '--source bundle' (or '--source auto') for no-internet bridges."
+        if source == "remote" and not selected_bridge.has_internet:
+            hint = "Use '--source bundle' for no-internet bridges."
             emit_output_error(
                 ctx,
                 error_type="ValidationError",
@@ -713,7 +719,7 @@ def sync(
             )
             sys.exit(EXIT_CONFIG_ERROR)
 
-        use_offline_bundle = ssh_source == "bundle"
+        use_offline_bundle = source == "bundle"
         if ctx.debug and not ctx.json_output:
             has_cpu_candidate = any(
                 _is_cpu_bridge_name(bridge.name) for bridge in candidate_bridges
@@ -726,13 +732,7 @@ def sync(
                     err=True,
                 )
             if use_offline_bundle:
-                if source == "bundle":
-                    click.echo("Using offline bundle sync path (--source bundle).", err=True)
-                else:
-                    click.echo(
-                        "Selected bridge has no internet; using offline bundle sync path.",
-                        err=True,
-                    )
+                click.echo("Using offline bundle sync path (--source bundle).", err=True)
             elif source == "remote":
                 click.echo("Using remote git sync path (--source remote).")
     else:
@@ -777,10 +777,7 @@ def sync(
     commit_msg = get_commit_message(branch)
     effective_push_mode = _effective_push_mode(
         no_push=no_push,
-        force=force,
         push_mode=push_mode,
-        transport=transport,
-        ssh_source=ssh_source,
     )
 
     if effective_push_mode != "skip":
