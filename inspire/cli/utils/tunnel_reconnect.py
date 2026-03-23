@@ -135,10 +135,12 @@ def rebuild_notebook_bridge_profile(
     updated = BridgeProfile(
         name=bridge_name,
         proxy_url=proxy_url,
+        aliases=list(getattr(bridge, "aliases", []) or []),
         ssh_user=bridge.ssh_user,
         ssh_port=bridge.ssh_port,
         has_internet=bridge.has_internet,
         notebook_id=notebook_id,
+        notebook_name=getattr(bridge, "notebook_name", None),
         rtunnel_port=tunnel_port,
     )
     tunnel_config.add_bridge(updated)

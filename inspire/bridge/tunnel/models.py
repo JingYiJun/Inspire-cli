@@ -78,11 +78,13 @@ class BridgeProfile:
 
     name: str
     proxy_url: str
+    aliases: list[str] = field(default_factory=list)
     ssh_user: str = DEFAULT_SSH_USER
     ssh_port: int = DEFAULT_SSH_PORT
     has_internet: bool = True  # Whether this bridge has internet access
     # Optional notebook binding for saved notebook SSH profiles.
     notebook_id: Optional[str] = None
+    notebook_name: Optional[str] = None
     # Optional rtunnel server port in the notebook.
     rtunnel_port: Optional[int] = None
 
@@ -90,12 +92,15 @@ class BridgeProfile:
         payload = {
             "name": self.name,
             "proxy_url": self.proxy_url,
+            "aliases": list(self.aliases),
             "ssh_user": self.ssh_user,
             "ssh_port": self.ssh_port,
             "has_internet": self.has_internet,
         }
         if self.notebook_id:
             payload["notebook_id"] = self.notebook_id
+        if self.notebook_name:
+            payload["notebook_name"] = self.notebook_name
         if self.rtunnel_port is not None:
             payload["rtunnel_port"] = self.rtunnel_port
         return payload
@@ -111,12 +116,35 @@ class BridgeProfile:
         return cls(
             name=data["name"],
             proxy_url=proxy_url,
+            aliases=[str(item).strip() for item in data.get("aliases", []) if str(item).strip()],
             ssh_user=data.get("ssh_user", DEFAULT_SSH_USER),
             ssh_port=data.get("ssh_port", DEFAULT_SSH_PORT),
             has_internet=data.get("has_internet", True),  # Default True for backward compat
             notebook_id=data.get("notebook_id"),
+            notebook_name=data.get("notebook_name"),
             rtunnel_port=rtunnel_port,
         )
+
+    def all_host_aliases(self) -> list[str]:
+        aliases = [self.name]
+        for alias in self.aliases:
+            if alias not in aliases:
+                aliases.append(alias)
+        if self.notebook_id and self.notebook_id not in aliases:
+            aliases.append(self.notebook_id)
+        return aliases
+
+    def matches_identifier(self, identifier: str) -> bool:
+        token = str(identifier or "").strip().lower()
+        if not token:
+            return False
+        candidates = [self.name]
+        candidates.extend(self.aliases)
+        if self.notebook_id:
+            candidates.append(self.notebook_id)
+        if self.notebook_name:
+            candidates.append(self.notebook_name)
+        return any(str(candidate or "").strip().lower() == token for candidate in candidates)
 
 
 @dataclass
@@ -143,7 +171,17 @@ class TunnelConfig:
     def get_bridge(self, name: Optional[str] = None) -> Optional[BridgeProfile]:
         """Get a bridge profile by name, or the default if name is None."""
         if name:
-            return self.bridges.get(name)
+            direct = self.bridges.get(name)
+            if direct is not None:
+                return direct
+            lowered = str(name).strip().lower()
+            for bridge in self.bridges.values():
+                if str(bridge.name).strip().lower() == lowered:
+                    return bridge
+            for bridge in self.bridges.values():
+                if bridge.matches_identifier(name):
+                    return bridge
+            return None
         elif self.default_bridge:
             return self.bridges.get(self.default_bridge)
         elif len(self.bridges) == 1:

@@ -164,14 +164,20 @@ def generate_ssh_config(
     Returns:
         SSH config string to add to ~/.ssh/config
     """
-    if host_alias is None:
-        host_alias = bridge.name
+    host_aliases = bridge.all_host_aliases()
+    if host_alias is not None:
+        requested = str(host_alias).strip()
+        if requested:
+            host_aliases = [alias for alias in host_aliases if alias != requested]
+            host_aliases.insert(0, requested)
+    if not host_aliases:
+        host_aliases = [bridge.name]
 
     # Keep ProxyCommand rendering consistent with runtime SSH command construction
     # so URL/path quoting is always shell-safe in generated ~/.ssh/config entries.
     proxy_cmd = _get_proxy_command(bridge, rtunnel_path, quiet=False)
 
-    ssh_config = f"""Host {host_alias}
+    ssh_config = f"""Host {' '.join(host_aliases)}
     HostName localhost
     User {bridge.ssh_user}
     Port {bridge.ssh_port}

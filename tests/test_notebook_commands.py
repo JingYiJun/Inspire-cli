@@ -560,7 +560,7 @@ def test_run_notebook_ssh_validates_dropbear_setup_script(
             notebook_id="nb-name",
             wait=True,
             pubkey=None,
-            save_as=None,
+            aliases=(),
             port=31337,
             ssh_port=22222,
             command=None,
@@ -628,7 +628,7 @@ def test_run_notebook_ssh_fails_fast_on_account_mismatch(
             notebook_id="nb-name",
             wait=True,
             pubkey=None,
-            save_as=None,
+            aliases=(),
             port=31337,
             ssh_port=22222,
             command=None,
@@ -733,7 +733,7 @@ def test_run_notebook_ssh_passes_resolved_runtime_to_setup(
         notebook_id="nb-name",
         wait=True,
         pubkey=None,
-        save_as=None,
+        aliases=(),
         port=31337,
         ssh_port=22222,
         command=None,
@@ -743,6 +743,104 @@ def test_run_notebook_ssh_passes_resolved_runtime_to_setup(
     )
 
     assert setup_kwargs["ssh_runtime"] is resolved_runtime
+
+
+def test_run_notebook_ssh_uses_notebook_name_as_default_bridge_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeSession:
+        workspace_id = "ws-test"
+        storage_state = {}
+
+    class FakeTunnelConfig:
+        def __init__(self) -> None:
+            self.bridges: dict[str, object] = {}
+            self.default_bridge = None
+
+        def add_bridge(self, profile: object) -> None:
+            name = str(getattr(profile, "name", "default"))
+            self.bridges[name] = profile
+            if self.default_bridge is None:
+                self.default_bridge = name
+
+    fake_tunnel_config = FakeTunnelConfig()
+
+    monkeypatch.setattr(ssh_flow_module, "require_web_session", lambda ctx, hint: FakeSession())
+    monkeypatch.setattr(ssh_flow_module, "load_config", lambda ctx: make_test_config(tmp_path))
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_resolve_notebook_id",
+        lambda *args, **kwargs: ("notebook-12345678", None),
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "wait_for_notebook_running",
+        lambda notebook_id, session=None: {
+            "name": "ring 8xH100 / test",
+            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}},
+        },
+    )
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_get_current_user_detail",
+        lambda session, base_url: {"id": "user-1", "username": "user"},
+    )
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_validate_notebook_account_access",
+        lambda current_user, notebook_detail: (True, ""),
+    )
+    monkeypatch.setattr(ssh_flow_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA")
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "resolve_ssh_runtime_config",
+        lambda cli_overrides=None: SshRuntimeConfig(),
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "setup_notebook_rtunnel",
+        lambda **kwargs: "wss://proxy.example/notebook/",
+    )
+    monkeypatch.setattr(
+        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
+    )
+    monkeypatch.setattr(tunnel_module, "save_tunnel_config", lambda config: None)
+    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: True)
+    monkeypatch.setattr(
+        tunnel_module,
+        "is_tunnel_available",
+        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: True,
+    )
+    monkeypatch.setattr(
+        tunnel_module,
+        "get_ssh_command_args",
+        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
+    )
+    monkeypatch.setattr(
+        ssh_flow_module,
+        "_run_interactive_notebook_ssh_with_reconnect",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(ssh_flow_module.subprocess, "call", lambda args: 0)
+
+    ssh_flow_module.run_notebook_ssh(
+        Context(),
+        notebook_id="nb-name",
+        wait=True,
+        pubkey=None,
+        aliases=("gpu-main", "train"),
+        port=31337,
+        ssh_port=22222,
+        command=None,
+        rtunnel_bin="/cli/rtunnel",
+        debug_playwright=False,
+        setup_timeout=60,
+    )
+
+    saved_profile = fake_tunnel_config.bridges["ring-8xH100-test"]
+    assert saved_profile.aliases == ["gpu-main", "train"]
+    assert saved_profile.notebook_id == "notebook-12345678"
+    assert saved_profile.notebook_name == "ring 8xH100 / test"
 
 
 def test_run_notebook_ssh_refreshes_saved_profile_on_notebook_mismatch(
@@ -791,7 +889,8 @@ def test_run_notebook_ssh_refreshes_saved_profile_on_notebook_mismatch(
         browser_api_module,
         "wait_for_notebook_running",
         lambda notebook_id, session=None: {
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
+            "name": "shared-profile",
+            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}},
         },
     )
     monkeypatch.setattr(
@@ -839,7 +938,7 @@ def test_run_notebook_ssh_refreshes_saved_profile_on_notebook_mismatch(
         notebook_id="nb-name",
         wait=True,
         pubkey=None,
-        save_as="shared-profile",
+        aliases=(),
         port=31337,
         ssh_port=22222,
         command=None,
@@ -951,7 +1050,7 @@ def test_run_notebook_ssh_interactive_reconnects_after_drop(
         notebook_id="nb-name",
         wait=True,
         pubkey=None,
-        save_as=None,
+        aliases=(),
         port=31337,
         ssh_port=22222,
         command=None,
@@ -1059,7 +1158,7 @@ def test_run_notebook_ssh_reports_when_tunnel_not_ready(
             notebook_id="nb-name",
             wait=True,
             pubkey=None,
-            save_as=None,
+            aliases=(),
             port=31337,
             ssh_port=22222,
             command=None,

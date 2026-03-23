@@ -575,6 +575,22 @@ class TestTunnelConfig:
         assert retrieved is not None
         assert retrieved.name == "test-bridge"
 
+    def test_get_bridge_matches_alias_and_notebook_id(self) -> None:
+        """Test bridge lookup accepts aliases and notebook ids."""
+        config = TunnelConfig()
+        profile = BridgeProfile(
+            name="gpu-main",
+            proxy_url="https://proxy.example.com",
+            aliases=["train", "default"],
+            notebook_id="notebook-12345678",
+            notebook_name="GPU Main",
+        )
+        config.add_bridge(profile)
+
+        assert config.get_bridge("train") is profile
+        assert config.get_bridge("notebook-12345678") is profile
+        assert config.get_bridge("GPU Main") is profile
+
     def test_get_default_bridge(self) -> None:
         """Test getting default bridge."""
         config = TunnelConfig()
@@ -877,11 +893,13 @@ class TestProxyCommand:
         bridge = BridgeProfile(
             name="test",
             proxy_url="https://proxy.example.com/tunnel?token=a*b",
+            aliases=["train"],
+            notebook_id="notebook-12345678",
         )
         rtunnel_bin = tmp_path / "rtunnel with space"
 
         ssh_config = generate_ssh_config(bridge, rtunnel_bin, host_alias="mybridge")
         expected_proxy = _get_proxy_command(bridge, rtunnel_bin, quiet=False)
 
-        assert "Host mybridge" in ssh_config
+        assert "Host mybridge test train notebook-12345678" in ssh_config
         assert f"ProxyCommand {expected_proxy}" in ssh_config

@@ -6,6 +6,7 @@ import click
 
 from .add import tunnel_add
 from .list_cmd import tunnel_list
+from .migrate import tunnel_migrate
 from .remove import tunnel_remove
 from .set_default import tunnel_set_default
 from .ssh_config import tunnel_ssh_config
@@ -48,6 +49,7 @@ tunnel.add_command(tunnel_remove)
 tunnel.add_command(tunnel_update)
 tunnel.add_command(tunnel_set_default)
 tunnel.add_command(tunnel_list)
+tunnel.add_command(tunnel_migrate)
 tunnel.add_command(tunnel_ssh_config)
 tunnel.add_command(tunnel_test)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from typing import Optional
@@ -36,6 +37,9 @@ from .notebook_lookup import (
     _validate_notebook_account_access,
 )
 
+_BRIDGE_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_BRIDGE_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
 
 def _format_proxy_http_body(raw: bytes) -> str:
     if not raw:
@@ -67,6 +71,167 @@ def _describe_proxy_http_status(proxy_url: str, timeout_s: float = 4.0) -> str:
 
 def load_ssh_public_key(pubkey_path: Optional[str] = None) -> str:
     return load_ssh_public_key_material(pubkey_path)
+
+
+def _normalize_identifier(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _dedupe_tokens(values: list[str] | tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        token = str(value or "").strip()
+        if not token:
+            continue
+        lowered = _normalize_identifier(token)
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        result.append(token)
+    return result
+
+
+def _sanitize_bridge_name(raw_name: object, *, fallback: str) -> str:
+    name = str(raw_name or "").strip()
+    if not name:
+        return fallback
+    sanitized = _BRIDGE_NAME_SANITIZE_RE.sub("-", name)
+    sanitized = re.sub(r"-{2,}", "-", sanitized).strip("-_")
+    return sanitized or fallback
+
+
+def _find_bridge_by_notebook_id(tunnel_config: object, notebook_id: str) -> object | None:
+    token = _normalize_identifier(notebook_id)
+    if not token:
+        return None
+    for bridge in getattr(tunnel_config, "bridges", {}).values():
+        bridge_notebook_id = _normalize_identifier(getattr(bridge, "notebook_id", ""))
+        if bridge_notebook_id == token:
+            return bridge
+    return None
+
+
+def _bridge_identifier_owner(
+    tunnel_config: object,
+    identifier: str,
+    *,
+    skip_name: Optional[str] = None,
+) -> Optional[str]:
+    token = _normalize_identifier(identifier)
+    if not token:
+        return None
+    skip = _normalize_identifier(skip_name)
+    for bridge in getattr(tunnel_config, "bridges", {}).values():
+        if skip and _normalize_identifier(getattr(bridge, "name", "")) == skip:
+            continue
+        for candidate in getattr(bridge, "all_host_aliases", lambda: [bridge.name])():
+            if _normalize_identifier(candidate) == token:
+                return str(getattr(bridge, "name", "") or "")
+    return None
+
+
+def _choose_bridge_name(
+    tunnel_config: object,
+    *,
+    notebook_name: str,
+    notebook_id: str,
+    skip_name: Optional[str] = None,
+) -> str:
+    fallback = f"notebook-{notebook_id[:8]}"
+    preferred = _sanitize_bridge_name(notebook_name, fallback=fallback)
+
+    if _bridge_identifier_owner(tunnel_config, preferred, skip_name=skip_name) is None:
+        return preferred
+
+    suffix = notebook_id[:8] or "bridge"
+    candidate = f"{preferred}-{suffix}"
+    if _bridge_identifier_owner(tunnel_config, candidate, skip_name=skip_name) is None:
+        return candidate
+
+    index = 2
+    while True:
+        candidate = f"{preferred}-{suffix}-{index}"
+        if _bridge_identifier_owner(tunnel_config, candidate, skip_name=skip_name) is None:
+            return candidate
+        index += 1
+
+
+def _resolve_bridge_identity(
+    *,
+    tunnel_config: object,
+    notebook_id: str,
+    notebook_name: str,
+    aliases: tuple[str, ...],
+) -> tuple[str, list[str], object | None]:
+    preferred_name = _sanitize_bridge_name(notebook_name, fallback=f"notebook-{notebook_id[:8]}")
+    existing_bridge = _find_bridge_by_notebook_id(tunnel_config, notebook_id)
+    if existing_bridge is None:
+        named_bridge = getattr(tunnel_config, "bridges", {}).get(preferred_name)
+        if str(getattr(named_bridge, "notebook_id", "") or "").strip():
+            existing_bridge = named_bridge
+    existing_name = str(getattr(existing_bridge, "name", "") or "").strip() or None
+    if existing_name and _normalize_identifier(existing_name) == _normalize_identifier(preferred_name):
+        profile_name = preferred_name
+    else:
+        profile_name = _choose_bridge_name(
+            tunnel_config,
+            notebook_name=notebook_name,
+            notebook_id=notebook_id,
+            skip_name=existing_name,
+        )
+
+    cli_aliases: list[str] = []
+    for raw_alias in aliases:
+        alias = str(raw_alias or "").strip()
+        if not alias:
+            continue
+        if not _BRIDGE_ALIAS_RE.fullmatch(alias):
+            raise ConfigError(
+                f"Invalid bridge alias '{alias}'. Use alphanumeric, dash, underscore."
+            )
+        cli_aliases.append(alias)
+
+    merged_aliases: list[str] = []
+    if (
+        existing_bridge is not None
+        and existing_name
+        and _normalize_identifier(existing_name) != _normalize_identifier(profile_name)
+    ):
+        merged_aliases.append(existing_name)
+    merged_aliases.extend(getattr(existing_bridge, "aliases", []) or [])
+    merged_aliases.extend(cli_aliases)
+
+    final_aliases: list[str] = []
+    for alias in _dedupe_tokens(merged_aliases):
+        if _normalize_identifier(alias) == _normalize_identifier(profile_name):
+            continue
+        owner = _bridge_identifier_owner(tunnel_config, alias, skip_name=existing_name)
+        if owner is not None:
+            raise ConfigError(f"Bridge alias '{alias}' is already used by bridge '{owner}'.")
+        final_aliases.append(alias)
+
+    return profile_name, final_aliases, existing_bridge
+
+
+def _persist_bridge_profile(
+    *,
+    tunnel_config: object,
+    bridge: object,
+    previous_name: Optional[str] = None,
+) -> None:
+    previous = str(previous_name or "").strip()
+    current = str(getattr(bridge, "name", "") or "").strip()
+    old_default = str(getattr(tunnel_config, "default_bridge", "") or "").strip() or None
+    bridges = getattr(tunnel_config, "bridges", {})
+
+    if previous and previous != current and previous in bridges:
+        del bridges[previous]
+
+    tunnel_config.add_bridge(bridge)
+
+    if old_default == previous and current:
+        tunnel_config.default_bridge = current
 
 
 def _run_interactive_notebook_ssh_with_reconnect(
@@ -187,7 +352,7 @@ def _run_interactive_notebook_ssh_with_reconnect(
                 "ConfigError",
                 f"Bridge profile '{profile_name}' is missing notebook metadata.",
                 EXIT_CONFIG_ERROR,
-                hint="Re-run 'inspire notebook ssh <notebook-id> --save-as <name>'.",
+                hint="Re-run 'inspire notebook ssh <notebook-id> --alias <name>'.",
             )
             return
 
@@ -242,7 +407,7 @@ def run_notebook_ssh(
     notebook_id: str,
     wait: bool,
     pubkey: Optional[str],
-    save_as: Optional[str],
+    aliases: tuple[str, ...],
     port: int,
     ssh_port: int,
     command: Optional[str],
@@ -339,17 +504,30 @@ def run_notebook_ssh(
     gpu_info = (notebook_detail.get("resource_spec_price") or {}).get("gpu_info") or {}
     gpu_type = gpu_info.get("gpu_product_simple", "")
     has_internet = has_internet_for_gpu_type(gpu_type)
+    notebook_name = str(notebook_detail.get("name") or "").strip()
 
     tunnel_account = str(getattr(config, "username", "") or "").strip() or None
-    profile_name = save_as or f"notebook-{notebook_id[:8]}"
     cached_config = load_tunnel_config(account=tunnel_account)
+    try:
+        profile_name, bridge_aliases, existing_bridge = _resolve_bridge_identity(
+            tunnel_config=cached_config,
+            notebook_id=notebook_id,
+            notebook_name=notebook_name,
+            aliases=aliases,
+        )
+    except ConfigError as e:
+        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+        return
 
-    if profile_name in cached_config.bridges:
+    cached_bridge = existing_bridge
+    if cached_bridge is None and profile_name in cached_config.bridges:
         cached_bridge = cached_config.bridges[profile_name]
+
+    if cached_bridge is not None:
         cached_notebook_id = str(getattr(cached_bridge, "notebook_id", "") or "").strip()
         if cached_notebook_id == notebook_id:
             test_args = get_ssh_command_args(
-                bridge_name=profile_name,
+                bridge_name=str(getattr(cached_bridge, "name", "") or profile_name),
                 config=cached_config,
                 remote_command="echo ok",
             )
@@ -361,6 +539,34 @@ def run_notebook_ssh(
                     text=True,
                 )
                 if result.returncode == 0 and "ok" in result.stdout:
+                    cached_profile_name = str(getattr(cached_bridge, "name", "") or profile_name)
+                    desired_proxy_url = str(getattr(cached_bridge, "proxy_url", "") or "")
+                    desired_rtunnel_port = getattr(cached_bridge, "rtunnel_port", port)
+                    desired_ssh_user = str(getattr(cached_bridge, "ssh_user", "") or "root")
+                    needs_update = (
+                        cached_profile_name != profile_name
+                        or list(getattr(cached_bridge, "aliases", []) or []) != bridge_aliases
+                        or str(getattr(cached_bridge, "notebook_name", "") or "") != notebook_name
+                        or getattr(cached_bridge, "has_internet", True) != has_internet
+                    )
+                    if needs_update:
+                        cached_profile = BridgeProfile(
+                            name=profile_name,
+                            proxy_url=desired_proxy_url,
+                            aliases=bridge_aliases,
+                            ssh_user=desired_ssh_user,
+                            ssh_port=ssh_port,
+                            has_internet=has_internet,
+                            notebook_id=notebook_id,
+                            notebook_name=notebook_name or None,
+                            rtunnel_port=desired_rtunnel_port,
+                        )
+                        _persist_bridge_profile(
+                            tunnel_config=cached_config,
+                            bridge=cached_profile,
+                            previous_name=cached_profile_name,
+                        )
+                        save_tunnel_config(cached_config)
                     click.echo("Using cached tunnel connection (fast path).", err=True)
                     if command is None:
                         _run_interactive_notebook_ssh_with_reconnect(
@@ -435,15 +641,22 @@ def run_notebook_ssh(
     bridge = BridgeProfile(
         name=profile_name,
         proxy_url=proxy_url,
+        aliases=bridge_aliases,
         ssh_user="root",
         ssh_port=ssh_port,
         has_internet=has_internet,
         notebook_id=notebook_id,
+        notebook_name=notebook_name or None,
         rtunnel_port=port,
     )
 
     tunnel_config = load_tunnel_config(account=tunnel_account)
-    tunnel_config.add_bridge(bridge)
+    previous_name = str(getattr(existing_bridge, "name", "") or "").strip() or None
+    _persist_bridge_profile(
+        tunnel_config=tunnel_config,
+        bridge=bridge,
+        previous_name=previous_name,
+    )
     save_tunnel_config(tunnel_config)
 
     if not is_tunnel_available(

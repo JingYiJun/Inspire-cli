@@ -7,8 +7,10 @@ from inspire.cli.utils.tunnel_reconnect import (
     NotebookBridgeReconnectState,
     NotebookBridgeReconnectStatus,
     attempt_notebook_bridge_rebuild,
+    rebuild_notebook_bridge_profile,
     should_attempt_ssh_reconnect,
 )
+from inspire.platform.web import browser_api as browser_api_module
 
 
 def test_should_attempt_ssh_reconnect_interactive_only_by_default() -> None:
@@ -128,3 +130,37 @@ def test_attempt_notebook_bridge_rebuild_returns_exhausted_on_last_failure() -> 
     assert result.status is NotebookBridgeReconnectStatus.EXHAUSTED
     assert result.attempt == 1
     assert isinstance(result.error, RuntimeError)
+
+
+def test_rebuild_notebook_bridge_profile_preserves_aliases_and_notebook_name(
+    monkeypatch,
+) -> None:
+    bridge = BridgeProfile(
+        name="gpu-main",
+        proxy_url="https://proxy.example/proxy/31337/",
+        aliases=["train", "daily"],
+        notebook_id="notebook-1",
+        notebook_name="GPU Main",
+    )
+    tunnel_config = TunnelConfig(bridges={"gpu-main": bridge}, default_bridge="gpu-main")
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "setup_notebook_rtunnel",
+        lambda **kwargs: "https://proxy.example/proxy/31338/",
+    )
+
+    updated = rebuild_notebook_bridge_profile(
+        bridge_name="gpu-main",
+        bridge=bridge,
+        tunnel_config=tunnel_config,
+        session=object(),
+        ssh_public_key="ssh-key",
+        ssh_runtime=object(),
+        timeout=10,
+        headless=True,
+    )
+
+    assert updated.aliases == ["train", "daily"]
+    assert updated.notebook_name == "GPU Main"
+    assert tunnel_config.bridges["gpu-main"].aliases == ["train", "daily"]

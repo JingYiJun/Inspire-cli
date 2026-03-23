@@ -690,11 +690,10 @@ def list_notebooks(
     ),
 )
 @click.option(
-    "--save-as",
-    help=(
-        "Save this notebook tunnel as a named profile (usable with 'ssh <name>' after "
-        "'inspire tunnel ssh-config --install')"
-    ),
+    "--alias",
+    "aliases",
+    multiple=True,
+    help=("Add one or more reusable bridge aliases (repeatable; defaults to the notebook name)"),
 )
 @click.option(
     "--port",
@@ -734,7 +733,7 @@ def ssh_notebook_cmd(
     notebook: str,
     wait: bool,
     pubkey: Optional[str],
-    save_as: Optional[str],
+    aliases: tuple[str, ...],
     port: int,
     ssh_port: int,
     command: Optional[str],
@@ -748,7 +747,7 @@ def ssh_notebook_cmd(
         notebook_id=notebook,
         wait=wait,
         pubkey=pubkey,
-        save_as=save_as,
+        aliases=aliases,
         port=port,
         ssh_port=ssh_port,
         command=command,

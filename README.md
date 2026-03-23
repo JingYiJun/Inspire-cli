@@ -88,7 +88,7 @@ inspire run "python train.py --epochs 100" --sync --watch
 inspire sync && inspire bridge exec "ls -la"
 
 # Set up SSH tunnel to a notebook
-inspire notebook ssh <notebook-id> --save-as mybridge
+inspire notebook ssh <notebook-id> --alias mybridge
 ssh mybridge
 
 # Check live GPU usage for all saved notebook tunnels
@@ -106,9 +106,9 @@ inspire project list
 
 ## SSH/SCP Reliability Notes
 
-- There is no `inspire tunnel start` command. Create or refresh bridge profiles with `inspire notebook ssh <notebook-id> --save-as <name>` (or `inspire tunnel add` / `inspire tunnel update`), then validate with `inspire tunnel status`.
+- There is no `inspire tunnel start` command. Create or refresh bridge profiles with `inspire notebook ssh <notebook-id> --alias <name>` (or `inspire tunnel add` / `inspire tunnel update`), then validate with `inspire tunnel status`.
 - `inspire bridge ssh` and `inspire bridge scp` validate `--bridge` names before connectivity checks. If a profile is missing, run `inspire tunnel list`.
-- Saved notebook profiles now store the source notebook ID. Reusing `--save-as <name>` for a different notebook refreshes the tunnel instead of reusing stale tunnel state.
+- Saved notebook profiles now store the source notebook ID. Reusing the same alias for a different notebook refreshes the tunnel instead of reusing stale tunnel state.
 - `inspire bridge ssh`, `inspire bridge exec`, and interactive `inspire notebook ssh` auto-rebuild/reconnect dropped tunnels for notebook-backed profiles, using `tunnel.retries` / `tunnel.retry_pause` as retry controls.
 - Non-notebook tunnel profiles (for example, manually added profiles without `notebook_id`) cannot be auto-rebuilt and still require manual tunnel recovery.
 - `inspire tunnel ssh-config` now writes shell-quoted `ProxyCommand` entries so proxy URLs with query parameters/tokens remain safe in `~/.ssh/config`.

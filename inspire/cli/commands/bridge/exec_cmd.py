@@ -101,7 +101,7 @@ def try_exec_via_ssh_tunnel(
             hint = (
                 "Run 'inspire tunnel status' to troubleshoot. "
                 "If needed, re-create the bridge via "
-                "'inspire notebook ssh <notebook-id> --save-as <name>'."
+                "'inspire notebook ssh <notebook-id> --alias <name>'."
             )
             return _emit_error(
                 ctx,
@@ -119,7 +119,7 @@ def try_exec_via_ssh_tunnel(
                 "SSH tunnel not available",
                 hint=(
                     "Auto-rebuild retries exhausted. Run 'inspire tunnel status' and "
-                    "retry 'inspire notebook ssh <notebook-id> --save-as <name>'."
+                    "retry 'inspire notebook ssh <notebook-id> --alias <name>'."
                 ),
             )
 

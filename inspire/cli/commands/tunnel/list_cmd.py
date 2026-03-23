@@ -116,6 +116,15 @@ def tunnel_list(ctx: Context, no_check: bool) -> None:
         click.echo(f"    URL: {bridge.proxy_url}")
         click.echo(f"    SSH: {bridge.ssh_user}@localhost:{bridge.ssh_port}")
         click.echo(f"    Internet: {'yes' if bridge.has_internet else 'no'}")
+        notebook_id = str(getattr(bridge, "notebook_id", "") or "").strip()
+        notebook_name = str(getattr(bridge, "notebook_name", "") or "").strip()
+        aliases = list(getattr(bridge, "aliases", []) or [])
+        if notebook_name:
+            click.echo(f"    Notebook: {notebook_name}")
+        if notebook_id:
+            click.echo(f"    Notebook ID: {notebook_id}")
+        if aliases:
+            click.echo(f"    Aliases: {', '.join(aliases)}")
         if is_default:
             click.echo(human_formatter.format_success("    (default)"))
     click.echo("")

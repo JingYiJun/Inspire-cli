@@ -83,7 +83,7 @@ def tunnel_ssh_config(ctx: Context, bridge: str, install: bool) -> None:
                 return
 
             if install:
-                result = install_ssh_config(ssh_config, bridge)
+                result = install_ssh_config(ssh_config, bridge_profile.name)
                 if result["updated"]:
                     click.echo(
                         human_formatter.format_success(f"Updated '{bridge}' entry in ~/.ssh/config")
@@ -120,9 +120,10 @@ def tunnel_ssh_config(ctx: Context, bridge: str, install: bool) -> None:
 
             if ssh_config_path.exists():
                 content = ssh_config_path.read_text()
-                for bridge_name in list(config.bridges.keys()):
-                    pattern = rf"Host\s+.*?\b{re.escape(bridge_name)}\b.*?(?=\nHost\s|\Z)"
-                    content = re.sub(pattern, "", content, flags=re.DOTALL | re.MULTILINE)
+                for bridge_profile in config.list_bridges():
+                    for bridge_name in bridge_profile.all_host_aliases():
+                        pattern = rf"Host\s+.*?\b{re.escape(bridge_name)}\b.*?(?=\nHost\s|\Z)"
+                        content = re.sub(pattern, "", content, flags=re.DOTALL | re.MULTILINE)
                 ssh_config_path.write_text(content)
 
             with ssh_config_path.open("a", encoding="utf-8") as f:

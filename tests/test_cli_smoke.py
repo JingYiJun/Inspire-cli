@@ -45,4 +45,5 @@ def test_tunnel_help_includes_key_subcommands() -> None:
     assert result.exit_code == 0
     assert "add" in result.output
     assert "list" in result.output
+    assert "migrate" in result.output
     assert "status" in result.output
