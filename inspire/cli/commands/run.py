@@ -48,19 +48,6 @@ def _get_current_branch() -> str | None:
         return None
 
 
-def _check_uncommitted_changes() -> bool:
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return bool(result.stdout.strip())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
 def _get_inspire_executable() -> str | None:
     return shutil.which("inspire")
 
@@ -86,14 +73,6 @@ def _run_sync_if_requested(ctx: Context, *, sync: bool, watch: bool) -> None:
 
     if ctx.debug and not ctx.json_output:
         click.echo("Syncing code...")
-
-    if _check_uncommitted_changes():
-        _handle_error(
-            ctx,
-            "ValidationError",
-            "Uncommitted changes detected. Commit or stash first.",
-            EXIT_GENERAL_ERROR,
-        )
 
     try:
         exit_code = _run_inspire_subcommand(["sync"])

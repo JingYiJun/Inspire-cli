@@ -126,6 +126,8 @@ class TestConfigSchema:
 
         # Paths like target_dir should be project
         assert "INSPIRE_TARGET_DIR" in project_env_vars
+        assert "INSPIRE_SYNC_SOURCE_DIR" in project_env_vars
+        assert "INSPIRE_SYNC_BRIDGE" in project_env_vars
         assert "INSPIRE_LOG_PATTERN" in project_env_vars
 
         # Gitea repo should be project
@@ -200,6 +202,8 @@ timeout = 60
         assert Config._toml_key_to_field("auth.username") == "username"
         assert Config._toml_key_to_field("api.timeout") == "timeout"
         assert Config._toml_key_to_field("paths.target_dir") == "target_dir"
+        assert Config._toml_key_to_field("paths.sync_source_dir") == "sync_source_dir"
+        assert Config._toml_key_to_field("paths.sync_bridge") == "sync_bridge"
         assert Config._toml_key_to_field("workspaces.cpu") == "workspace_cpu_id"
         assert Config._toml_key_to_field("workspaces.gpu") == "workspace_gpu_id"
         assert Config._toml_key_to_field("workspaces.internet") == "workspace_internet_id"
@@ -223,6 +227,7 @@ class TestLayeredConfig:
             "INSPIRE_BASE_URL",
             "INSPIRE_TIMEOUT",
             "INSPIRE_TARGET_DIR",
+            "INSPIRE_SYNC_SOURCE_DIR",
             "INSP_GITEA_SERVER",
         ]
         for var in env_vars:
@@ -1761,6 +1766,7 @@ class TestPreferSource:
             "INSPIRE_BASE_URL",
             "INSPIRE_TIMEOUT",
             "INSPIRE_TARGET_DIR",
+            "INSPIRE_SYNC_SOURCE_DIR",
             "INSP_GITEA_SERVER",
         ]
         for var in env_vars:

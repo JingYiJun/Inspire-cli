@@ -57,7 +57,7 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 | `inspire job status/logs/list` | Monitor and manage jobs |
 | `inspire job stop/wait` | Stop or wait for a job |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
-| `inspire sync` | Sync code to shared filesystem (via SSH tunnel) |
+| `inspire sync` | Rsync local code to shared filesystem (via SSH tunnel) |
 | `inspire bridge exec "<cmd>"` | Run command on a Bridge profile via SSH tunnel |
 | `inspire bridge ssh [--bridge <name>]` | Interactive SSH shell to a Bridge profile |
 | `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
@@ -84,8 +84,8 @@ inspire job create --name "train-v1" --resource "4xH200" --command "bash train.s
 # Quick run with auto-selected resources, sync code and follow logs
 inspire run "python train.py --epochs 100" --sync --watch
 
-# Sync code and verify
-inspire sync && inspire bridge exec "git log -1"
+# Sync local directory and verify
+inspire sync && inspire bridge exec "ls -la"
 
 # Set up SSH tunnel to a notebook
 inspire notebook ssh <notebook-id> --save-as mybridge
@@ -130,6 +130,21 @@ Account password lookup follows the same layered model:
 Legacy `[auth].password` is still supported, but account passwords take precedence when both are present.
 
 Run `inspire init --discover` to auto-configure, or `inspire config show` to inspect the merged result.
+
+`inspire sync` uses `rsync` over the SSH tunnel. It always syncs the current working
+directory. On the first run, provide the bridge and remote target directory:
+
+```bash
+cd ~/path/to/your/project
+inspire sync your-bridge /inspire/.../path/to/your/project
+```
+
+This persists `bridge` and `target_dir` to `./.inspire/config.toml`,
+so later `inspire sync` runs can omit them.
+
+`inspire sync` always preserves remote-only files. Local files with the same path
+still overwrite remote files of the same name. The preserved `.inspire/` directory
+is still excluded from sync.
 
 `inspire init` probe-only options are effective only with `--discover --probe-shared-path`:
 `--probe-limit`, `--probe-keep-notebooks`, `--probe-pubkey`/`--pubkey`, and `--probe-timeout`.

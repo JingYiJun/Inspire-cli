@@ -13,7 +13,7 @@ CLI for the Inspire HPC training platform. Run `inspire --help` and `inspire <co
 - **Setup**: `init --discover` (auto-detect projects/workspaces/compute groups via browser login)
 - **Jobs**: `job create`, `job status/logs/list`, `job stop/wait`, `run` (quick submit with auto-sync)
 - **Notebooks**: `notebook create/list/start/stop`, `notebook ssh` (tunnel + shell), `notebook top` (GPU monitoring)
-- **Code sync**: `sync` (git push to shared filesystem), `bridge exec` (run remote commands)
+- **Code sync**: `sync` (rsync local cwd to shared filesystem via SSH tunnel), `bridge exec` (run remote commands)
 - **File transfer**: `bridge scp` (upload/download via tunnel)
 - **Tunnels**: `tunnel add/list/status`, `notebook ssh --save-as` (create reusable bridge profiles)
 - **Info**: `resources list/nodes`, `project list`, `image list`, `config show/check`
@@ -44,7 +44,7 @@ CLI for the Inspire HPC training platform. Run `inspire --help` and `inspire <co
 
 ## Rules the model should always follow
 
-1. **Commit before sync** — `inspire sync` pushes the current git branch; uncommitted changes are lost.
+1. **Sync uses current directory** — `inspire sync` rsyncs the current local directory to the saved remote target and preserves remote-only files.
 2. **Jobs start in an unknown directory** — Always `cd $TARGET_DIR && ...` in job commands.
 3. **Use `.` not `source`** for venv activation in job commands (POSIX compatibility).
 4. **GPU nodes have NO internet** — pip install, git clone, curl all fail. Use a CPU notebook/bridge.

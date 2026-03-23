@@ -57,6 +57,7 @@ _DEFAULTS_FIELD_MAP = {
     "priority": "job_priority",
     "shm_size": "shm_size",
     "target_dir": "target_dir",
+    "sync_source_dir": "sync_source_dir",
     "log_pattern": "log_pattern",
     "project_order": "project_order",
 }
@@ -86,6 +87,8 @@ def _default_config_values() -> dict[str, Any]:
         "password": "",
         "base_url": "https://api.example.com",
         "target_dir": None,
+        "sync_source_dir": None,
+        "sync_bridge": None,
         "log_pattern": "training_master_*.log",
         "job_cache_path": "~/.inspire/jobs.json",
         "timeout": 30,
