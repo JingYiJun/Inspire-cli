@@ -2,6 +2,7 @@
 
 from inspire.cli.formatters.json_formatter import format_json, format_json_error
 from inspire.cli.formatters.human_formatter import (
+    format_hpc_status,
     format_job_status,
     format_job_list,
     format_resources,
@@ -14,6 +15,7 @@ from inspire.cli.formatters.human_formatter import (
 __all__ = [
     "format_json",
     "format_json_error",
+    "format_hpc_status",
     "format_job_status",
     "format_job_list",
     "format_resources",

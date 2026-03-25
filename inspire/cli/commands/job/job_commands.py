@@ -106,7 +106,7 @@ def _watch_jobs(
             else:
                 click.echo(f"✅ [{bar}] {total_count}/{total_count} done (interval: {interval}s)\n")
 
-            click.echo(human_formatter.format_job_list(jobs_list))
+            human_formatter.print_job_list(jobs_list)
 
             if completed_list:
                 click.echo(f"\n✅ Completed This Session ({len(completed_list)})")
@@ -239,7 +239,7 @@ def list_jobs(
         if ctx.json_output:
             click.echo(json_formatter.format_json(jobs))
         else:
-            click.echo(human_formatter.format_job_list(jobs))
+            human_formatter.print_job_list(jobs)
 
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -514,7 +514,7 @@ def update_jobs(ctx: Context, status: tuple, limit: int, delay: float) -> None:
         if updated:
             refreshed_jobs = [cache.get_job(u["job_id"]) for u in updated]
             refreshed_jobs = [j for j in refreshed_jobs if j]
-            click.echo(human_formatter.format_job_list(refreshed_jobs))
+            human_formatter.print_job_list(refreshed_jobs)
         else:
             click.echo("\nNo matching jobs to update.\n")
 

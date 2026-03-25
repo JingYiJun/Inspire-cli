@@ -575,4 +575,4 @@ def list_projects_cmd(
         click.echo(json_formatter.format_json({"projects": results, "total": len(results)}))
         return
 
-    click.echo(human_formatter.format_project_list(results))
+    human_formatter.print_project_list(results)

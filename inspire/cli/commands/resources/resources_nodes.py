@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+
 import click
 
 from inspire.cli.context import Context, EXIT_API_ERROR, EXIT_AUTH_ERROR, pass_context
@@ -9,6 +11,22 @@ from inspire.cli.formatters import json_formatter
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.platform.web.session import SessionExpiredError
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:  # pragma: no cover - optional dependency fallback
+    box = None
+    Console = None
+    Table = None
+
+
+def _make_console() -> Console | None:
+    if Console is None:
+        return None
+    terminal_width = shutil.get_terminal_size((120, 24)).columns
+    return Console(width=max(100, terminal_width))
 
 
 @click.command("nodes")
@@ -70,14 +88,9 @@ def list_nodes(ctx: Context, group: str) -> None:
             )
             return
 
-        click.echo("")
-        click.echo("📊 Full-Free 8-GPU Nodes by Compute Group")
-        click.echo("─" * 78)
-        click.echo(f"{'Group':<25} {'Full Free':>10} {'Ready':>8} {'Total':>8} {'Free GPUs':>10}")
-        click.echo("─" * 78)
-
         total_full_free = 0
         total_free_gpus = 0
+        rows: list[tuple[str, int, int, int, int, str]] = []
         for row in filtered:
             name = row["group_name"][:24]
             full_free = row["full_free_nodes"]
@@ -97,16 +110,54 @@ def list_nodes(ctx: Context, group: str) -> None:
             else:
                 indicator = "🔴"
 
-            click.echo(
-                f"{name:<25} {full_free:>10} {ready:>8} {total:>8} {free_gpus:>10} {indicator}"
-            )
+            rows.append((name, full_free, ready, total, free_gpus, indicator))
 
-        click.echo("─" * 78)
-        click.echo(f"{'TOTAL':<25} {total_full_free:>10} {'':>8} {'':>8} {total_free_gpus:>10}")
-        click.echo("")
-        click.echo("Full Free = READY nodes with 8 GPUs and no running tasks")
-        click.echo("Free GPUs = Total available GPUs (matches 'inspire resources list')")
-        click.echo("")
+        console = _make_console()
+        if console is None or Table is None or box is None:
+            click.echo("")
+            click.echo("📊 Full-Free 8-GPU Nodes by Compute Group")
+            click.echo("─" * 78)
+            click.echo(
+                f"{'Group':<25} {'Full Free':>10} {'Ready':>8} {'Total':>8} {'Free GPUs':>10}"
+            )
+            click.echo("─" * 78)
+            for name, full_free, ready, total, free_gpus, indicator in rows:
+                click.echo(
+                    f"{name:<25} {full_free:>10} {ready:>8} {total:>8} {free_gpus:>10} {indicator}"
+                )
+            click.echo("─" * 78)
+            click.echo(f"{'TOTAL':<25} {total_full_free:>10} {'':>8} {'':>8} {total_free_gpus:>10}")
+            click.echo("")
+            click.echo("Full Free = READY nodes with 8 GPUs and no running tasks")
+            click.echo("Free GPUs = Total available GPUs (matches 'inspire resources list')")
+            click.echo("")
+        else:
+            table = Table(
+                title="Full-Free 8-GPU Nodes by Compute Group",
+                box=box.SIMPLE_HEAVY,
+                show_header=True,
+                header_style="bold cyan",
+            )
+            table.add_column("Group", style="cyan")
+            table.add_column("Full Free", justify="right")
+            table.add_column("Ready", justify="right")
+            table.add_column("Total", justify="right")
+            table.add_column("Free GPUs", justify="right")
+            table.add_column("", justify="center")
+            for name, full_free, ready, total, free_gpus, indicator in rows:
+                table.add_row(
+                    name,
+                    str(full_free),
+                    str(ready),
+                    str(total),
+                    str(free_gpus),
+                    indicator,
+                )
+            table.add_section()
+            table.add_row("TOTAL", str(total_full_free), "", "", str(total_free_gpus), "")
+            console.print(table)
+            console.print("Full Free = READY nodes with 8 GPUs and no running tasks")
+            console.print("Free GPUs = Total available GPUs (matches 'inspire resources list')")
 
     except (SessionExpiredError, ValueError) as e:
         _handle_error(ctx, "AuthenticationError", str(e), EXIT_AUTH_ERROR)

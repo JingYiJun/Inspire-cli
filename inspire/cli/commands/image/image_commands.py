@@ -476,7 +476,7 @@ def list_images_cmd(
         click.echo(json_formatter.format_json({"images": results, "total": len(results)}))
         return
 
-    click.echo(human_formatter.format_image_list(results))
+    human_formatter.print_image_list(results)
 
 
 # ---------------------------------------------------------------------------

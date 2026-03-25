@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import concurrent.futures
 import csv
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import click
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:  # pragma: no cover - optional dependency fallback
+    box = None
+    Console = None
+    Table = None
 
 from inspire.bridge.tunnel import is_tunnel_available, load_tunnel_config, run_ssh_command
 from inspire.bridge.tunnel.models import BridgeProfile, TunnelConfig
@@ -29,6 +39,13 @@ _NVIDIA_SMI_QUERY = (
     "--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu "
     "--format=csv,noheader,nounits"
 )
+
+
+def _make_console() -> Console | None:
+    if Console is None:
+        return None
+    terminal_width = shutil.get_terminal_size((120, 24)).columns
+    return Console(width=max(100, terminal_width))
 
 
 def _utc_timestamp() -> str:
@@ -311,6 +328,52 @@ def _format_human_output(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _print_human_output(payload: dict[str, Any]) -> None:
+    console = _make_console()
+    if console is None or Table is None or box is None:
+        click.echo(_format_human_output(payload))
+        return
+
+    console.print("[bold cyan]Notebook GPU Telemetry (tunnel-backed)[/bold cyan]")
+    console.print(f"Sample: {payload['timestamp']}")
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+    table.add_column("Bridge", style="cyan")
+    table.add_column("Notebook", style="white")
+    table.add_column("GPUs", justify="right")
+    table.add_column("Util", justify="right")
+    table.add_column("Memory", justify="right")
+    table.add_column("Status", style="green")
+
+    for item in payload["items"]:
+        aggregate = item.get("aggregate") or {}
+        if aggregate:
+            table.add_row(
+                str(item.get("bridge", "")),
+                _short_notebook_id(str(item.get("notebook_id", ""))),
+                str(int(aggregate.get("gpu_count", 0))),
+                f"{float(aggregate.get('util_avg_percent', 0.0)):.1f}%",
+                (
+                    f"{int(aggregate.get('mem_used_total_mib', 0))}/"
+                    f"{int(aggregate.get('mem_total_mib', 0))} MiB "
+                    f"({float(aggregate.get('mem_used_percent', 0.0)):.1f}%)"
+                ),
+                "ok",
+            )
+        else:
+            table.add_row(
+                str(item.get("bridge", "")),
+                _short_notebook_id(str(item.get("notebook_id", ""))),
+                "0",
+                "-",
+                "-",
+                f"error {str(item.get('error', '') or 'Unknown failure')}",
+            )
+
+    console.print(table)
+    summary = payload["summary"]
+    console.print(f"Summary: {summary['ok']}/{summary['total']} bridge(s) collected successfully.")
+
+
 @click.command("top")
 @click.option(
     "--bridge",
@@ -385,7 +448,7 @@ def notebook_top(
                 raise SystemExit(EXIT_API_ERROR)
             return
 
-        click.echo(_format_human_output(payload))
+        _print_human_output(payload)
         if ok_count == 0 and not watch:
             _handle_error(
                 ctx,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from typing import Any
 
 import click
@@ -18,12 +19,28 @@ from inspire.cli.utils.id_resolver import is_partial_id, normalize_partial, reso
 from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import session as web_session_module
 
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:  # pragma: no cover - optional dependency fallback
+    box = None
+    Console = None
+    Table = None
+
 _ZERO_WORKSPACE_ID = "ws-00000000-0000-0000-0000-000000000000"
 
 _NOTEBOOK_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+
+
+def _make_console() -> Console | None:
+    if Console is None:
+        return None
+    terminal_width = shutil.get_terminal_size((120, 24)).columns
+    return Console(width=max(100, terminal_width))
 
 
 def _unique_workspace_ids(values: list[str]) -> list[str]:
@@ -527,19 +544,39 @@ def _resolve_notebook_id(
         )
 
     click.echo(f"Multiple notebooks named '{identifier}' found:")
-    resource_width = max(
-        len("Resource"),
-        max(len(_format_notebook_resource(item)) for _, item in matches),
-    )
-    for idx, (ws_id, item) in enumerate(matches, start=1):
-        notebook_id = _notebook_id_from_item(item) or "N/A"
-        status = str(item.get("status") or "Unknown")
-        resource = _format_notebook_resource(item)
-        created_at = str(item.get("created_at") or "")
-        click.echo(
-            f"  [{idx}] {status:<12} {resource:<{resource_width}} {notebook_id}  "
-            f"{created_at}  ws={ws_id}"
+    console = _make_console()
+    if console is None or Table is None or box is None:
+        resource_width = max(
+            len("Resource"),
+            max(len(_format_notebook_resource(item)) for _, item in matches),
         )
+        for idx, (ws_id, item) in enumerate(matches, start=1):
+            notebook_id = _notebook_id_from_item(item) or "N/A"
+            status = str(item.get("status") or "Unknown")
+            resource = _format_notebook_resource(item)
+            created_at = str(item.get("created_at") or "")
+            click.echo(
+                f"  [{idx}] {status:<12} {resource:<{resource_width}} {notebook_id}  "
+                f"{created_at}  ws={ws_id}"
+            )
+    else:
+        table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Status", style="green")
+        table.add_column("Resource", style="yellow")
+        table.add_column("ID", style="white", no_wrap=True)
+        table.add_column("Created", style="magenta")
+        table.add_column("Workspace", style="cyan")
+        for idx, (ws_id, item) in enumerate(matches, start=1):
+            table.add_row(
+                str(idx),
+                str(item.get("status") or "Unknown"),
+                _format_notebook_resource(item),
+                _notebook_id_from_item(item) or "N/A",
+                str(item.get("created_at") or ""),
+                ws_id,
+            )
+        console.print(table)
 
     choice = click.prompt(
         "Select notebook",

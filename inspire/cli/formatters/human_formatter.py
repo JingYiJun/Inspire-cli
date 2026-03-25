@@ -6,8 +6,18 @@ Provides compact plain-text output for terminal and agent use.
 from __future__ import annotations
 
 import sys
+import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:  # pragma: no cover - optional dependency fallback
+    box = None
+    Console = None
+    Table = None
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +68,65 @@ def format_warning(message: str) -> str:
 def print_error(message: str, hint: Optional[str] = None) -> None:
     """Print an error message to stderr."""
     print(format_error(message, hint), file=sys.stderr)
+
+
+def _make_console() -> Console | None:
+    if Console is None:
+        return None
+    terminal_width = shutil.get_terminal_size((120, 24)).columns
+    return Console(width=max(100, terminal_width))
+
+
+def _render_plain_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    aligns: Optional[list[str]] = None,
+) -> str:
+    if not rows:
+        return ""
+
+    aligns = aligns or ["left"] * len(headers)
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(str(cell)))
+
+    def _format_row(row: list[str]) -> str:
+        formatted: list[str] = []
+        for idx, cell in enumerate(row):
+            text = str(cell)
+            if aligns[idx] == "right":
+                formatted.append(text.rjust(widths[idx]))
+            else:
+                formatted.append(text.ljust(widths[idx]))
+        return " ".join(formatted)
+
+    lines = [_format_row(headers), "-" * (sum(widths) + len(widths) - 1)]
+    lines.extend(_format_row(row) for row in rows)
+    return "\n".join(lines)
+
+
+def _print_rich_table(
+    *,
+    title: str,
+    headers: list[tuple[str, dict[str, Any]]],
+    rows: list[list[Any]],
+    footer: Optional[str] = None,
+) -> bool:
+    console = _make_console()
+    if console is None or Table is None or box is None:
+        return False
+
+    table = Table(title=title, box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+    for header, options in headers:
+        table.add_column(header, **options)
+    for row in rows:
+        table.add_row(*[str(cell) for cell in row])
+    console.print(table)
+    if footer:
+        console.print(footer)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +201,25 @@ def format_job_status(job_data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_hpc_status(job_data: Dict[str, Any]) -> str:
+    """Format HPC job detail."""
+    lines = ["HPC Job"]
+    fields = [
+        ("Job ID", job_data.get("job_id", "N/A")),
+        ("Name", job_data.get("name", "N/A")),
+        ("Status", job_data.get("status", "UNKNOWN")),
+        ("Compute Group", job_data.get("logic_compute_group_id", "N/A")),
+        ("Workspace", job_data.get("workspace_id", "N/A")),
+        ("Image", job_data.get("image", "N/A")),
+        ("Tasks", job_data.get("number_of_tasks", "N/A")),
+        ("CPUs/Task", job_data.get("cpus_per_task", "N/A")),
+        ("Mem/CPU", job_data.get("memory_per_cpu", "N/A")),
+    ]
+    for label, value in fields:
+        lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
 def format_job_list(jobs: List[Dict[str, Any]]) -> str:
     """Format job list as a table.
 
@@ -174,6 +262,36 @@ def format_job_list(jobs: List[Dict[str, Any]]) -> str:
     lines.append(f"Total: {len(jobs)} job(s)")
 
     return "\n".join(lines)
+
+
+def print_job_list(jobs: List[Dict[str, Any]]) -> None:
+    """Print job list using rich when available."""
+    if not jobs:
+        print("No jobs found in local cache.")
+        return
+
+    rows = [
+        [
+            str(job.get("job_id", "N/A")),
+            str(job.get("name", "N/A")),
+            str(job.get("status", "UNKNOWN")),
+            str(job.get("created_at", "N/A")),
+        ]
+        for job in jobs
+    ]
+    printed = _print_rich_table(
+        title="Jobs",
+        headers=[
+            ("Job ID", {"style": "cyan", "no_wrap": True}),
+            ("Name", {"style": "white"}),
+            ("Status", {"style": "green"}),
+            ("Created", {"style": "magenta"}),
+        ],
+        rows=rows,
+        footer=f"Total: {len(jobs)} job(s)",
+    )
+    if not printed:
+        print(format_job_list(jobs))
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +376,37 @@ def format_nodes(nodes: List[Dict[str, Any]], total: int = 0) -> str:
     return "\n".join(lines)
 
 
+def print_nodes(nodes: List[Dict[str, Any]], total: int = 0) -> None:
+    """Print cluster nodes using rich when available."""
+    if not nodes:
+        print("No nodes found.")
+        return
+
+    rows = [
+        [
+            str(node.get("node_id", "N/A")),
+            str(node.get("resource_pool", "unknown")),
+            str(node.get("status", "unknown")),
+            str(node.get("gpu_count", "?")),
+        ]
+        for node in nodes
+    ]
+    footer = f"Showing {len(nodes)} of {total} nodes" if total else f"Total: {len(nodes)} node(s)"
+    printed = _print_rich_table(
+        title="Cluster nodes",
+        headers=[
+            ("Node ID", {"style": "cyan"}),
+            ("Pool", {"style": "white"}),
+            ("Status", {"style": "green"}),
+            ("GPUs", {"justify": "right"}),
+        ],
+        rows=rows,
+        footer=footer,
+    )
+    if not printed:
+        print(format_nodes(nodes, total=total))
+
+
 # ---------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------
@@ -303,6 +452,43 @@ def format_image_list(images: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def print_image_list(images: List[Dict[str, Any]]) -> None:
+    """Print image list using rich when available."""
+    if not images:
+        print("No images found.")
+        return
+
+    source_labels = {
+        "SOURCE_OFFICIAL": "official",
+        "SOURCE_PUBLIC": "public",
+        "SOURCE_PRIVATE": "private",
+    }
+    rows = [
+        [
+            str(img.get("name", "N/A")),
+            str(img.get("version", "")),
+            source_labels.get(str(img.get("source", "")), str(img.get("source", ""))),
+            str(img.get("status", "")),
+            str(img.get("framework", "")),
+        ]
+        for img in images
+    ]
+    printed = _print_rich_table(
+        title="Images",
+        headers=[
+            ("Name", {"style": "cyan"}),
+            ("Version", {"style": "white"}),
+            ("Source", {"style": "green"}),
+            ("Status", {"style": "magenta"}),
+            ("Framework", {"style": "yellow"}),
+        ],
+        rows=rows,
+        footer=f"Total: {len(images)} image(s)",
+    )
+    if not printed:
+        print(format_image_list(images))
+
+
 def format_project_list(projects: List[Dict[str, Any]]) -> str:
     """Format project list as a table.
 
@@ -332,6 +518,34 @@ def format_project_list(projects: List[Dict[str, Any]]) -> str:
     lines.append(f"Total: {len(projects)} project(s)")
 
     return "\n".join(lines)
+
+
+def print_project_list(projects: List[Dict[str, Any]]) -> None:
+    """Print project list using rich when available."""
+    if not projects:
+        print("No projects found.")
+        return
+
+    rows = [
+        [
+            str(proj.get("name", "N/A")),
+            str(proj.get("priority_level", "")) or "-",
+            f"{proj.get('member_remain_budget', 0.0):,.0f}",
+        ]
+        for proj in projects
+    ]
+    printed = _print_rich_table(
+        title="Projects",
+        headers=[
+            ("Name", {"style": "cyan"}),
+            ("Priority", {"style": "white"}),
+            ("Budget remain", {"justify": "right", "style": "green"}),
+        ],
+        rows=rows,
+        footer=f"Total: {len(projects)} project(s)",
+    )
+    if not printed:
+        print(format_project_list(projects))
 
 
 def format_image_detail(image_data: Dict[str, Any]) -> str:

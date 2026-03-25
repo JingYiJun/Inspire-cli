@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import shutil
+
 import click
 
 from inspire.cli.formatters import json_formatter
 from .notebook_lookup import _extract_notebook_resource_fields
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:  # pragma: no cover - optional dependency fallback
+    box = None
+    Console = None
+    Table = None
+
+
+def _make_console() -> Console | None:
+    if Console is None:
+        return None
+    terminal_width = shutil.get_terminal_size((120, 24)).columns
+    return Console(width=max(100, terminal_width))
 
 
 def _print_notebook_detail(notebook: dict) -> None:
@@ -88,26 +106,51 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
         return
 
     resource_fields = [_extract_notebook_resource_fields(item) for item in items]
-    cpu_width = max(len("CPU"), max(len(cpu) for cpu, _, _ in resource_fields))
-    gpu_width = max(len("GPU"), max(len(gpu) for _, gpu, _ in resource_fields))
-    memory_width = max(len("Memory"), max(len(memory) for _, _, memory in resource_fields))
-    lines = [
-        f"{'Name':<25} {'Status':<12} {'CPU':>{cpu_width}} {'GPU':>{gpu_width}} "
-        f"{'Memory':>{memory_width}} {'ID':<38}",
-        "-" * (25 + 1 + 12 + 1 + cpu_width + 1 + gpu_width + 1 + memory_width + 1 + 38),
-    ]
+    console = _make_console()
+    if console is None or Table is None or box is None:
+        cpu_width = max(len("CPU"), max(len(cpu) for cpu, _, _ in resource_fields))
+        gpu_width = max(len("GPU"), max(len(gpu) for _, gpu, _ in resource_fields))
+        memory_width = max(len("Memory"), max(len(memory) for _, _, memory in resource_fields))
+        lines = [
+            f"{'Name':<25} {'Status':<12} {'CPU':>{cpu_width}} {'GPU':>{gpu_width}} "
+            f"{'Memory':>{memory_width}} {'ID':<38}",
+            "-" * (25 + 1 + 12 + 1 + cpu_width + 1 + gpu_width + 1 + memory_width + 1 + 38),
+        ]
+        for item, (cpu_display, gpu_display, memory_display) in zip(items, resource_fields):
+            name = item.get("name", "N/A")[:25]
+            status = item.get("status", "Unknown")[:12]
+            notebook_id = item.get("notebook_id", item.get("id", "N/A"))
+            lines.append(
+                f"{name:<25} {status:<12} {cpu_display:>{cpu_width}} {gpu_display:>{gpu_width}} "
+                f"{memory_display:>{memory_width}} {notebook_id:<38}"
+            )
+        lines.append(f"\nShowing {len(items)} notebook(s)")
+        click.echo("\n".join(lines))
+        return
 
+    table = Table(
+        title="Notebook Instances",
+        box=box.SIMPLE_HEAVY,
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Name", style="cyan")
+    table.add_column("Status", style="green")
+    table.add_column("CPU", justify="right")
+    table.add_column("GPU", justify="right")
+    table.add_column("Memory", justify="right")
+    table.add_column("ID", style="white", no_wrap=True)
     for item, (cpu_display, gpu_display, memory_display) in zip(items, resource_fields):
-        name = item.get("name", "N/A")[:25]
-        status = item.get("status", "Unknown")[:12]
-        notebook_id = item.get("notebook_id", item.get("id", "N/A"))
-        lines.append(
-            f"{name:<25} {status:<12} {cpu_display:>{cpu_width}} {gpu_display:>{gpu_width}} "
-            f"{memory_display:>{memory_width}} {notebook_id:<38}"
+        table.add_row(
+            str(item.get("name", "N/A")),
+            str(item.get("status", "Unknown")),
+            cpu_display,
+            gpu_display,
+            memory_display,
+            str(item.get("notebook_id", item.get("id", "N/A"))),
         )
-
-    lines.append(f"\nShowing {len(items)} notebook(s)")
-    click.echo("\n".join(lines))
+    console.print(table)
+    console.print(f"Showing {len(items)} notebook(s)")
 
 
 __all__ = ["_print_notebook_detail", "_print_notebook_list"]
