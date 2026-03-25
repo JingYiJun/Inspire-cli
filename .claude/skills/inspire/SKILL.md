@@ -15,7 +15,7 @@ CLI for the Inspire HPC training platform. Run `inspire --help` and `inspire <co
 - **Notebooks**: `notebook create/list/start/stop`, `notebook ssh` (tunnel + shell), `notebook top` (GPU monitoring)
 - **Code sync**: `sync` (rsync local cwd to shared filesystem via SSH tunnel), `bridge exec` (run remote commands)
 - **File transfer**: `bridge scp` (upload/download via tunnel)
-- **Tunnels**: `tunnel add/list/status`, `notebook ssh --save-as` (create reusable bridge profiles)
+- **Tunnels**: `tunnel add/list/status`, `notebook ssh --alias` (create reusable bridge profiles)
 - **Info**: `resources list/nodes`, `project list`, `image list`, `config show/check`
 
 ## Platform knowledge (things you can't get from --help)
@@ -39,12 +39,12 @@ CLI for the Inspire HPC training platform. Run `inspire --help` and `inspire <co
 ### SSH tunnel architecture
 - `notebook ssh` opens a Jupyter terminal via WebSocket, runs a setup script (installs SSH server + rtunnel), then connects via the platform's HTTP proxy.
 - First SSH to a fresh notebook takes 10-60s (setup). Subsequent connections reuse the running processes.
-- `--save-as <name>` creates a reusable bridge profile. After that, `ssh <name>`, `bridge exec`, `sync`, `bridge scp` all work through it.
+- `--alias <name>` adds a reusable bridge alias. After that, `ssh <name>`, `bridge exec`, `sync`, `bridge scp` all work through it.
 - Tunnels break when notebooks restart. `bridge exec/ssh` auto-reconnect for notebook-backed profiles.
 
 ## Rules the model should always follow
 
-1. **Sync uses current directory** — `inspire sync` rsyncs the current local directory to the saved remote target and preserves remote-only files.
+1. **Sync uses current directory** — `inspire sync` rsyncs the current local directory to the saved remote target and preserves remote-only files. It does not read `INSPIRE_SYNC_BRIDGE` or `INSPIRE_TARGET_DIR` from the environment.
 2. **Jobs start in an unknown directory** — Always `cd $TARGET_DIR && ...` in job commands.
 3. **Use `.` not `source`** for venv activation in job commands (POSIX compatibility).
 4. **GPU nodes have NO internet** — pip install, git clone, curl all fail. Use a CPU notebook/bridge.

@@ -35,9 +35,9 @@ class Config:
 
     # Optional with defaults
     base_url: str = "https://api.example.com"
-    target_dir: Optional[str] = None  # INSPIRE_TARGET_DIR - unified for all Bridge operations
+    target_dir: Optional[str] = None  # INSPIRE_TARGET_DIR - unified for bridge/job operations
     sync_source_dir: Optional[str] = None  # Deprecated: sync always uses current directory
-    sync_bridge: Optional[str] = None  # INSPIRE_SYNC_BRIDGE - saved bridge for rsync sync
+    sync_bridge: Optional[str] = None  # Saved bridge for rsync sync; sync ignores env-sourced values
     log_pattern: str = "training_master_*.log"
     job_cache_path: str = "~/.inspire/jobs.json"
 

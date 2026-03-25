@@ -7,7 +7,7 @@ from click.testing import CliRunner
 from inspire.bridge.tunnel import BridgeProfile, TunnelConfig
 from inspire.cli.context import EXIT_CONFIG_ERROR, EXIT_GENERAL_ERROR, EXIT_SUCCESS
 from inspire.cli.main import main as cli_main
-from inspire.config import Config
+from inspire.config import Config, SOURCE_ENV
 
 sync_cmd_module = importlib.import_module("inspire.cli.commands.sync")
 
@@ -174,3 +174,53 @@ def test_sync_requires_bridge_and_target_dir_on_first_run(monkeypatch, tmp_path:
     assert (
         "sync target directory" in result.output.lower() or "sync bridge" in result.output.lower()
     )
+
+
+def test_sync_ignores_env_cached_target_dir(monkeypatch, tmp_path: Path) -> None:
+    source_dir = tmp_path / "project"
+    source_dir.mkdir()
+    config = make_sync_config(tmp_path, sync_bridge="cpu-main", target_dir="/remote/from-env")
+
+    monkeypatch.chdir(source_dir)
+    monkeypatch.setattr(
+        Config,
+        "from_files_and_env",
+        classmethod(
+            lambda cls, require_target_dir=False, require_credentials=True: (
+                config,
+                {"target_dir": SOURCE_ENV, "sync_bridge": "project"},
+            )
+        ),
+    )
+    monkeypatch.setattr(sync_cmd_module, "load_tunnel_config", make_tunnel_config)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["sync"])
+
+    assert result.exit_code == EXIT_CONFIG_ERROR
+    assert "sync target directory" in result.output.lower()
+
+
+def test_sync_ignores_env_cached_bridge(monkeypatch, tmp_path: Path) -> None:
+    source_dir = tmp_path / "project"
+    source_dir.mkdir()
+    config = make_sync_config(tmp_path, sync_bridge="cpu-main", target_dir="/remote/project")
+
+    monkeypatch.chdir(source_dir)
+    monkeypatch.setattr(
+        Config,
+        "from_files_and_env",
+        classmethod(
+            lambda cls, require_target_dir=False, require_credentials=True: (
+                config,
+                {"target_dir": "project", "sync_bridge": SOURCE_ENV},
+            )
+        ),
+    )
+    monkeypatch.setattr(sync_cmd_module, "load_tunnel_config", make_tunnel_config)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["sync"])
+
+    assert result.exit_code == EXIT_CONFIG_ERROR
+    assert "sync bridge" in result.output.lower()

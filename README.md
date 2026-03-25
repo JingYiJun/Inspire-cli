@@ -212,3 +212,7 @@ inspire init --json --template --project --force
 | `INSPIRE_PROJECT_ID` | Default project ID |
 | `INSP_IMAGE` | Default Docker image |
 | `INSP_PRIORITY` | Job priority (1-10) |
+
+Note: `inspire sync` does not read `INSPIRE_TARGET_DIR` from the environment.
+For sync, pass `bridge` and `target_dir` on the first run, then reuse the
+saved values in `./.inspire/config.toml`.

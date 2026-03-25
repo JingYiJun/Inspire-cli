@@ -19,7 +19,7 @@ Treat CLI help as source of truth (`inspire --help`, `inspire <group> --help`, `
 | Project preference order | Nothing | Ranked list of project names |
 | CPU/4090 notebook SSH | Fully automatic (rtunnel auto-downloaded and uploaded) | Nothing |
 | GPU notebook SSH (no internet) | Automatic (rtunnel auto-uploaded) | `apt_mirror_url` or `dropbear_deb_dir` for SSH server |
-| Bridge profile | `inspire notebook ssh --save-as` | Which notebook to use |
+| Bridge profile | `inspire notebook ssh --alias` | Which notebook to use |
 
 ## Setup flow
 
@@ -72,7 +72,7 @@ Both go in `[ssh]` section of project config.
 
 ### Phase 4: Bridge profile
 
-`inspire notebook ssh <id> --save-as <name>` saves a reusable profile. Ask which notebook should be the default bridge — typically a CPU notebook for code sync/execution.
+`inspire notebook ssh <id> --alias <name>` adds a reusable bridge alias. Ask which notebook should be the default bridge — typically a CPU notebook for code sync/execution.
 
 Bridge profiles break when notebooks restart. `bridge exec`/`ssh` auto-reconnect for notebook-backed profiles, but manually-added tunnels need manual recovery.
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import click
 
@@ -27,7 +27,7 @@ from inspire.cli.utils.output import (
     emit_error as emit_output_error,
     emit_success as emit_output_success,
 )
-from inspire.config import CONFIG_FILENAME, PROJECT_CONFIG_DIR, Config, ConfigError
+from inspire.config import CONFIG_FILENAME, PROJECT_CONFIG_DIR, SOURCE_ENV, Config, ConfigError
 from inspire.config.toml import _load_toml
 
 logger = logging.getLogger(__name__)
@@ -42,8 +42,27 @@ def _resolve_source_dir() -> Path:
     return resolved
 
 
-def _resolve_target_dir(config: Config, target_dir: Optional[str]) -> str:
-    raw = str(target_dir or getattr(config, "target_dir", "") or "").strip()
+def _resolve_config_value(
+    config: Config,
+    sources: Mapping[str, str],
+    field_name: str,
+    cli_value: Optional[str],
+) -> str:
+    if cli_value is not None:
+        return str(cli_value).strip()
+
+    if sources.get(field_name) == SOURCE_ENV:
+        return ""
+
+    return str(getattr(config, field_name, "") or "").strip()
+
+
+def _resolve_target_dir(
+    config: Config,
+    sources: Mapping[str, str],
+    target_dir: Optional[str],
+) -> str:
+    raw = _resolve_config_value(config, sources, "target_dir", target_dir)
     if not raw:
         raise ConfigError(
             "Missing sync target directory configuration.\n"
@@ -56,8 +75,12 @@ def _resolve_target_dir(config: Config, target_dir: Optional[str]) -> str:
     return raw
 
 
-def _resolve_sync_bridge_name(config: Config, bridge_name: Optional[str]) -> str:
-    raw = str(bridge_name or getattr(config, "sync_bridge", "") or "").strip()
+def _resolve_sync_bridge_name(
+    config: Config,
+    sources: Mapping[str, str],
+    bridge_name: Optional[str],
+) -> str:
+    raw = _resolve_config_value(config, sources, "sync_bridge", bridge_name)
     if not raw:
         raise ConfigError(
             "Missing sync bridge configuration.\n"
@@ -179,12 +202,15 @@ def sync(
         inspire sync
 
     \b
-    Environment variables:
-        INSPIRE_TARGET_DIR       Target directory on Bridge (optional if already cached)
-        INSPIRE_SYNC_BRIDGE      Saved bridge profile for rsync
+    `sync` only accepts `bridge` and `target_dir` from CLI arguments or
+    saved config. It does not read `INSPIRE_SYNC_BRIDGE` or
+    `INSPIRE_TARGET_DIR`.
     """
     try:
-        config, _ = Config.from_files_and_env(require_target_dir=False, require_credentials=False)
+        config, sources = Config.from_files_and_env(
+            require_target_dir=False,
+            require_credentials=False,
+        )
     except ConfigError as e:
         emit_output_error(
             ctx,
@@ -208,8 +234,8 @@ def sync(
         sys.exit(EXIT_CONFIG_ERROR)
 
     try:
-        resolved_target_dir = _resolve_target_dir(config, target_dir)
-        requested_bridge_name = _resolve_sync_bridge_name(config, bridge)
+        resolved_target_dir = _resolve_target_dir(config, sources, target_dir)
+        requested_bridge_name = _resolve_sync_bridge_name(config, sources, bridge)
     except ConfigError as e:
         emit_output_error(
             ctx,
