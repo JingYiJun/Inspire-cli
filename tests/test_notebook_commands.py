@@ -174,7 +174,7 @@ def test_notebook_status_prints_human_readable_detail(monkeypatch: pytest.Monkey
         "id": "notebook-abc-123",
         "name": "dev-box",
         "status": "RUNNING",
-        "created_at": "2026-03-25T10:00:00Z",
+        "created_at": 1770885691000,
         "live_time": 3720,
         "project": {"name": "Alpha", "priority_name": "P1"},
         "logic_compute_group": {"name": "H200 Pool"},
@@ -216,7 +216,7 @@ def test_notebook_status_prints_human_readable_detail(monkeypatch: pytest.Monkey
     assert "180x · 8x H200 · 500 GB" in result.output
     assert "分布式训练空间" in result.output
     assert "pytorch-dev:v1" in result.output
-    assert "2026-03-25 18:00:00 UTC+8 (2026-03-25T10:00:00Z)" in result.output
+    assert "2026-02-12 16:41:31 UTC+8 (1770885691000)" in result.output
 
 
 def test_notebook_start_accepts_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

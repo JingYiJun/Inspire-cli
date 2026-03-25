@@ -68,9 +68,21 @@ def _notebook_status_style(status: object) -> str:
 
 
 def _format_notebook_created_at(created_at: object) -> str | None:
+    raw_value = created_at
     raw = str(created_at or "").strip()
     if not raw:
         return None
+
+    if isinstance(raw_value, (int, float)) or raw.isdigit():
+        try:
+            timestamp = float(raw)
+            if timestamp >= 1_000_000_000_000:
+                timestamp /= 1000.0
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            human = dt.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S UTC+8")
+            return f"{human} ({raw})"
+        except (OverflowError, OSError, ValueError):
+            return raw
 
     try:
         normalized = raw.replace("Z", "+00:00")
