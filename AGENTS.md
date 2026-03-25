@@ -4,7 +4,7 @@
 - `inspire/` is the main Python package.
 - CLI entry point: `inspire/cli/main.py`; top-level command registration is in `inspire/cli/commands/__init__.py`.
 - CLI command modules live in `inspire/cli/commands/`:
-  - Group packages: `bridge/`, `config/`, `image/`, `init/`, `job/`, `notebook/`, `project/`, `resources/`, `tunnel/`
+  - Group packages: `bridge/`, `config/`, `hpc/`, `image/`, `init/`, `job/`, `notebook/`, `project/`, `resources/`, `tunnel/`
   - Top-level command modules: `run.py`, `sync.py`
 - Command package conventions:
   - Most groups use thin `__init__.py` files (Click group + `add_command` calls), with implementation in submodules.
@@ -13,6 +13,7 @@
   - `bridge/`: `exec_cmd.py`, `ssh_cmd.py`, `scp_cmd.py`
   - `tunnel/`: `add.py`, `remove.py`, `status.py`, `list_cmd.py`, `update.py`, `set_default.py`, `ssh_config.py`, `test_cmd.py`
   - `config/`: `check.py`, `show.py`, `env_cmd.py`
+  - `hpc/`: `hpc_create.py`, `hpc_commands.py`
   - `init/`: `init_cmd.py`, `discover.py`, `templates.py`, `env_detect.py`, `toml_helpers.py`, `errors.py`, `json_report.py`
   - `image/`: `image_commands.py` (list, detail, register, save, delete, set-default)
   - `job/`: `job_commands.py`, `job_create.py`, `job_logs.py`, `job_deps.py`
@@ -22,8 +23,8 @@
 - Formatters: `inspire/cli/formatters/human_formatter.py` (human-readable) and `json_formatter.py` (machine-readable).
 - Domain packages (preferred for shared logic used by CLI):
   - `inspire/config/`: config models, TOML/env loading, schema/options, runtime helpers.
-  - `inspire/config/options/`: option groups in `api.py`, `forge.py`, `infra.py`, `project.py`.
-  - `inspire/platform/openapi/`: OpenAPI client/auth/jobs/nodes/resources.
+  - `inspire/config/options/`: option groups in `api.py`, `forge.py`, `hpc.py`, `infra.py`, `project.py`.
+  - `inspire/platform/openapi/`: OpenAPI client/auth/jobs/hpc_jobs/nodes/resources.
   - `inspire/platform/web/`: web session (SSO) + browser-only APIs (`session/`, `browser_api/`, `resources.py`).
   - `inspire/platform/web/browser_api/`: split domain modules including `availability/`, `jobs.py`, `notebooks.py`, `images.py`, `projects.py`, `workspaces.py`, `playwright_notebooks.py`, `rtunnel.py`.
   - `inspire/bridge/tunnel/`: tunnel config/models + rtunnel/ssh/scp/sync helpers.
@@ -80,9 +81,27 @@
 - Typical required inputs for authenticated commands are `INSPIRE_USERNAME`, `INSPIRE_PASSWORD` (or `[accounts."<username>"].password`), and `INSPIRE_TARGET_DIR`.
 - Gitea/Forge workflow sync and remote logs rely on `INSP_GITEA_REPO`, `INSP_GITEA_TOKEN`, and `INSP_GITEA_SERVER`.
 - Optional: `INSPIRE_SHM_SIZE` (or `job.shm_size` in config) sets default shared memory (GiB) for job and notebook creation.
+- Optional: `INSPIRE_WORKSPACE_HPC_ID` (or `workspaces.hpc` in config) routes HPC jobs to the dedicated CPU/HPC workspace.
+- Optional: `INSPIRE_HPC_IMAGE`, `INSPIRE_HPC_IMAGE_TYPE`, and `INSPIRE_HPC_DEFAULT_PRESET` provide HPC-specific defaults.
+- Optional: `[hpc]` and `[hpc.presets.<name>]` store default image/priority/TTL plus preset CPU/slurm submission parameters.
 - Optional: `INSPIRE_BRIDGE_ACTION_TIMEOUT` (or `bridge.action_timeout` in config) sets default timeout (seconds) for `inspire bridge exec`.
 - Optional: `INSPIRE_BROWSER_API_PREFIX` overrides the default browser API path prefix.
 - Never commit credentials/tokens. Prefer local env exports or local config; run `inspire config check` to validate setup.
+
+## HPC Notes
+- `inspire hpc` is for CPU/slurm-style workloads, not GPU training jobs; keep `inspire job` for training-style submissions.
+- HPC jobs should target CPU or HPC partitions/workspaces; use preset-driven config instead of reusing GPU resource selection.
+- HPC images must include a working slurm toolchain (for example `slurm-gromacs:*` or other slurm-enabled images).
+- HPC `entrypoint` is an sbatch script body. The generated/default script must keep the required `#SBATCH` headers and must launch the workload with `srun`.
+
+## Recent CLI UX Notes
+- Human-readable list-style commands now prefer Rich tables when Rich is installed; plain-text fallback still exists and should remain usable.
+- `notebook list` output now uses separate CPU / GPU / Memory columns instead of a single packed resource field.
+- `notebook status` is intentionally more readable; `created_at` may arrive as ISO text or Unix timestamps (including milliseconds) and is rendered as a UTC+8 human timestamp while preserving the raw source value.
+- Notebook compute-group auto-selection must stay workspace-scoped; do not assume availability from unrelated workspaces when picking notebook resources.
+- Image list/detail lookup is workspace-aware. `image detail` can resolve full IDs, partial IDs, names, or URLs, and may prompt when multiple matches exist across workspaces.
+- `image list --source personal-visible` matches the web UI's personal visible image source.
+- `resources list` now emphasizes grouped human-readable summaries and schedulable resource-spec visibility rather than the older flatter output.
 
 ## Public Sync & Ignore Policy
 - Treat `.gitignore` as the source of truth for non-public/internal artifacts.

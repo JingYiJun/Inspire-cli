@@ -96,6 +96,17 @@ def select_workspace_id(
             _validate_workspace_id(candidate)
             return candidate
 
+        if normalized in {"hpc", "cpu_hpc"}:
+            candidate = (
+                config.workspace_hpc_id or config.workspace_cpu_id or config.job_workspace_id
+            )
+            if not candidate:
+                raise ConfigError(
+                    "No HPC workspace configured. Set [workspaces].hpc or INSPIRE_WORKSPACE_HPC_ID."
+                )
+            _validate_workspace_id(candidate)
+            return candidate
+
         candidate = None
         for name, workspace_id in (config.workspaces or {}).items():
             if name.lower() == normalized:

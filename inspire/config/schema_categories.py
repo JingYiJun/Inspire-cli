@@ -14,6 +14,7 @@ CATEGORY_ORDER = [
     "Bridge",
     "Workspaces",
     "Job",
+    "HPC",
     "Notebook",
     "SSH",
     "Tunnel",

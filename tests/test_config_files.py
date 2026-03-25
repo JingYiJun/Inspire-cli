@@ -207,6 +207,7 @@ timeout = 60
         assert Config._toml_key_to_field("workspaces.cpu") == "workspace_cpu_id"
         assert Config._toml_key_to_field("workspaces.gpu") == "workspace_gpu_id"
         assert Config._toml_key_to_field("workspaces.internet") == "workspace_internet_id"
+        assert Config._toml_key_to_field("workspaces.hpc") == "workspace_hpc_id"
         assert Config._toml_key_to_field("nonexistent.key") is None
 
 
@@ -2139,6 +2140,58 @@ workdir = "/project/only"
         assert sources["project_workdirs"] == SOURCE_PROJECT
         assert sources["account_shared_path_group"] == SOURCE_PROJECT
         assert sources["account_train_job_workdir"] == SOURCE_PROJECT
+
+    def test_project_hpc_config_and_presets_load(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+    ) -> None:
+        """Project TOML should load HPC defaults, workspace routing, and presets."""
+        project_dir = tmp_path / ".inspire"
+        project_dir.mkdir()
+        project_config = project_dir / "config.toml"
+        project_config.write_text(
+            """
+[workspaces]
+hpc = "ws-hpc-11111111-1111-1111-1111-111111111111"
+
+[hpc]
+image = "docker.sii.shaipower.online/inspire-studio/slurm-gromacs:latest"
+image_type = "SOURCE_PUBLIC"
+priority = 4
+ttl_after_finish_seconds = 900
+default_preset = "cpu-small"
+
+[hpc.presets.cpu-small]
+workspace = "hpc"
+logic_compute_group_id = "lcg-hpc"
+spec_id = "quota-cpu-small"
+number_of_tasks = 2
+cpus_per_task = 8
+memory_per_cpu = "4G"
+time = "0-12:00:00"
+enable_hyper_threading = false
+"""
+        )
+
+        monkeypatch.setattr(Config, "GLOBAL_CONFIG_PATH", tmp_path / "missing" / "config.toml")
+        monkeypatch.chdir(tmp_path)
+
+        cfg, _ = Config.from_files_and_env(require_credentials=False)
+
+        assert cfg.workspace_hpc_id == "ws-hpc-11111111-1111-1111-1111-111111111111"
+        assert cfg.workspaces["hpc"] == "ws-hpc-11111111-1111-1111-1111-111111111111"
+        assert cfg.hpc_image == "docker.sii.shaipower.online/inspire-studio/slurm-gromacs:latest"
+        assert cfg.hpc_image_type == "SOURCE_PUBLIC"
+        assert cfg.hpc_priority == 4
+        assert cfg.hpc_ttl_after_finish_seconds == 900
+        assert cfg.hpc_default_preset == "cpu-small"
+        assert cfg.hpc_presets["cpu-small"]["workspace"] == "hpc"
+        assert cfg.hpc_presets["cpu-small"]["logic_compute_group_id"] == "lcg-hpc"
+        assert cfg.hpc_presets["cpu-small"]["spec_id"] == "quota-cpu-small"
+        assert cfg.hpc_presets["cpu-small"]["number_of_tasks"] == 2
+        assert cfg.hpc_presets["cpu-small"]["cpus_per_task"] == 8
+        assert cfg.hpc_presets["cpu-small"]["memory_per_cpu"] == "4G"
+        assert cfg.hpc_presets["cpu-small"]["time"] == "0-12:00:00"
+        assert cfg.hpc_presets["cpu-small"]["enable_hyper_threading"] is False
 
     def test_password_env_used_when_global_account_missing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None

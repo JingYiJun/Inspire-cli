@@ -44,6 +44,11 @@ JOB_ID_PATTERN = re.compile(
     r"^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 JOB_ID_EXPECTED_LENGTH = 40  # "job-" (4) + UUID with hyphens (36)
+HPC_JOB_ID_PATTERN = re.compile(
+    r"^hpc-job-[0-9a-fx]{8}-[0-9a-fx]{4}-[0-9a-fx]{4}-[0-9a-fx]{4}-[0-9a-fx]{12}$",
+    re.IGNORECASE,
+)
+HPC_JOB_ID_EXPECTED_LENGTH = 44  # "hpc-job-" (8) + UUID with hyphens (36)
 
 
 def _validate_job_id_format(job_id: str) -> Optional[str]:
@@ -71,3 +76,29 @@ def _validate_job_id_format(job_id: str) -> Optional[str]:
         return f"Job ID is too long (got {actual_len} chars, expected {JOB_ID_EXPECTED_LENGTH})"
     else:
         return "Job ID format is invalid. Expected format: job-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+
+def _validate_hpc_job_id_format(job_id: str) -> Optional[str]:
+    """Validate HPC job ID format and return a helpful message if invalid."""
+    if not job_id:
+        return "Job ID cannot be empty"
+
+    if not job_id.startswith("hpc-job-"):
+        return f"Job ID should start with 'hpc-job-', got: {job_id[:20]}..."
+
+    if HPC_JOB_ID_PATTERN.match(job_id):
+        return None
+
+    actual_len = len(job_id)
+    if actual_len < HPC_JOB_ID_EXPECTED_LENGTH:
+        missing = HPC_JOB_ID_EXPECTED_LENGTH - actual_len
+        return (
+            f"Job ID appears to be truncated (got {actual_len} chars, expected "
+            f"{HPC_JOB_ID_EXPECTED_LENGTH}). Missing {missing} character(s). "
+            "Did you copy the full ID?"
+        )
+    if actual_len > HPC_JOB_ID_EXPECTED_LENGTH:
+        return f"Job ID is too long (got {actual_len} chars, expected {HPC_JOB_ID_EXPECTED_LENGTH})"
+    return (
+        "Job ID format is invalid. Expected format: " "hpc-job-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    )

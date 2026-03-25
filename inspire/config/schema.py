@@ -26,6 +26,7 @@ from inspire.config.options.project import (
     SYNC_OPTIONS,
     WORKSPACES_OPTIONS,
 )
+from inspire.config.options.hpc import HPC_OPTIONS
 
 # All configuration options organized by category.
 CONFIG_OPTIONS: list[ConfigOption] = [
@@ -39,6 +40,7 @@ CONFIG_OPTIONS: list[ConfigOption] = [
     *BRIDGE_OPTIONS,
     *WORKSPACES_OPTIONS,
     *JOB_OPTIONS,
+    *HPC_OPTIONS,
     *NOTEBOOK_OPTIONS,
     *SSH_OPTIONS,
     *TUNNEL_OPTIONS,

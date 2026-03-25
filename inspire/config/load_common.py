@@ -62,6 +62,14 @@ _DEFAULTS_FIELD_MAP = {
     "project_order": "project_order",
 }
 
+_HPC_FIELD_MAP = {
+    "image": "hpc_image",
+    "image_type": "hpc_image_type",
+    "priority": "hpc_priority",
+    "ttl_after_finish_seconds": "hpc_ttl_after_finish_seconds",
+    "default_preset": "hpc_default_preset",
+}
+
 _CONTEXT_WORKSPACE_FIELD_MAP = {
     "workspace": "job_workspace_id",
     "workspace_cpu": "workspace_cpu_id",
@@ -122,6 +130,7 @@ def _default_config_values() -> dict[str, Any]:
         "workspace_cpu_id": None,
         "workspace_gpu_id": None,
         "workspace_internet_id": None,
+        "workspace_hpc_id": None,
         "workspaces": {},
         "projects": {},
         "project_catalog": {},
@@ -133,6 +142,12 @@ def _default_config_values() -> dict[str, Any]:
         "notebook_resource": "1xH200",
         "notebook_image": None,
         "notebook_post_start": None,
+        "hpc_image": None,
+        "hpc_image_type": "SOURCE_PUBLIC",
+        "hpc_priority": 4,
+        "hpc_ttl_after_finish_seconds": 600,
+        "hpc_default_preset": None,
+        "hpc_presets": {},
         "rtunnel_bin": None,
         "sshd_deb_dir": None,
         "dropbear_deb_dir": None,
@@ -170,6 +185,33 @@ def _apply_defaults_overrides(
         except (ValueError, TypeError):
             continue
         config_dict[field_name] = coerced
+        sources[field_name] = source_name
+
+
+def _apply_hpc_config(
+    *,
+    raw_hpc: Any,
+    config_dict: dict[str, Any],
+    sources: dict[str, str],
+    source_name: str,
+) -> None:
+    if not isinstance(raw_hpc, dict):
+        return
+
+    for key, field_name in _HPC_FIELD_MAP.items():
+        if key not in raw_hpc:
+            continue
+        value = raw_hpc.get(key)
+        if value in (None, ""):
+            continue
+        if field_name in {"hpc_priority", "hpc_ttl_after_finish_seconds"}:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(value, str):
+            value = value.strip()
+        config_dict[field_name] = value
         sources[field_name] = source_name
 
 

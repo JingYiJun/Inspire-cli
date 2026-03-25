@@ -21,6 +21,7 @@ from inspire.cli.context import (
 )
 from inspire.cli.commands import (
     job,
+    hpc,
     resources,
     config,
     sync,
@@ -72,6 +73,7 @@ def main(ctx: Context, json_output: bool, debug: bool) -> None:
     \b
     Examples:
         inspire job create --name "pr-123" --resource "4xH200" --command "bash train.sh"
+        inspire hpc create --name "cpu-demo" --preset cpu-small --command "python main.py"
         inspire job status job-abc-123
         inspire job logs job-abc-123 --tail 100
         inspire resources list
@@ -87,6 +89,7 @@ def main(ctx: Context, json_output: bool, debug: bool) -> None:
 
 # Register command groups
 main.add_command(job)
+main.add_command(hpc)
 main.add_command(resources)
 main.add_command(config)
 main.add_command(sync)

@@ -34,5 +34,17 @@ class APIEndpoints:
         return f"{self._openapi_prefix}/train_job/stop"
 
     @property
+    def HPC_JOB_CREATE(self) -> str:
+        return f"{self._openapi_prefix}/hpc_jobs/create"
+
+    @property
+    def HPC_JOB_DETAIL(self) -> str:
+        return f"{self._openapi_prefix}/hpc_jobs/detail"
+
+    @property
+    def HPC_JOB_STOP(self) -> str:
+        return f"{self._openapi_prefix}/hpc_jobs/stop"
+
+    @property
     def CLUSTER_NODES_LIST(self) -> str:
         return f"{self._openapi_prefix}/cluster_nodes/list"

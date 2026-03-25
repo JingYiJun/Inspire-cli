@@ -12,6 +12,7 @@ from inspire.config.workspaces import select_workspace_id
 WS_CPU = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
 WS_GPU = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
 WS_INET = "ws-6040202d-b785-4b37-98b0-c68d65dd52ce"
+WS_HPC = "ws-11111111-1111-1111-1111-111111111111"
 WS_SPECIAL = "ws-22222222-2222-2222-2222-222222222222"
 
 
@@ -55,6 +56,11 @@ def test_explicit_workspace_name_uses_workspaces_map() -> None:
     assert select_workspace_id(cfg, explicit_workspace_name="special") == WS_SPECIAL
 
 
+def test_explicit_workspace_name_hpc_prefers_hpc_workspace() -> None:
+    cfg = _cfg(workspace_cpu_id=WS_CPU, workspace_hpc_id=WS_HPC)
+    assert select_workspace_id(cfg, explicit_workspace_name="hpc", cpu_only=True) == WS_HPC
+
+
 def test_placeholder_workspace_id_is_rejected() -> None:
     cfg = _cfg(workspace_cpu_id="ws-00000000-0000-0000-0000-000000000000")
     with pytest.raises(ConfigError, match="placeholder"):
@@ -74,6 +80,7 @@ def test_config_loads_workspaces_from_project_toml(
 cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
 gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
 internet = "ws-6040202d-b785-4b37-98b0-c68d65dd52ce"
+hpc = "ws-11111111-1111-1111-1111-111111111111"
 special = "ws-22222222-2222-2222-2222-222222222222"
 """.lstrip(),
         encoding="utf-8",
@@ -90,4 +97,5 @@ special = "ws-22222222-2222-2222-2222-222222222222"
     assert cfg.workspace_cpu_id == WS_CPU
     assert cfg.workspace_gpu_id == WS_GPU
     assert cfg.workspace_internet_id == WS_INET
+    assert cfg.workspace_hpc_id == WS_HPC
     assert cfg.workspaces.get("special") == WS_SPECIAL

@@ -17,8 +17,10 @@ from .load_accounts import _parse_global_accounts
 from .load_common import (
     _ProjectLayerState,
     _apply_defaults_overrides,
+    _apply_hpc_config,
     _parse_alias_map,
 )
+from inspire.config.hpc_presets import merge_hpc_presets, normalize_hpc_presets
 
 
 def _apply_global_layer(
@@ -44,6 +46,7 @@ def _apply_global_layer(
     raw_global_defaults = global_raw.pop("defaults", {})
     if isinstance(raw_global_defaults, dict):
         global_defaults = raw_global_defaults
+    raw_global_hpc = global_raw.get("hpc") or {}
 
     global_workspaces: dict[str, str] = {}
     raw_workspaces = global_raw.get("workspaces") or {}
@@ -69,6 +72,17 @@ def _apply_global_layer(
     if global_accounts:
         config_dict["accounts"] = global_accounts
         sources["accounts"] = SOURCE_GLOBAL
+
+    _apply_hpc_config(
+        raw_hpc=raw_global_hpc,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_GLOBAL,
+    )
+    global_hpc_presets = normalize_hpc_presets((raw_global_hpc or {}).get("presets"))
+    if global_hpc_presets:
+        config_dict["hpc_presets"] = global_hpc_presets
+        sources["hpc_presets"] = SOURCE_GLOBAL
 
     _apply_defaults_overrides(
         defaults=global_defaults,
@@ -114,6 +128,7 @@ def _apply_project_layer(
     raw_defaults = project_raw.pop("defaults", {})
     if isinstance(raw_defaults, dict):
         layer_state.project_defaults = raw_defaults
+    raw_hpc = project_raw.get("hpc") or {}
     raw_context = project_raw.pop("context", {})
     if isinstance(raw_context, dict):
         layer_state.project_context = raw_context
@@ -154,6 +169,20 @@ def _apply_project_layer(
         merged_accounts.update(project_accounts)
         config_dict["accounts"] = merged_accounts
         sources["accounts"] = SOURCE_PROJECT
+
+    _apply_hpc_config(
+        raw_hpc=raw_hpc,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_PROJECT,
+    )
+    project_hpc_presets = normalize_hpc_presets((raw_hpc or {}).get("presets"))
+    if project_hpc_presets:
+        config_dict["hpc_presets"] = merge_hpc_presets(
+            config_dict.get("hpc_presets", {}),
+            project_hpc_presets,
+        )
+        sources["hpc_presets"] = SOURCE_PROJECT
 
     return layer_state
 

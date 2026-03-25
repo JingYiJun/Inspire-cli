@@ -11,6 +11,7 @@ from inspire.cli.commands.notebook import notebook
 from inspire.cli.commands.init import init
 from inspire.cli.commands.image import image
 from inspire.cli.commands.project import project
+from inspire.cli.commands.hpc import hpc
 
 __all__ = [
     "job",
@@ -24,4 +25,5 @@ __all__ = [
     "init",
     "image",
     "project",
+    "hpc",
 ]

@@ -30,6 +30,9 @@ from inspire.platform.openapi.http import make_request_with_retry as _make_reque
 from inspire.platform.openapi.jobs import create_training_job_smart as _create_training_job_smart
 from inspire.platform.openapi.jobs import get_job_detail as _get_job_detail
 from inspire.platform.openapi.jobs import stop_training_job as _stop_training_job
+from inspire.platform.openapi.hpc_jobs import create_hpc_job as _create_hpc_job
+from inspire.platform.openapi.hpc_jobs import get_hpc_job_detail as _get_hpc_job_detail
+from inspire.platform.openapi.hpc_jobs import stop_hpc_job as _stop_hpc_job
 from inspire.platform.openapi.nodes import list_cluster_nodes as _list_cluster_nodes
 from inspire.platform.openapi.endpoints import APIEndpoints
 from inspire.platform.openapi.errors import (
@@ -202,6 +205,15 @@ class InspireAPI:
 
     def stop_training_job(self, job_id: str) -> bool:
         return _stop_training_job(self, job_id)
+
+    def create_hpc_job(self, **kwargs) -> Dict[str, Any]:  # noqa: ANN003
+        return _create_hpc_job(self, **kwargs)
+
+    def get_hpc_job_detail(self, job_id: str) -> Dict[str, Any]:
+        return _get_hpc_job_detail(self, job_id)
+
+    def stop_hpc_job(self, job_id: str) -> bool:
+        return _stop_hpc_job(self, job_id)
 
     def list_cluster_nodes(
         self, page_num: int = 1, page_size: int = 10, resource_pool: Optional[str] = None

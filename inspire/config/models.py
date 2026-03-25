@@ -37,7 +37,9 @@ class Config:
     base_url: str = "https://api.example.com"
     target_dir: Optional[str] = None  # INSPIRE_TARGET_DIR - unified for bridge/job operations
     sync_source_dir: Optional[str] = None  # Deprecated: sync always uses current directory
-    sync_bridge: Optional[str] = None  # Saved bridge for rsync sync; sync ignores env-sourced values
+    sync_bridge: Optional[str] = (
+        None  # Saved bridge for rsync sync; sync ignores env-sourced values
+    )
     log_pattern: str = "training_master_*.log"
     job_cache_path: str = "~/.inspire/jobs.json"
 
@@ -92,6 +94,7 @@ class Config:
     workspace_cpu_id: Optional[str] = None
     workspace_gpu_id: Optional[str] = None
     workspace_internet_id: Optional[str] = None
+    workspace_hpc_id: Optional[str] = None
 
     # Full workspace map loaded from TOML [workspaces]
     workspaces: dict[str, str] = field(default_factory=dict)
@@ -118,6 +121,14 @@ class Config:
     notebook_resource: str = "1xH200"
     notebook_image: Optional[str] = None
     notebook_post_start: Optional[str] = None
+
+    # HPC settings
+    hpc_image: Optional[str] = None
+    hpc_image_type: str = "SOURCE_PUBLIC"
+    hpc_priority: int = 4
+    hpc_ttl_after_finish_seconds: int = 600
+    hpc_default_preset: Optional[str] = None
+    hpc_presets: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # SSH settings
     rtunnel_bin: Optional[str] = None

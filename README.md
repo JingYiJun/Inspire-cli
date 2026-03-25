@@ -47,6 +47,7 @@ inspire config check   # Validate API auth
 inspire resources list          # View GPU availability
 inspire notebook create --name dev --resource 4xCPU --wait
 inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
+inspire hpc create --name cpu-demo --preset cpu-small --command "python main.py"
 ```
 
 ## Commands
@@ -56,12 +57,14 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 | `inspire job create` | Submit a training job |
 | `inspire job status/logs/list` | Monitor and manage jobs |
 | `inspire job stop/wait` | Stop or wait for a job |
+| `inspire hpc create/status/list` | Create and inspect HPC jobs |
+| `inspire hpc stop/wait/script` | Stop, wait for, or inspect cached sbatch scripts |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
 | `inspire sync` | Rsync local code to shared filesystem (via SSH tunnel) |
 | `inspire bridge exec "<cmd>"` | Run command on a Bridge profile via SSH tunnel |
 | `inspire bridge ssh [--bridge <name>]` | Interactive SSH shell to a Bridge profile |
 | `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
-| `inspire notebook list/create` | List or create notebook instances |
+| `inspire notebook list/create/status` | List, create, or inspect notebook instances |
 | `inspire notebook start/stop` | Start or stop a notebook |
 | `inspire notebook ssh <id>` | SSH into notebook (sets up tunnel) |
 | `inspire notebook top` | Show GPU utilization/memory for tunnel-backed notebooks |
@@ -81,6 +84,12 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 # Submit a training job
 inspire job create --name "train-v1" --resource "4xH200" --command "bash train.sh"
 
+# Submit an HPC (CPU/slurm) job from a preset
+inspire hpc create --name "gromacs-demo" --preset cpu-small --command "python main.py"
+
+# Use a full sbatch script from file
+inspire hpc create --name "ffmpeg-batch" --preset cpu-small --script-file ./job.sbatch
+
 # Quick run with auto-selected resources, sync code and follow logs
 inspire run "python train.py --epochs 100" --sync --watch
 
@@ -95,6 +104,10 @@ ssh mybridge
 inspire notebook top
 inspire notebook top --bridge mybridge --watch
 
+# Browse workspace-aware image sources
+inspire image list --source personal-visible
+inspire image detail my-image --workspace gpu
+
 # Copy files through a configured bridge profile
 inspire bridge scp ./model.py /tmp/model.py --bridge mybridge
 inspire bridge scp -d /tmp/checkpoints/ ./checkpoints/ -r --bridge mybridge
@@ -103,6 +116,23 @@ inspire bridge scp -d /tmp/checkpoints/ ./checkpoints/ -r --bridge mybridge
 inspire resources list
 inspire project list
 ```
+
+## Recent CLI Notes
+
+- Human-readable list commands prefer Rich tables when Rich is available and fall back to plain text otherwise.
+- `inspire notebook list` now shows separate CPU, GPU, and Memory columns instead of one packed resource string.
+- `inspire notebook status` renders a more readable detail view and normalizes `created_at` from ISO strings or Unix timestamps (including milliseconds) into a UTC+8 display while keeping the raw value.
+- Notebook compute-group auto-selection is workspace-scoped. Availability is evaluated inside the selected workspace, not across unrelated workspaces.
+- `inspire image detail` is workspace-aware and can resolve a full ID, partial ID, image name, or full URL. When multiple workspaces match, the CLI may ask you to choose.
+- `inspire image list --source personal-visible` matches the web UI's personal visible tab.
+- `inspire resources list` now emphasizes grouped human-readable summaries and schedulable resource-spec visibility.
+
+## HPC Notes
+
+- `inspire hpc` is intended for CPU/slurm-style workloads, not regular GPU training jobs.
+- Submit HPC jobs to CPU/HPC workspaces or partitions, preferably via config-backed presets.
+- HPC images must include slurm (for example `slurm-gromacs:*` or another slurm-enabled image).
+- The HPC `entrypoint` is an sbatch script body. The generated/default script keeps required `#SBATCH` lines and must launch the workload with `srun`.
 
 ## SSH/SCP Reliability Notes
 
@@ -171,7 +201,25 @@ action_timeout = 600
 # cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)
 # gpu = "ws-..."       # GPU workspace (H100/H200 jobs)
 # internet = "ws-..."  # Internet-enabled GPU workspace (e.g. RTX 4090)
+# hpc = "ws-..."       # HPC workspace for slurm CPU jobs
 # special = "ws-..."   # Custom alias (use with --workspace special)
+
+[hpc]
+# image = "docker.sii.shaipower.online/inspire-studio/slurm-gromacs:latest"
+# image_type = "SOURCE_PUBLIC"
+# priority = 4
+# ttl_after_finish_seconds = 600
+# default_preset = "cpu-small"
+
+[hpc.presets.cpu-small]
+# workspace = "hpc"
+# logic_compute_group_id = "lcg-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# spec_id = "quota-xxxxxxxx"
+# number_of_tasks = 1
+# cpus_per_task = 4
+# memory_per_cpu = "4G"
+# time = "0-12:00:00"
+# enable_hyper_threading = false
 
 [[compute_groups]]
 name = "H100 Cluster"
@@ -209,9 +257,15 @@ inspire init --json --template --project --force
 | `INSPIRE_WORKSPACE_CPU_ID` | CPU workspace ID (default workspace) |
 | `INSPIRE_WORKSPACE_GPU_ID` | GPU workspace ID (H100/H200) |
 | `INSPIRE_WORKSPACE_INTERNET_ID` | Internet-enabled workspace ID (e.g. RTX 4090) |
+| `INSPIRE_WORKSPACE_HPC_ID` | HPC workspace ID for slurm CPU jobs |
 | `INSPIRE_PROJECT_ID` | Default project ID |
 | `INSP_IMAGE` | Default Docker image |
 | `INSP_PRIORITY` | Job priority (1-10) |
+| `INSPIRE_HPC_IMAGE` | Default HPC image (must include slurm) |
+| `INSPIRE_HPC_IMAGE_TYPE` | Default HPC image source type |
+| `INSPIRE_HPC_PRIORITY` | Default HPC priority |
+| `INSPIRE_HPC_TTL_AFTER_FINISH_SECONDS` | Default HPC post-finish retention time |
+| `INSPIRE_HPC_DEFAULT_PRESET` | Default HPC preset name |
 
 Note: `inspire sync` does not read `INSPIRE_TARGET_DIR` from the environment.
 For sync, pass `bridge` and `target_dir` on the first run, then reuse the
