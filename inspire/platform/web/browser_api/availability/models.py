@@ -19,6 +19,8 @@ class GPUAvailability:
     free_nodes: int = 0
     gpu_per_node: int = 0
     selection_source: str = "aggregate"
+    workspace_id: str = ""
+    workspace_name: str = ""
 
 
 @dataclass

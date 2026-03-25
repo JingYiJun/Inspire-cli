@@ -26,6 +26,7 @@ from inspire.cli.utils.auth import AuthenticationError
 from inspire.config import ConfigError
 from inspire.cli.utils.job_cache import JobCache
 from inspire.platform.openapi import ResourceManager
+from inspire.cli.commands.resources import resources_list as resources_list_module
 
 # Valid test job IDs (must match the format: job-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
 TEST_JOB_ID = "job-12345678-1234-1234-1234-123456789abc"
@@ -176,12 +177,19 @@ def patch_config_and_auth(
     # Mock browser API calls for project selection
     class FakeWebSession:
         workspace_id = "ws-test-workspace"
+        all_workspace_ids = None
+        all_workspace_names = {}
         storage_state = {}
 
     monkeypatch.setattr(
         web_session_module,
         "get_web_session",
-        lambda: FakeWebSession(),
+        lambda *args, **kwargs: FakeWebSession(),
+    )
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeWebSession(),
     )
 
     test_project = browser_api_module.ProjectInfo(
@@ -222,7 +230,7 @@ def test_global_json_flag_with_resources_list(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setattr(
         browser_api_module,
         "get_accurate_gpu_availability",
-        lambda: [
+        lambda workspace_id=None, session=None, _retry=True: [  # noqa: ARG005
             browser_api_module.GPUAvailability(
                 group_id=test_group_id,
                 group_name="H200 TestRoom",
@@ -252,12 +260,616 @@ def test_global_debug_flag_runs_subcommand(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setattr(
         browser_api_module,
         "get_accurate_gpu_availability",
-        lambda: [],
+        lambda workspace_id=None, session=None, _retry=True: [],  # noqa: ARG005
     )
     runner = CliRunner()
 
     result = runner.invoke(cli_main, ["--debug", "resources", "list"])
     assert result.exit_code == 0
+
+
+def test_resources_list_human_output_uses_readable_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    from inspire.platform.web import browser_api as browser_api_module
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_cpu_id = "ws-cpu"
+    config.workspace_gpu_id = "ws-gpu"
+    config.workspace_internet_id = "ws-net"
+    config.job_workspace_id = "ws-gpu"
+    config.workspaces = {
+        "cpu": "ws-cpu",
+        "gpu": "ws-gpu",
+        "internet": "ws-net",
+        "ascend": "ws-ascend",
+        "hpc": "ws-hpc",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-ascend"
+        all_workspace_ids = None
+        all_workspace_names = {
+            "ws-cpu": "CPU资源空间",
+            "ws-gpu": "分布式训练空间",
+            "ws-net": "可上网GPU资源",
+            "ws-ascend": "CI-情境智能-国产卡-ssd3",
+            "ws-hpc": "高性能计算",
+        }
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession())
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    def fake_get_accurate_gpu_availability(workspace_id=None, session=None, _retry=True):  # noqa: ARG001
+        ws_id = str(workspace_id)
+        if ws_id == "ws-gpu":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-h200",
+                    group_name="H200-1号机房",
+                    gpu_type="NVIDIA H200 (141GB)",
+                    total_gpus=8,
+                    used_gpus=10,
+                    available_gpus=-2,
+                    low_priority_gpus=1,
+                )
+            ]
+        if ws_id == "ws-net":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-4090",
+                    group_name="4090",
+                    gpu_type="NVIDIA 4090 (48GB)",
+                    total_gpus=8,
+                    used_gpus=2,
+                    available_gpus=6,
+                    low_priority_gpus=0,
+                )
+            ]
+        if ws_id == "ws-cpu":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-cpu",
+                    group_name="CPU资源",
+                    gpu_type="CPU",
+                    total_gpus=0,
+                    used_gpus=0,
+                    available_gpus=0,
+                    low_priority_gpus=0,
+                )
+            ]
+        if ws_id == "ws-hpc":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-hpc",
+                    group_name="高性能计算",
+                    gpu_type="CPU",
+                    total_gpus=0,
+                    used_gpus=0,
+                    available_gpus=0,
+                    low_priority_gpus=0,
+                )
+            ]
+        if ws_id == "ws-ascend":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-ascend",
+                    group_name="推理池",
+                    gpu_type="ASCEND 910B (64GB)",
+                    total_gpus=64,
+                    used_gpus=32,
+                    available_gpus=32,
+                    low_priority_gpus=0,
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        fake_get_accurate_gpu_availability,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["resources", "list", "--all"])
+    assert result.exit_code == 0
+    assert "GPU Resources" in result.output
+    assert "CPU Resources" in result.output
+    assert "ASCEND Resources" in result.output
+    assert "Resource Type" in result.output
+    assert "H200-1号机房" in result.output
+    assert "高性能计算" in result.output
+    assert "推理池" in result.output
+    assert "Available" in result.output
+    assert "平台接口返回的统计异常或短暂超卖" in result.output
+
+
+def test_resources_list_cpu_summary_uses_workspace_nodes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_cpu_id = "ws-cpu"
+    config.workspaces = {
+        "cpu": "ws-cpu",
+        "hpc": "ws-hpc",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-cpu"
+        all_workspace_ids = None
+        all_workspace_names = {
+            "ws-cpu": "CPU资源空间",
+            "ws-hpc": "高性能计算",
+        }
+        storage_state = {"cookies": [{"name": "a", "value": "b"}]}
+        cookies = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession())
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        lambda workspace_id=None, session=None, _retry=True: [],  # noqa: ARG005
+    )
+
+    def fake_fetch_workspace_availability(session, *, base_url, workspace_id):  # noqa: ARG001
+        if workspace_id == "ws-cpu":
+            return [
+                {
+                    "logic_compute_group_id": "lcg-cpu",
+                    "logic_compute_group_name": "CPU资源",
+                    "cpu_count": 64,
+                    "task_list": [],
+                    "cordon_type": "",
+                    "is_maint": False,
+                    "resource_pool": "online",
+                },
+                {
+                    "logic_compute_group_id": "lcg-cpu",
+                    "logic_compute_group_name": "CPU资源",
+                    "cpu_count": 64,
+                    "task_list": [{"job_id": "job-1"}],
+                    "cordon_type": "",
+                    "is_maint": False,
+                    "resource_pool": "online",
+                },
+            ]
+        if workspace_id == "ws-hpc":
+            return [
+                {
+                    "logic_compute_group_id": "lcg-hpc",
+                    "logic_compute_group_name": "高性能计算",
+                    "cpu_count": 56,
+                    "task_list": [],
+                    "cordon_type": "",
+                    "is_maint": False,
+                    "resource_pool": "online",
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(
+        resources_list_module,
+        "fetch_workspace_availability",
+        fake_fetch_workspace_availability,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["resources", "list", "--all"])
+    assert result.exit_code == 0
+    assert "CPU Resources" in result.output
+    assert "CPU资源" in result.output
+    assert "高性能计算" in result.output
+    assert "64" in result.output
+    assert "56" in result.output
+
+
+def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_gpu_id = "ws-gpu"
+    config.workspace_internet_id = "ws-net"
+    config.workspaces = {
+        "gpu": "ws-gpu",
+        "internet": "ws-net",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-net"
+        all_workspace_ids = None
+        all_workspace_names = {
+            "ws-gpu": "分布式训练空间",
+            "ws-net": "可上网GPU资源",
+        }
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession())
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        resources_list_module,
+        "fetch_workspace_availability",
+        lambda *args, **kwargs: [],
+    )
+
+    def fake_get_accurate_gpu_availability(workspace_id=None, session=None, _retry=True):  # noqa: ARG001
+        if workspace_id == "ws-net":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-unknown",
+                    group_name="4090-cuda12.4",
+                    gpu_type="",
+                    total_gpus=0,
+                    used_gpus=0,
+                    available_gpus=0,
+                    low_priority_gpus=0,
+                ),
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-4090",
+                    group_name="4090",
+                    gpu_type="NVIDIA 4090 (48GB)",
+                    total_gpus=8,
+                    used_gpus=8,
+                    available_gpus=0,
+                    low_priority_gpus=0,
+                ),
+            ]
+        return []
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        fake_get_accurate_gpu_availability,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["resources", "list", "--all"])
+    assert result.exit_code == 0
+    assert result.output.index("4090") < result.output.index("4090-cuda12.4")
+
+
+def test_resources_list_queries_configured_workspaces_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_cpu_id = "ws-cpu"
+    config.workspace_gpu_id = "ws-gpu"
+    config.workspace_internet_id = "ws-net"
+    config.workspaces = {
+        "cpu": "ws-cpu",
+        "gpu": "ws-gpu",
+        "internet": "ws-net",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-other"
+        all_workspace_ids = ["ws-other", "ws-extra"]
+        all_workspace_names = {
+            "ws-cpu": "CPU空间",
+            "ws-gpu": "GPU空间",
+            "ws-net": "公网GPU",
+            "ws-other": "其他空间",
+            "ws-extra": "额外空间",
+        }
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession())
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    calls: list[str | None] = []
+
+    def fake_get_accurate_gpu_availability(
+        workspace_id=None, session=None, _retry=True  # noqa: ARG001
+    ):
+        calls.append(workspace_id)
+        ws_id = str(workspace_id)
+        return [
+            browser_api_module.GPUAvailability(
+                group_id=f"lcg-{ws_id}",
+                group_name=f"group-{ws_id}",
+                gpu_type="NVIDIA H200",
+                total_gpus=8,
+                used_gpus=0,
+                available_gpus=8,
+                low_priority_gpus=0,
+            )
+        ]
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        fake_get_accurate_gpu_availability,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "resources", "list", "--all"])
+    assert result.exit_code == 0
+    assert calls == [
+        "ws-cpu",
+        "ws-gpu",
+        "ws-net",
+        "ws-11111111-1111-1111-1111-111111111111",
+        "ws-other",
+    ]
+
+    payload = json.loads(result.output)
+    availability = payload["data"]["availability"]
+    assert [item["workspace_id"] for item in availability] == calls
+
+
+def test_resources_list_all_workspaces_includes_discovered_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_cpu_id = "ws-cpu"
+    config.workspace_gpu_id = "ws-gpu"
+    config.workspaces = {
+        "cpu": "ws-cpu",
+        "gpu": "ws-gpu",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-other"
+        all_workspace_ids = ["ws-other", "ws-extra", "ws-gpu"]
+        all_workspace_names = {}
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession())
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    calls: list[str | None] = []
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        lambda workspace_id=None, session=None, _retry=True: (  # noqa: ARG005
+            calls.append(workspace_id)
+            or [
+                browser_api_module.GPUAvailability(
+                    group_id=f"lcg-{workspace_id}",
+                    group_name=f"group-{workspace_id}",
+                    gpu_type="NVIDIA H200",
+                    total_gpus=8,
+                    used_gpus=0,
+                    available_gpus=8,
+                    low_priority_gpus=0,
+                )
+            ]
+        ),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "resources", "list", "--all", "--all-workspaces"])
+    assert result.exit_code == 0
+    assert calls == [
+        "ws-cpu",
+        "ws-gpu",
+        "ws-11111111-1111-1111-1111-111111111111",
+        "ws-other",
+        "ws-extra",
+    ]
+
+
+def test_resources_list_prints_schedulable_specs_with_downward_bucketing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_cpu_id = "ws-cpu"
+    config.workspace_gpu_id = "ws-gpu"
+    config.workspaces = {
+        "cpu": "ws-cpu",
+        "gpu": "ws-gpu",
+        "ascend": "ws-ascend",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-gpu"
+        all_workspace_ids = None
+        all_workspace_names = {
+            "ws-cpu": "CPU空间",
+            "ws-gpu": "GPU空间",
+            "ws-ascend": "昇腾空间",
+        }
+        storage_state = {"cookies": [{"name": "a", "value": "b"}]}
+        cookies = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession())
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    def fake_get_accurate_gpu_availability(workspace_id=None, session=None, _retry=True):  # noqa: ARG001
+        if workspace_id == "ws-gpu":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-gpu",
+                    group_name="H200资源",
+                    gpu_type="NVIDIA H200 (141GB)",
+                    total_gpus=16,
+                    used_gpus=8,
+                    available_gpus=8,
+                    low_priority_gpus=0,
+                )
+            ]
+        if workspace_id == "ws-ascend":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-ascend",
+                    group_name="910B资源",
+                    gpu_type="ASCEND 910B (64GB)",
+                    total_gpus=16,
+                    used_gpus=4,
+                    available_gpus=12,
+                    low_priority_gpus=0,
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        fake_get_accurate_gpu_availability,
+    )
+
+    def fake_fetch_workspace_availability(session, *, base_url, workspace_id):  # noqa: ARG001
+        if workspace_id == "ws-cpu":
+            return [
+                {
+                    "logic_compute_group_id": "lcg-cpu",
+                    "logic_compute_group_name": "CPU资源",
+                    "cpu_count": 64,
+                    "task_list": [],
+                    "cordon_type": "",
+                    "is_maint": False,
+                    "resource_pool": "online",
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(
+        resources_list_module,
+        "fetch_workspace_availability",
+        fake_fetch_workspace_availability,
+    )
+
+    def fake_get_resource_prices(workspace_id=None, logic_compute_group_id="", session=None):  # noqa: ARG001
+        if workspace_id == "ws-gpu" and logic_compute_group_id == "lcg-gpu":
+            return [
+                {"gpu_count": 8},
+                {"gpu_count": 4},
+                {"gpu_count": 2},
+                {"gpu_count": 1},
+            ]
+        if workspace_id == "ws-ascend" and logic_compute_group_id == "lcg-ascend":
+            return [
+                {"gpu_count": 8},
+                {"gpu_count": 4},
+                {"gpu_count": 2},
+                {"gpu_count": 1},
+            ]
+        return []
+
+    monkeypatch.setattr(browser_api_module, "get_resource_prices", fake_get_resource_prices)
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_notebook_schedule",
+        lambda workspace_id=None, session=None: {  # noqa: ARG005
+            "quota": [
+                {"gpu_count": 0, "cpu_count": 55},
+                {"gpu_count": 0, "cpu_count": 20},
+            ]
+        },
+    )
+
+    def fake_request_json(session, method, url, *, headers=None, body=None, timeout=30, _retry_count=0):  # noqa: ARG001
+        assert method == "POST"
+        assert body is not None
+        ws_id = body["filter"]["workspace_id"]
+        group_id = body["filter"]["logic_compute_group_id"]
+
+        if ws_id == "ws-gpu" and group_id == "lcg-gpu":
+            return {
+                "code": 0,
+                "data": {
+                    "node_dimensions": [
+                        {
+                            "status": "Ready",
+                            "cordon_type": "",
+                            "resource_pool": "online",
+                            "gpu": {"available": 6, "total": 8},
+                        },
+                        {
+                            "status": "Ready",
+                            "cordon_type": "",
+                            "resource_pool": "online",
+                            "gpu": {"available": 2, "total": 8},
+                        },
+                    ]
+                },
+            }
+        if ws_id == "ws-ascend" and group_id == "lcg-ascend":
+            return {
+                "code": 0,
+                "data": {
+                    "node_dimensions": [
+                        {
+                            "status": "Ready",
+                            "cordon_type": "",
+                            "resource_pool": "online",
+                            "gpu": {"available": 12, "total": 16},
+                        }
+                    ]
+                },
+            }
+        if ws_id == "ws-cpu" and group_id == "lcg-cpu":
+            return {
+                "code": 0,
+                "data": {
+                    "node_dimensions": [
+                        {
+                            "status": "Ready",
+                            "cordon_type": "",
+                            "resource_pool": "online",
+                            "cpu": {"available": 58, "total": 64},
+                        },
+                        {
+                            "status": "Ready",
+                            "cordon_type": "",
+                            "resource_pool": "online",
+                            "cpu": {"available": 23, "total": 64},
+                        },
+                        {
+                            "status": "SchedulingDisabled",
+                            "cordon_type": "machine-migration",
+                            "resource_pool": "online",
+                            "cpu": {"available": 64, "total": 64},
+                        },
+                    ]
+                },
+            }
+        return {"code": 0, "data": {"node_dimensions": []}}
+
+    monkeypatch.setattr(resources_list_module, "request_json", fake_request_json)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["resources", "list", "--all"])
+
+    assert result.exit_code == 0
+    assert "Schedulable Specs" in result.output
+    assert "4卡×1" in result.output
+    assert "2卡×1" in result.output
+    assert "55核×1" in result.output
+    assert "20核×1" in result.output
+    assert "8卡×1" in result.output
 
 
 def test_job_help_smoke(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

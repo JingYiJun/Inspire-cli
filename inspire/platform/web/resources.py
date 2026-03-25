@@ -39,6 +39,8 @@ class ComputeGroupAvailability:
     online_nodes: int = 0  # resource_pool == "online"
     backup_nodes: int = 0  # resource_pool == "backup"
     fault_nodes: int = 0  # resource_pool == "fault"
+    workspace_id: str = ""
+    workspace_name: str = ""
 
 
 # Known compute groups for smart allocation
