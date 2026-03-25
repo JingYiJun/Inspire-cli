@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime, timedelta, timezone
 
 import click
 
@@ -26,12 +27,67 @@ def _make_console() -> Console | None:
     return Console(width=max(100, terminal_width))
 
 
+def _format_notebook_resource_summary(notebook: dict) -> str:
+    cpu_display, gpu_display, memory_display = _extract_notebook_resource_fields(notebook)
+    parts = [value.strip() for value in (cpu_display, gpu_display, memory_display) if value.strip()]
+    return " · ".join(parts) if parts else "N/A"
+
+
+def _format_notebook_uptime(live_seconds: object) -> str | None:
+    try:
+        seconds = int(live_seconds or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if seconds <= 0:
+        return None
+
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds and not hours:
+        parts.append(f"{seconds}s")
+    return " ".join(parts) or "< 1m"
+
+
+def _notebook_status_style(status: object) -> str:
+    normalized = str(status or "").strip().upper()
+    if normalized in {"RUNNING", "READY"}:
+        return "bold green"
+    if normalized in {"QUEUING", "PENDING", "CREATING", "STARTING", "STARTED"}:
+        return "bold yellow"
+    if normalized in {"STOPPED", "STOPPING"}:
+        return "bold bright_black"
+    if normalized in {"FAILED", "ERROR", "DELETED"}:
+        return "bold red"
+    return "bold white"
+
+
+def _format_notebook_created_at(created_at: object) -> str | None:
+    raw = str(created_at or "").strip()
+    if not raw:
+        return None
+
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        timestamp = datetime.fromisoformat(normalized)
+    except ValueError:
+        return raw
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    local_dt = timestamp.astimezone(timezone(timedelta(hours=8)))
+    human = local_dt.strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    return f"{human} ({raw})"
+
+
 def _print_notebook_detail(notebook: dict) -> None:
     """Print detailed notebook information."""
-    click.echo(f"\n{'='*60}")
-    click.echo(f"Notebook: {notebook.get('name', 'N/A')}")
-    click.echo(f"{'='*60}")
-
     project = notebook.get("project") or {}
     quota = notebook.get("quota") or {}
     compute_group = notebook.get("logic_compute_group") or {}
@@ -49,35 +105,25 @@ def _print_notebook_detail(notebook: dict) -> None:
         spec = notebook.get("resource_spec") or {}
         gpu_type = spec.get("gpu_type", "")
 
-    gpu_count = quota.get("gpu_count", 0)
-    gpu_str = f"{gpu_count}x {gpu_type}" if gpu_type and gpu_count else str(gpu_count or "N/A")
-
     img_name = image.get("name", "")
     img_ver = image.get("version", "")
     img_str = f"{img_name}:{img_ver}" if img_name and img_ver else img_name or "N/A"
-
-    live_seconds = int(notebook.get("live_time") or 0)
-    uptime = ""
-    if live_seconds > 0:
-        hours, rem = divmod(live_seconds, 3600)
-        minutes = rem // 60
-        parts = []
-        if hours:
-            parts.append(f"{hours}h")
-        if minutes:
-            parts.append(f"{minutes}m")
-        uptime = " ".join(parts) or "< 1m"
-
     shm = start_cfg.get("shared_memory_size", 0) or 0
+    uptime = _format_notebook_uptime(notebook.get("live_time"))
+    resource_summary = _format_notebook_resource_summary(notebook)
+    notebook_name = str(notebook.get("name", "N/A"))
+    notebook_id = str(notebook.get("notebook_id") or notebook.get("id") or "N/A")
+    status = str(notebook.get("status") or "Unknown")
 
     fields = [
-        ("ID", notebook.get("notebook_id") or notebook.get("id")),
-        ("Status", notebook.get("status")),
+        ("Name", notebook_name),
+        ("ID", notebook_id),
+        ("Status", status),
+        ("Resource", resource_summary),
         ("Project", project.get("name") or notebook.get("project_name")),
         ("Priority", project.get("priority_name")),
         ("Compute Group", compute_group.get("name")),
         ("Image", img_str),
-        ("GPU", gpu_str),
         ("CPU", quota.get("cpu_count")),
         ("Memory", f"{quota['memory_size']} GiB" if quota.get("memory_size") else None),
         ("SHM", f"{shm} GiB" if shm else None),
@@ -85,13 +131,35 @@ def _print_notebook_detail(notebook: dict) -> None:
         ("Host IP", extra.get("HostIP") or None),
         ("Uptime", uptime or None),
         ("Workspace", workspace.get("name")),
-        ("Created", notebook.get("created_at")),
+        ("Created", _format_notebook_created_at(notebook.get("created_at"))),
     ]
 
+    console = _make_console()
+    if console is not None and Table is not None and box is not None:
+        table = Table(
+            title=f"Notebook Status · {notebook_name}",
+            box=box.SIMPLE_HEAVY,
+            show_header=False,
+            pad_edge=False,
+        )
+        table.add_column("Field", style="bold cyan", no_wrap=True, width=14)
+        table.add_column("Value", style="white")
+
+        for label, value in fields:
+            if not value:
+                continue
+            row_style = _notebook_status_style(value) if label == "Status" else None
+            table.add_row(label, str(value), style=row_style)
+
+        console.print(table)
+        return
+
+    click.echo(f"\n{'='*60}")
+    click.echo(f"Notebook: {notebook_name}")
+    click.echo(f"{'='*60}")
     for label, value in fields:
         if value:
             click.echo(f"  {label:<15}: {value}")
-
     click.echo(f"{'='*60}\n")
 
 

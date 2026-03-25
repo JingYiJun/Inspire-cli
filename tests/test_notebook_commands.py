@@ -156,6 +156,69 @@ def test_format_notebook_resource_omits_gpu_for_cpu_only_notebook() -> None:
     assert _format_notebook_resource(item) == " 55x   220 GB"
 
 
+def test_notebook_status_prints_human_readable_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeSession:
+        workspace_id = "ws-test"
+        storage_state = {}
+
+    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
+    monkeypatch.setattr(notebook_cmd_module, "get_base_url", lambda: "https://example.invalid")
+    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: object())
+    monkeypatch.setattr(
+        notebook_cmd_module,
+        "_resolve_notebook_id",
+        lambda *args, **kwargs: ("notebook-abc-123", None),
+    )
+
+    detail = {
+        "id": "notebook-abc-123",
+        "name": "dev-box",
+        "status": "RUNNING",
+        "created_at": "2026-03-25T10:00:00Z",
+        "live_time": 3720,
+        "project": {"name": "Alpha", "priority_name": "P1"},
+        "logic_compute_group": {"name": "H200 Pool"},
+        "workspace": {"name": "分布式训练空间"},
+        "image": {"name": "pytorch-dev", "version": "v1"},
+        "quota": {"cpu_count": 180, "gpu_count": 8, "memory_size": 500},
+        "resource_spec": {"gpu_type": "H200"},
+        "extra_info": {"NodeName": "node-01", "HostIP": "10.0.0.8"},
+        "start_config": {"shared_memory_size": 128},
+    }
+
+    def fake_request_json(
+        session,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[dict] = None,
+        timeout: int = 30,
+        _retry_count: int = 0,
+    ) -> dict:
+        assert headers == {"Accept": "application/json"}
+        assert body is None
+        assert timeout == 30
+        assert _retry_count >= 0
+        assert session is not None
+        assert method.upper() == "GET"
+        assert url == "https://example.invalid/api/v1/notebook/notebook-abc-123"
+        return {"code": 0, "data": detail}
+
+    monkeypatch.setattr(web_session_module, "request_json", fake_request_json)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["notebook", "status", "dev-box"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert "Notebook Status" in result.output
+    assert "Resource" in result.output
+    assert "180x · 8x H200 · 500 GB" in result.output
+    assert "分布式训练空间" in result.output
+    assert "pytorch-dev:v1" in result.output
+    assert "2026-03-25 18:00:00 UTC+8 (2026-03-25T10:00:00Z)" in result.output
+
+
 def test_notebook_start_accepts_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     ws_cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
     ws_gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
