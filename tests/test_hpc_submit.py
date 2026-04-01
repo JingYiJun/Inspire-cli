@@ -75,8 +75,7 @@ def test_build_hpc_create_payload_includes_generated_entrypoint(tmp_path: Path) 
 
     assert payload["logic_compute_group_id"] == "lcg-hpc"
     assert payload["spec_id"] == "quota-cpu-small"
-    assert payload["entrypoint"].startswith("#!/bin/bash\n")
-    assert "#SBATCH --mem=64G" in payload["entrypoint"]
+    assert payload["entrypoint"] == "srun bash -lc 'python main.py'"
 
 
 def test_cache_created_hpc_job_writes_independent_cache(tmp_path: Path) -> None:

@@ -24,7 +24,7 @@ from inspire.cli.utils.hpc_submit import (
     merge_hpc_overrides,
     resolve_hpc_preset,
 )
-from inspire.cli.utils.hpc_script import validate_hpc_script
+from inspire.cli.utils.hpc_script import extract_hpc_execution_body, validate_hpc_script
 from inspire.config import Config, ConfigError
 from inspire.config.workspaces import select_workspace_id
 
@@ -41,7 +41,7 @@ def _load_script_file(script_file: Optional[str]) -> str | None:
         return None
     content = Path(script_file).read_text(encoding="utf-8")
     validate_hpc_script(content)
-    return content
+    return extract_hpc_execution_body(content)
 
 
 @click.command("create")

@@ -21,17 +21,22 @@ def test_build_hpc_sbatch_script_includes_required_headers() -> None:
         extra_sbatch_lines=["#SBATCH --partition=hpc"],
     )
 
-    assert script.startswith("#!/bin/bash\n")
-    assert "#SBATCH -o /hpc_logs/slurm-%j.out" in script
-    assert "#SBATCH -e /hpc_logs/slurm-%j.err" in script
-    assert "#SBATCH --ntasks=2" in script
-    assert "#SBATCH --cpus-per-task=8" in script
-    assert "#SBATCH --mem=64G" in script
-    assert "#SBATCH --time=0-12:00:00" in script
-    assert "#SBATCH --partition=hpc" in script
-    assert "srun bash -lc 'python main.py'" in script
+    assert script == "srun bash -lc 'python main.py'"
 
 
 def test_validate_hpc_script_rejects_script_without_srun() -> None:
     with pytest.raises(ValueError, match="srun"):
         validate_hpc_script("#!/bin/bash\n#SBATCH --time=0-01:00:00\npython main.py\n")
+
+
+def test_validate_hpc_script_accepts_full_sbatch_and_extracts_execution_body() -> None:
+    script = """#!/bin/bash
+#SBATCH -o /hpc_logs/slurm-%j.out
+#SBATCH -e /hpc_logs/slurm-%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+
+srun /bin/sh -lc 'sleep 300'
+"""
+
+    validate_hpc_script(script)

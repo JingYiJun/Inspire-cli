@@ -57,7 +57,7 @@ inspire hpc create --name cpu-demo --preset cpu-small --command "python main.py"
 | `inspire job create` | Submit a training job |
 | `inspire job status/logs/list` | Monitor and manage jobs |
 | `inspire job stop/wait` | Stop or wait for a job |
-| `inspire hpc create/status/list` | Create and inspect HPC jobs |
+| `inspire hpc create/status/list` | Create HPC jobs and list/status your current-account HPC tasks |
 | `inspire hpc stop/wait/script` | Stop, wait for, or inspect cached sbatch scripts |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
 | `inspire sync` | Rsync local code to shared filesystem (via SSH tunnel) |
@@ -89,6 +89,18 @@ inspire hpc create --name "gromacs-demo" --preset cpu-small --command "python ma
 
 # Use a full sbatch script from file
 inspire hpc create --name "ffmpeg-batch" --preset cpu-small --script-file ./job.sbatch
+
+# List my HPC jobs from the remote web UI
+inspire hpc list
+
+# List my HPC jobs from both cpu + hpc workspaces
+inspire hpc list --all -n 100
+
+# List only jobs in specific statuses
+inspire hpc list -s RUNNING -s STOPPED
+
+# Revisit the old local submission cache only
+inspire hpc list --cache
 
 # Quick run with auto-selected resources, sync code and follow logs
 inspire run "python train.py --epochs 100" --sync --watch
@@ -132,7 +144,10 @@ inspire project list
 - `inspire hpc` is intended for CPU/slurm-style workloads, not regular GPU training jobs.
 - Submit HPC jobs to CPU/HPC workspaces or partitions, preferably via config-backed presets.
 - HPC images must include slurm (for example `slurm-gromacs:*` or another slurm-enabled image).
-- The HPC `entrypoint` is an sbatch script body. The generated/default script keeps required `#SBATCH` lines and must launch the workload with `srun`.
+- `inspire hpc list` now defaults to the remote web list and only shows jobs created by the current account.
+- `inspire hpc list --all` combines the current account's jobs from both `cpu` and `hpc` workspaces, with a default limit of `100` per workspace.
+- `inspire hpc list --cache` keeps the old local-cache behavior if you only want locally submitted entries.
+- The HPC `entrypoint` is an sbatch script body. The platform backend owns the `#!/bin/bash` and `#SBATCH ...` headers; CLI submission only needs the execution body, and the workload must launch with `srun`.
 
 ## SSH/SCP Reliability Notes
 

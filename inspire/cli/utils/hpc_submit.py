@@ -73,7 +73,6 @@ def build_hpc_create_payload(
         "image_type": final_image_type,
         "entrypoint": entrypoint,
         "instance_count": int(merged_config.get("instance_count", 1)),
-        "task_priority": int(merged_config.get("task_priority", config.hpc_priority)),
         "workspace_id": workspace_id,
         "spec_id": merged_config["spec_id"],
         "ttl_after_finish_seconds": int(

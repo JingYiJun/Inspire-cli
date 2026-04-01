@@ -57,7 +57,6 @@ def test_create_hpc_job_builds_payload() -> None:
         "image_type": "SOURCE_PUBLIC",
         "entrypoint": "#!/bin/bash\nsrun python main.py\n",
         "instance_count": 1,
-        "task_priority": 4,
         "workspace_id": "ws-hpc",
         "spec_id": "quota-cpu-small",
         "ttl_after_finish_seconds": 900,

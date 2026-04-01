@@ -220,6 +220,63 @@ def format_hpc_status(job_data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_hpc_job_list(jobs: List[Dict[str, Any]]) -> str:
+    """Format remote HPC jobs as a compact table."""
+    if not jobs:
+        return "No HPC jobs found."
+
+    rows = [
+        [
+            str(job.get("name", "N/A")),
+            str(job.get("status", "UNKNOWN")),
+            str(job.get("workspace", "unknown")),
+            str(job.get("created_at", "N/A")),
+            str(job.get("job_id", "N/A")),
+            str(job.get("url", "")),
+        ]
+        for job in jobs
+    ]
+    plain = _render_plain_table(
+        ["Name", "Status", "Workspace", "Created", "Job ID", "URL"],
+        rows,
+    )
+    return "\n".join([plain, f"Total: {len(jobs)} job(s)"])
+
+
+def print_hpc_job_list(jobs: List[Dict[str, Any]]) -> None:
+    """Print remote HPC job list using rich when available."""
+    if not jobs:
+        print("No HPC jobs found.")
+        return
+
+    rows = [
+        [
+            str(job.get("name", "N/A")),
+            str(job.get("status", "UNKNOWN")),
+            str(job.get("workspace", "unknown")),
+            str(job.get("created_at", "N/A")),
+            str(job.get("job_id", "N/A")),
+            str(job.get("url", "")),
+        ]
+        for job in jobs
+    ]
+    printed = _print_rich_table(
+        title="HPC Jobs",
+        headers=[
+            ("Name", {"style": "cyan"}),
+            ("Status", {"style": "green"}),
+            ("Workspace", {"style": "white", "no_wrap": True}),
+            ("Created", {"style": "magenta"}),
+            ("Job ID", {"style": "white", "no_wrap": True}),
+            ("URL", {"style": "blue", "overflow": "fold"}),
+        ],
+        rows=rows,
+        footer=f"Total: {len(jobs)} job(s)",
+    )
+    if not printed:
+        print(format_hpc_job_list(jobs))
+
+
 def format_job_list(jobs: List[Dict[str, Any]]) -> str:
     """Format job list as a table.
 

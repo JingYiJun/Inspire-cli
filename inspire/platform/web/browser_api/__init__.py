@@ -22,6 +22,10 @@ from .jobs import (
     list_job_users,
     list_jobs,
 )
+from .hpc_jobs import (
+    HPCJobInfo,
+    list_hpc_jobs,
+)
 from .notebooks import (
     ImageInfo,
     NotebookFailedError,
@@ -62,6 +66,8 @@ __all__ = [
     "list_job_events",
     "list_job_users",
     "list_jobs",
+    "HPCJobInfo",
+    "list_hpc_jobs",
     # Availability
     "FullFreeNodeCount",
     "GPUAvailability",
