@@ -31,6 +31,7 @@ dependencies = [
     "click>=8.0.0",
     "rich>=13.7.0",
     "playwright>=1.57.0",
+    "mcp>=1.9.4,<2",
     "tomli>=1.2.0; python_version < '3.11'",
 ]
 
@@ -44,6 +45,7 @@ dev = [
 
 [project.scripts]
 inspire = "inspire.cli.main:cli"
+inspire-mcp = "inspire.mcp.server:main"
 
 [project.urls]
 Documentation = "https://gitea.com/cyteena/inspire-cli"

@@ -38,7 +38,7 @@ from .ssh_exec import (
     run_ssh_command,
     run_ssh_command_streaming,
 )
-from .sync import sync_via_rsync
+from .sync import sync_paths_via_rsync, sync_via_rsync
 
 __all__ = [
     # Models / errors
@@ -72,5 +72,6 @@ __all__ = [
     "generate_ssh_config",
     "install_ssh_config",
     # Sync
+    "sync_paths_via_rsync",
     "sync_via_rsync",
 ]

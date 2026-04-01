@@ -70,7 +70,6 @@ def test_sync_via_rsync_runs_preflight_and_rsync(monkeypatch, tmp_path: Path) ->
     assert captured["rsync_kwargs"]["timeout"] == 123
 
 
-
 def test_sync_via_rsync_can_skip_delete(monkeypatch, tmp_path: Path) -> None:
     source_dir = tmp_path / "src"
     source_dir.mkdir()
@@ -111,7 +110,6 @@ def test_sync_via_rsync_can_skip_delete(monkeypatch, tmp_path: Path) -> None:
     assert "--delete" not in captured["rsync_args"]
 
 
-
 def test_sync_via_rsync_returns_error_when_remote_preflight_fails(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -131,7 +129,9 @@ def test_sync_via_rsync_returns_error_when_remote_preflight_fails(
     monkeypatch.setattr(
         sync_module,
         "run_ssh_command",
-        lambda *args, **kwargs: FakeCompletedProcess(returncode=1, stderr="rsync missing on bridge"),
+        lambda *args, **kwargs: FakeCompletedProcess(
+            returncode=1, stderr="rsync missing on bridge"
+        ),
     )
 
     result = sync_module.sync_via_rsync(
@@ -143,3 +143,94 @@ def test_sync_via_rsync_returns_error_when_remote_preflight_fails(
 
     assert result["success"] is False
     assert "rsync missing on bridge" in result["error"]
+
+
+def test_sync_paths_via_rsync_push_file_to_remote_file(monkeypatch, tmp_path: Path) -> None:
+    source_file = tmp_path / "train.py"
+    source_file.write_text("print('ok')\n", encoding="utf-8")
+
+    tunnel_config = TunnelConfig()
+    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
+    tunnel_config.add_bridge(bridge)
+
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
+    monkeypatch.setattr(
+        sync_module,
+        "_resolve_bridge_and_proxy",
+        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
+    )
+
+    def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        captured["preflight"] = command
+        return FakeCompletedProcess(returncode=0)
+
+    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
+        captured["rsync_args"] = args
+        return FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+
+    result = sync_module.sync_paths_via_rsync(
+        source_path=str(source_file),
+        target_path="/remote/project/train.py",
+        direction="push",
+        bridge_name="cpu-main",
+        config=tunnel_config,
+    )
+
+    assert result["success"] is True
+    assert result["source_kind"] == "file"
+    assert "mkdir -p /remote/project" in captured["preflight"]
+    assert captured["rsync_args"][-2] == str(source_file.resolve())
+    assert captured["rsync_args"][-1] == "root@localhost:/remote/project/train.py"
+    assert "--delete" not in captured["rsync_args"]
+
+
+def test_sync_paths_via_rsync_pull_directory_to_local_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    target_dir = tmp_path / "downloaded"
+
+    tunnel_config = TunnelConfig()
+    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
+    tunnel_config.add_bridge(bridge)
+
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
+    monkeypatch.setattr(
+        sync_module,
+        "_resolve_bridge_and_proxy",
+        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
+    )
+
+    def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        captured["preflight"] = command
+        return FakeCompletedProcess(returncode=0, stdout="directory\n")
+
+    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
+        captured["rsync_args"] = args
+        return FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+
+    result = sync_module.sync_paths_via_rsync(
+        source_path="/remote/project",
+        target_path=str(target_dir),
+        direction="pull",
+        bridge_name="cpu-main",
+        config=tunnel_config,
+        delete=True,
+    )
+
+    assert result["success"] is True
+    assert result["source_kind"] == "directory"
+    assert target_dir.exists()
+    assert "test -d /remote/project" in captured["preflight"]
+    assert captured["rsync_args"][-2] == "root@localhost:/remote/project/"
+    assert captured["rsync_args"][-1] == str(target_dir.resolve()) + "/"
+    assert "--delete" in captured["rsync_args"]
