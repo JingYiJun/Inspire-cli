@@ -19,7 +19,7 @@ CONFIG_TEMPLATE = """# Inspire CLI Configuration
 # Location: {location_comment}
 #
 # Values here are overridden by environment variables.
-# Sensitive values (passwords, tokens) should use env vars.
+# Sensitive values (passwords) should use env vars.
 
 [auth]
 username = "your_username"
@@ -36,29 +36,6 @@ target_dir = "/shared/EBM_dev"
 log_pattern = "training_master_*.log"
 job_cache = "~/.inspire/jobs.json"
 log_cache_dir = "~/.inspire/logs"
-
-[git]
-# Platform selection: "gitea" or "github"
-platform = "gitea"
-
-[gitea]
-server = "https://codeberg.org"
-repo = "owner/repo"
-# token - use INSP_GITEA_TOKEN env var
-# Workflow settings are fallback-only. Prefer SSH tunnel/bridge transport when available.
-# These workflow keys are expected to be deprecated in the future.
-log_workflow = "retrieve_job_log.yml"
-sync_workflow = "sync_code.yml"
-remote_timeout = 90
-
-[github]
-server = "https://github.com"
-repo = "owner/repo"
-# token - use INSP_GITHUB_TOKEN env var
-# Workflow settings are fallback-only. Prefer SSH tunnel/bridge transport when available.
-# These workflow keys are expected to be deprecated in the future.
-log_workflow = "retrieve_job_log.yml"
-sync_workflow = "sync_code.yml"
 
 [sync]
 default_remote = "origin"

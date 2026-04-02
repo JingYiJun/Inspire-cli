@@ -14,7 +14,9 @@ from inspire.platform.web.resources import ComputeGroupAvailability
 
 
 def _patch_config(monkeypatch, config) -> None:  # noqa: ANN001
-    def fake_from_files_and_env(cls, require_target_dir: bool = False, require_credentials: bool = True):  # type: ignore[override]  # noqa: ANN001,E501
+    def fake_from_files_and_env(
+        cls, require_target_dir: bool = False, require_credentials: bool = True
+    ):  # type: ignore[override]  # noqa: ANN001,E501
         return config, {}
 
     monkeypatch.setattr(
@@ -112,6 +114,8 @@ def test_resources_list_defaults_to_configured_workspaces(monkeypatch) -> None:
             "workspace_aliases": ["cpu", "internet"],
             "cpu_per_node_min": 104,
             "cpu_per_node_max": 120,
+            "total_cpu_cores": 0,
+            "available_cpu_cores": 0,
             "spec_cpu_min": None,
             "spec_cpu_max": None,
             "spec_memory_gib_min": None,

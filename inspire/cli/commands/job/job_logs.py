@@ -2,8 +2,8 @@
 
 Implements `inspire job logs` including:
 - Single-job mode (with JOB_ID)
-- Bulk mode (without JOB_ID)
 - SSH tunnel fast-path
+- Local cached log display
 """
 
 from __future__ import annotations
@@ -18,11 +18,6 @@ from typing import Optional, Protocol
 
 import click
 
-from inspire.bridge.forge import (
-    GiteaAuthError,
-    GiteaError,
-    fetch_remote_log_incremental,
-)
 from inspire.bridge.tunnel import (
     TunnelNotAvailableError,
     _test_ssh_connection,
@@ -38,7 +33,6 @@ from inspire.cli.context import (
     EXIT_JOB_NOT_FOUND,
     EXIT_LOG_NOT_FOUND,
     EXIT_SUCCESS,
-    EXIT_TIMEOUT,
     EXIT_VALIDATION_ERROR,
     pass_context,
 )
@@ -109,54 +103,6 @@ def _update_log_offset_to_filesize(
 ) -> None:
     if cache_path.exists():
         cache.set_log_offset(job_id, cache_path.stat().st_size)
-
-
-def _format_remote_log_error_message(
-    err: Exception, *, remote_log_path: str, config: Config
-) -> str:
-    return (
-        f"{str(err)}\n\n"
-        f"Hints:\n"
-        f"- Check that the training job created a log file at: {remote_log_path}\n"
-        f"- Prefer SSH tunnel/bridge log access when available; workflow retrieval is fallback-only\n"
-        f"- Verify the Bridge workflow exists and can access the shared filesystem\n"
-        f"- View Gitea Actions at: {config.gitea_server}/{config.gitea_repo}/actions"
-    )
-
-
-def _fetch_log_incremental(
-    *,
-    config: Config,
-    job_id: str,
-    remote_log_path: str,
-    cache_path: Path,
-    start_offset: int,
-) -> int:
-    _, bytes_added = fetch_remote_log_incremental(
-        config=config,
-        job_id=job_id,
-        remote_log_path=remote_log_path,
-        cache_path=cache_path,
-        start_offset=start_offset,
-    )
-    return bytes_added
-
-
-def _fetch_log_full_via_bridge(
-    *,
-    config: Config,
-    job_id: str,
-    remote_log_path: str,
-    cache_path: Path,
-    refresh: bool,
-) -> None:
-    job_deps.fetch_remote_log_via_bridge(
-        config=config,
-        job_id=job_id,
-        remote_log_path=remote_log_path,
-        cache_path=cache_path,
-        refresh=refresh,
-    )
 
 
 def _echo_log_path(ctx: Context, *, job_id: str, remote_log_path: str) -> None:
@@ -427,13 +373,13 @@ def _find_connected_tunnel_bridges(
     return sorted(connected)
 
 
-def _emit_tunnel_fallback_hint(ctx: Context, *, bridge_name: Optional[str]) -> None:
+def _emit_tunnel_unavailable_hint(ctx: Context, *, bridge_name: Optional[str]) -> None:
     if ctx.json_output:
         return
 
     target_label = f"bridge '{bridge_name}'" if bridge_name else "default bridge"
     click.echo(
-        f"Tunnel {target_label} not available, falling back to Gitea workflow...",
+        f"Tunnel {target_label} not available.",
         err=True,
     )
 
@@ -497,9 +443,7 @@ def _try_get_ssh_exit_code(
     )
     bridge_name_for_checks = effective_bridge_name or bridge_name
 
-    requires_remote_fetch = (not path) and (
-        follow or refresh or (not cache_exists) or current_offset > 0
-    )
+    requires_remote_fetch = (not path) and (follow or refresh or (not cache_exists))
 
     try:
         if not is_tunnel_available(
@@ -534,13 +478,19 @@ def _try_get_ssh_exit_code(
                         "'inspire notebook ssh <notebook-id> --alias <name>'."
                     ),
                 )
-            _emit_tunnel_fallback_hint(ctx, bridge_name=bridge_name)
+            if requires_remote_fetch:
+                _emit_tunnel_unavailable_hint(ctx, bridge_name=bridge_name)
+                return EXIT_GENERAL_ERROR
             return None
 
         if follow and ctx.json_output:
-            # JSON follow mode must stay machine-readable.
-            # Skip SSH tail -f output and use workflow follow path instead.
-            return None
+            _handle_error(
+                ctx,
+                "InvalidUsage",
+                "--json cannot be combined with --follow",
+                EXIT_VALIDATION_ERROR,
+            )
+            return EXIT_VALIDATION_ERROR
         if follow:
             if not ctx.json_output:
                 label = f", bridge: {bridge_name}" if bridge_name else ""
@@ -586,13 +536,11 @@ def _try_get_ssh_exit_code(
         return EXIT_SUCCESS
 
     except TunnelNotAvailableError:
-        _emit_tunnel_fallback_hint(ctx, bridge_name=bridge_name)
+        _emit_tunnel_unavailable_hint(ctx, bridge_name=bridge_name)
+        return EXIT_GENERAL_ERROR
     except IOError as e:
-        if not ctx.json_output:
-            click.echo(f"SSH log fetch failed: {e}", err=True)
-            click.echo("Falling back to Gitea workflow (SSH is preferred)...", err=True)
-
-    return None
+        _handle_error(ctx, "RemoteLogError", str(e), EXIT_GENERAL_ERROR)
+        return EXIT_GENERAL_ERROR
 
 
 def _follow_logs(
@@ -605,167 +553,13 @@ def _follow_logs(
     refresh: bool,
     interval: int,
 ) -> int:
-    api = AuthManager.get_api(config)
-    terminal_statuses = {
-        "SUCCEEDED",
-        "FAILED",
-        "CANCELLED",
-        "job_succeeded",
-        "job_failed",
-        "job_cancelled",
-    }
-    final_status = None
-
-    try:
-        current_offset = 0 if refresh else cache.get_log_offset(job_id)
-
-        if refresh or not cache_path.exists():
-            if not ctx.json_output:
-                click.echo(f"Fetching log for job {job_id}...")
-
-            try:
-                _fetch_log_full_via_bridge(
-                    config=config,
-                    job_id=job_id,
-                    remote_log_path=remote_log_path,
-                    cache_path=cache_path,
-                    refresh=refresh,
-                )
-                current_offset = cache_path.stat().st_size
-                cache.set_log_offset(job_id, current_offset)
-            except (GiteaAuthError, GiteaError, TimeoutError) as e:
-                _handle_error(ctx, "Error", str(e), EXIT_GENERAL_ERROR)
-
-        if cache_path.exists():
-            content = cache_path.read_text(encoding="utf-8", errors="replace")
-            if ctx.json_output:
-                click.echo(
-                    json_formatter.format_json(
-                        {
-                            "event": "initial_content",
-                            "job_id": job_id,
-                            "size_bytes": len(content),
-                            "content": content,
-                        }
-                    )
-                )
-            else:
-                click.echo(content, nl=False)
-
-            current_offset = cache_path.stat().st_size
-            cache.set_log_offset(job_id, current_offset)
-
-        last_displayed = current_offset
-
-        if not ctx.json_output:
-            click.echo(f"\n--- Following log (interval: {interval}s, Ctrl+C to stop) ---")
-
-        while True:
-            job_deps.time.sleep(interval)
-
-            try:
-                _fetch_log_full_via_bridge(
-                    config=config,
-                    job_id=job_id,
-                    remote_log_path=remote_log_path,
-                    cache_path=cache_path,
-                    refresh=True,
-                )
-
-                size_after = cache_path.stat().st_size if cache_path.exists() else 0
-                bytes_added = size_after - last_displayed
-
-                if bytes_added > 0:
-                    current_offset = size_after
-                    cache.set_log_offset(job_id, current_offset)
-
-                    with cache_path.open("rb") as f:
-                        f.seek(last_displayed)
-                        new_content = f.read().decode("utf-8", errors="replace")
-
-                    if ctx.json_output:
-                        click.echo(
-                            json_formatter.format_json(
-                                {
-                                    "event": "new_content",
-                                    "job_id": job_id,
-                                    "bytes_added": bytes_added,
-                                    "offset": current_offset,
-                                    "content": new_content,
-                                }
-                            )
-                        )
-                    else:
-                        click.echo(new_content, nl=False)
-
-                    last_displayed = current_offset
-
-            except (GiteaError, TimeoutError) as e:
-                if not ctx.json_output:
-                    click.echo(f"\nWarning: Fetch failed: {e}", err=True)
-
-            try:
-                result = api.get_job_detail(job_id)
-                job_data = result.get("data", {})
-                current_status = job_data.get("status", "UNKNOWN")
-                cache.update_status(job_id, current_status)
-
-                if current_status in terminal_statuses:
-                    final_status = current_status
-                    break
-            except Exception as e:
-                if not ctx.json_output:
-                    click.echo(f"\nWarning: Status check failed: {e}", err=True)
-
-        if final_status:
-            if not ctx.json_output:
-                click.echo(f"\n--- Job completed with status: {final_status} ---")
-                click.echo("Fetching final log content...")
-
-            _fetch_log_full_via_bridge(
-                config=config,
-                job_id=job_id,
-                remote_log_path=remote_log_path,
-                cache_path=cache_path,
-                refresh=True,
-            )
-
-            size_after = cache_path.stat().st_size if cache_path.exists() else 0
-            bytes_added = size_after - last_displayed
-
-            if bytes_added > 0:
-                with cache_path.open("rb") as f:
-                    f.seek(last_displayed)
-                    new_content = f.read().decode("utf-8", errors="replace")
-
-                if ctx.json_output:
-                    click.echo(
-                        json_formatter.format_json(
-                            {
-                                "event": "final_content",
-                                "job_id": job_id,
-                                "status": final_status,
-                                "bytes_added": bytes_added,
-                                "content": new_content,
-                            }
-                        )
-                    )
-                else:
-                    click.echo(new_content, nl=False)
-
-        if final_status in {"SUCCEEDED", "job_succeeded"}:
-            return EXIT_SUCCESS
-        if final_status in {"FAILED", "CANCELLED", "job_failed", "job_cancelled"}:
-            return EXIT_GENERAL_ERROR
-        return EXIT_SUCCESS
-
-    except KeyboardInterrupt:
-        if not ctx.json_output:
-            click.echo("\nStopped following.")
-        return EXIT_SUCCESS
-    except GiteaAuthError as e:
-        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-        return EXIT_CONFIG_ERROR
+    _handle_error(
+        ctx,
+        "Unsupported",
+        "Cached follow mode is no longer supported; use an active SSH tunnel with --follow.",
+        EXIT_GENERAL_ERROR,
+    )
+    return EXIT_GENERAL_ERROR
 
 
 def _bulk_update_logs(
@@ -774,121 +568,12 @@ def _bulk_update_logs(
     limit: int,
     refresh: bool,
 ) -> None:
-    try:
-        config, _ = Config.from_files_and_env(require_target_dir=False)
-        cache = job_deps.JobCache(config.get_expanded_cache_path())
-
-        alias_map = {
-            "PENDING": {"PENDING", "job_pending"},
-            "RUNNING": {"RUNNING", "job_running"},
-            "SUCCEEDED": {"SUCCEEDED", "job_succeeded"},
-            "FAILED": {"FAILED", "job_failed"},
-            "CANCELLED": {"CANCELLED", "job_cancelled"},
-        }
-
-        status_filter = set()
-        if status:
-            for s in status:
-                key = str(s).upper()
-                status_filter.update(alias_map.get(key, {s}))
-
-        jobs = cache.list_jobs(limit=limit)
-        if status_filter:
-            jobs = [j for j in jobs if j.get("status") in status_filter]
-
-        total_candidates = len(jobs)
-
-        cache_dir = Path(os.path.expanduser(config.log_cache_dir))
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        updated = []
-        errors = []
-        skipped_no_log = []
-
-        for job in jobs:
-            job_id_item = job.get("job_id")
-            remote_log_path_str = job.get("log_path")
-
-            if not job_id_item:
-                continue
-
-            if not remote_log_path_str:
-                skipped_no_log.append(job_id_item)
-                continue
-
-            cache_path = cache_dir / f"{job_id_item}.log"
-
-            try:
-                _fetch_log_full_via_bridge(
-                    config=config,
-                    job_id=job_id_item,
-                    remote_log_path=str(remote_log_path_str),
-                    cache_path=cache_path,
-                    refresh=refresh,
-                )
-                updated.append({"job_id": job_id_item, "log_path": str(cache_path)})
-            except GiteaAuthError as e:
-                _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-            except TimeoutError as e:
-                errors.append({"job_id": job_id_item, "error": str(e)})
-            except GiteaError as e:
-                error_msg = _format_remote_log_error_message(
-                    e,
-                    remote_log_path=str(remote_log_path_str),
-                    config=config,
-                )
-                errors.append({"job_id": job_id_item, "error": error_msg})
-            except Exception as e:  # noqa: BLE001
-                errors.append({"job_id": job_id_item, "error": str(e)})
-
-        success_flag = not errors
-
-        payload = {
-            "updated": updated,
-            "errors": errors,
-            "skipped_no_log_path": skipped_no_log,
-            "processed": total_candidates,
-            "fetched": len(updated),
-            "refresh": refresh,
-            "status_filter": sorted(status_filter),
-            "limit": limit,
-        }
-
-        if ctx.json_output:
-            click.echo(json_formatter.format_json(payload, success=success_flag))
-            if not success_flag:
-                sys.exit(EXIT_GENERAL_ERROR)
-            return
-
-        if not jobs:
-            click.echo("No cached jobs matched the filter.")
-            return
-
-        status_label = f" with status in {sorted(status_filter)}" if status_filter else ""
-        click.echo(
-            f"Updating logs for {total_candidates} cached job(s){status_label} (refresh={refresh})"
-        )
-
-        if updated:
-            click.echo("\nFetched:")
-            for entry in updated:
-                click.echo(f"- {entry['job_id']}: {entry['log_path']}")
-
-        if skipped_no_log:
-            click.echo("\nSkipped (no log_path in cache): " + ", ".join(skipped_no_log))
-
-        if errors:
-            click.echo("\nErrors:")
-            for err in errors:
-                click.echo(f"- {err['job_id']}: {err['error']}")
-            sys.exit(EXIT_GENERAL_ERROR)
-
-        click.echo("\nDone.")
-
-    except ConfigError as e:
-        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-    except Exception as e:
-        _handle_error(ctx, "Error", str(e), EXIT_GENERAL_ERROR)
+    _handle_error(
+        ctx,
+        "Unsupported",
+        "Bulk log refresh was removed with forge workflow support; use 'inspire job logs JOB_ID' over SSH.",
+        EXIT_GENERAL_ERROR,
+    )
 
 
 def _run_job_logs_single_job(
@@ -954,79 +639,30 @@ def _run_job_logs_single_job(
             sys.exit(EXIT_SUCCESS)
 
         if follow:
-            follow_exit_code = _follow_logs(
-                ctx=ctx,
-                config=config,
-                cache=cache,
-                job_id=job_id,
-                remote_log_path=str(remote_log_path_str),
-                cache_path=cache_path,
-                refresh=refresh,
-                interval=interval,
+            _handle_error(
+                ctx,
+                "TunnelError",
+                "--follow requires an active SSH tunnel.",
+                EXIT_GENERAL_ERROR,
+                hint="Run 'inspire notebook ssh <notebook-id> --save-as <name>' and retry with --bridge.",
             )
-            sys.exit(follow_exit_code)
+            return
 
-        if current_offset > 0 and cache_exists:
-            if not ctx.json_output:
-                click.echo(f"Fetching new log content from offset {current_offset}...")
-
-            try:
-                bytes_added = _fetch_log_incremental(
-                    config=config,
-                    job_id=job_id,
-                    remote_log_path=str(remote_log_path_str),
-                    cache_path=cache_path,
-                    start_offset=current_offset,
-                )
-                cache.set_log_offset(job_id, current_offset + bytes_added)
-                if not ctx.json_output and bytes_added == 0:
-                    click.echo("No new content. If log was rotated, use --refresh.", err=True)
-            except GiteaAuthError as e:
-                _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-            except TimeoutError as e:
-                _handle_error(ctx, "Timeout", str(e), EXIT_TIMEOUT)
-            except GiteaError as e:
-                error_msg = _format_remote_log_error_message(
-                    e,
-                    remote_log_path=str(remote_log_path_str),
-                    config=config,
-                )
-                _handle_error(ctx, "RemoteLogError", error_msg, EXIT_GENERAL_ERROR)
-
-        elif refresh or not cache_path.exists():
-            if not ctx.json_output:
-                click.echo(
-                    "Fetching remote log via Gitea workflow "
-                    "(deprecated -- will be removed in a future release; "
-                    "first fetch may take ~10-30s)..."
-                )
-
-            try:
-                _fetch_log_full_via_bridge(
-                    config=config,
-                    job_id=job_id,
-                    remote_log_path=str(remote_log_path_str),
-                    cache_path=cache_path,
-                    refresh=refresh,
-                )
-                _update_log_offset_to_filesize(cache, job_id=job_id, cache_path=cache_path)
-            except GiteaAuthError as e:
-                _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-            except TimeoutError as e:
-                _handle_error(ctx, "Timeout", str(e), EXIT_TIMEOUT)
-            except GiteaError as e:
-                error_msg = _format_remote_log_error_message(
-                    e,
-                    remote_log_path=str(remote_log_path_str),
-                    config=config,
-                )
-                _handle_error(ctx, "RemoteLogError", error_msg, EXIT_GENERAL_ERROR)
+        if refresh or not cache_path.exists():
+            _handle_error(
+                ctx,
+                "LogNotFound",
+                f"No cached log available for job {job_id}; connect a bridge and retry.",
+                EXIT_LOG_NOT_FOUND,
+                hint="Use 'inspire notebook ssh <notebook-id> --save-as <name>' then rerun with --bridge.",
+            )
+            return
 
         if not cache_path.exists():
             _handle_error(
                 ctx,
                 "LogNotFound",
-                f"Failed to retrieve log for job {job_id}; the Bridge workflow may have failed.",
+                f"No cached log found for job {job_id}.",
                 EXIT_LOG_NOT_FOUND,
             )
             return
@@ -1110,20 +746,13 @@ def logs(
     json_output = resolve_json_output(ctx, json_output)
     """View logs for a training job.
 
-    Fetches logs via Gitea workflow and caches them locally.
-    Incremental fetching is enabled by default - only new bytes are
-    fetched when a local cache exists. Use --refresh to re-fetch from
-    the beginning.
+    Reads logs over SSH when a bridge tunnel is available.
+    If no tunnel is available, the command can still display an already cached local log.
 
     \b
     Single job mode (with JOB_ID):
         Fetches and displays the log for a specific job.
 
-    Bulk mode (without JOB_ID):
-        Fetches and caches logs for multiple jobs from local cache.
-        Use --status to filter by job status.
-
-    \b
     Examples:
         inspire job logs job-c4eb3ac3-6d83-405c-aa29-059bc945c4bf
         inspire job logs job-c4eb3ac3-6d83-405c-aa29-059bc945c4bf --tail 100
@@ -1133,8 +762,6 @@ def logs(
         inspire job logs job-c4eb3ac3-6d83-405c-aa29-059bc945c4bf --path
         inspire job logs job-c4eb3ac3-6d83-405c-aa29-059bc945c4bf --refresh
         inspire job logs job-c4eb3ac3-6d83-405c-aa29-059bc945c4bf --bridge my-profile
-        inspire job logs --status RUNNING --status SUCCEEDED
-        inspire job logs --refresh --status RUNNING
     """
     if not job_id:
         if tail or head or path or follow or bridge:

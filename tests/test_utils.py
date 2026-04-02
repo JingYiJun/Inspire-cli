@@ -9,7 +9,6 @@ from inspire.config import (
     Config,
     ConfigError,
     _parse_denylist,
-    _parse_remote_timeout,
     build_env_exports,
 )
 from inspire.bridge.tunnel import (
@@ -326,17 +325,6 @@ class TestConfig:
 
 class TestConfigHelpers:
     """Tests for config helper functions."""
-
-    def test_parse_remote_timeout_valid(self) -> None:
-        """Test parsing valid timeout values."""
-        assert _parse_remote_timeout("90") == 90
-        assert _parse_remote_timeout("300") == 300
-        assert _parse_remote_timeout("5") == 5
-
-    def test_parse_remote_timeout_invalid(self) -> None:
-        """Test parsing invalid timeout values."""
-        with pytest.raises(ConfigError, match="Invalid INSP_REMOTE_TIMEOUT"):
-            _parse_remote_timeout("not-a-number")
 
     def test_parse_denylist_empty(self) -> None:
         """Test parsing empty denylist."""

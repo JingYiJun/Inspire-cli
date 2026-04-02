@@ -81,12 +81,6 @@ def _apply_password_and_token_fallbacks(
         config_dict["password"] = env_password
         sources["password"] = SOURCE_ENV
 
-    if not config_dict.get("github_token"):
-        github_token_fallback = os.getenv("GITHUB_TOKEN")
-        if github_token_fallback:
-            config_dict["github_token"] = github_token_fallback
-            sources["github_token"] = SOURCE_ENV
-
 
 def _validate_required_config(
     *,

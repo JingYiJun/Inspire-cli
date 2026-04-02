@@ -43,8 +43,6 @@ _PLACEHOLDER_HOST_SUFFIXES = (
 )
 _HOST_VALIDATION_FIELDS = (
     ("base_url", "INSPIRE_BASE_URL"),
-    ("gitea_server", "INSP_GITEA_SERVER"),
-    ("github_server", "INSP_GITHUB_SERVER"),
     ("docker_registry", "INSPIRE_DOCKER_REGISTRY"),
     ("rtunnel_download_url", "INSPIRE_RTUNNEL_DOWNLOAD_URL"),
 )

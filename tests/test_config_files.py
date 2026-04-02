@@ -105,10 +105,6 @@ class TestConfigSchema:
         assert "INSPIRE_BASE_URL" in global_env_vars
         assert "INSPIRE_TIMEOUT" in global_env_vars
 
-        # Gitea server and token should be global
-        assert "INSP_GITEA_SERVER" in global_env_vars
-        assert "INSP_GITEA_TOKEN" in global_env_vars
-
         # SSH paths should be global
         assert "INSPIRE_RTUNNEL_BIN" in global_env_vars
 
@@ -129,9 +125,6 @@ class TestConfigSchema:
         assert "INSPIRE_SYNC_SOURCE_DIR" in project_env_vars
         assert "INSPIRE_SYNC_BRIDGE" in project_env_vars
         assert "INSPIRE_LOG_PATTERN" in project_env_vars
-
-        # Gitea repo should be project
-        assert "INSP_GITEA_REPO" in project_env_vars
 
         # Job/Notebook settings should be project
         assert "INSP_PRIORITY" in project_env_vars
@@ -229,7 +222,6 @@ class TestLayeredConfig:
             "INSPIRE_TIMEOUT",
             "INSPIRE_TARGET_DIR",
             "INSPIRE_SYNC_SOURCE_DIR",
-            "INSP_GITEA_SERVER",
         ]
         for var in env_vars:
             monkeypatch.delenv(var, raising=False)
@@ -858,7 +850,6 @@ class TestInitCommand:
 
         # Set only project scope env vars
         monkeypatch.setenv("INSPIRE_TARGET_DIR", "/shared/myproject")
-        monkeypatch.setenv("INSP_GITEA_REPO", "user/repo")
 
         runner = CliRunner()
         result = runner.invoke(init, ["--force"])
@@ -870,7 +861,6 @@ class TestInitCommand:
         assert project_config.exists()
         project_content = project_config.read_text()
         assert 'target_dir = "/shared/myproject"' in project_content
-        assert 'repo = "user/repo"' in project_content
 
         # Global config should NOT exist (no global-scope vars)
         assert not global_config.exists()
@@ -1685,7 +1675,7 @@ class TestConfigShowCommand:
         assert result.exit_code == 0
         assert "Authentication" in result.output
         # Other categories should not appear
-        assert "Gitea" not in result.output
+        assert "Job" not in result.output
 
 
 # ===========================================================================
@@ -1768,7 +1758,6 @@ class TestPreferSource:
             "INSPIRE_TIMEOUT",
             "INSPIRE_TARGET_DIR",
             "INSPIRE_SYNC_SOURCE_DIR",
-            "INSP_GITEA_SERVER",
         ]
         for var in env_vars:
             monkeypatch.delenv(var, raising=False)

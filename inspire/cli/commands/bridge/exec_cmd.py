@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import logging
 import shlex
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 import click
@@ -22,14 +20,6 @@ from inspire.cli.context import (
     pass_context,
 )
 from inspire.config import Config, ConfigError, build_env_exports
-from inspire.bridge.forge import (
-    GiteaAuthError,
-    GiteaError,
-    trigger_bridge_action_workflow,
-    wait_for_bridge_action_completion,
-    download_bridge_artifact,
-    fetch_bridge_output_log,
-)
 from inspire.bridge.tunnel import (
     BridgeProfile,
     TunnelNotAvailableError,
@@ -45,9 +35,7 @@ from inspire.cli.utils.notebook_cli import require_web_session
 from inspire.cli.utils.output import (
     emit_error,
     emit_info,
-    emit_progress,
     emit_success,
-    emit_warning,
 )
 from inspire.cli.utils.tunnel_reconnect import (
     NotebookBridgeReconnectState,
@@ -456,180 +444,6 @@ def try_exec_via_ssh_tunnel(
             )
 
 
-def exec_via_workflow(
-    ctx: Context,
-    *,
-    command: str,
-    env_exports: str,
-    denylist: tuple[str, ...],
-    artifact_path: tuple[str, ...],
-    download: Optional[str],
-    wait: bool,
-    timeout_s: int,
-    config: Config,
-    trigger_bridge_action_workflow_fn: Callable[..., None],
-    wait_for_bridge_action_completion_fn: Callable[..., dict],
-    fetch_bridge_output_log_fn: Callable[..., Optional[str]],
-    download_bridge_artifact_fn: Callable[..., None],
-) -> int:
-    workflow_command = f"{env_exports}{command}" if env_exports else command
-
-    merged_denylist: list[str] = []
-    if config.bridge_action_denylist:
-        merged_denylist.extend(config.bridge_action_denylist)
-    merged_denylist.extend(split_denylist(denylist))
-
-    if not merged_denylist and _verbose_output(ctx):
-        emit_warning(ctx, "no denylist provided; proceeding")
-
-    request_id = f"{int(time.time())}-{os.getpid()}"
-    artifact_paths_list = list(artifact_path)
-
-    if _verbose_output(ctx):
-        emit_info(ctx, f"Triggering bridge exec (request {request_id})")
-        emit_info(ctx, f"Command: {command}")
-        emit_info(ctx, f"Working dir: {config.target_dir}")
-        if merged_denylist:
-            emit_info(ctx, f"Denylist: {merged_denylist}")
-        if artifact_paths_list:
-            emit_info(ctx, f"Artifact paths: {artifact_paths_list}")
-
-    try:
-        logger.debug(
-            "bridge_exec workflow trigger request_id=%s wait=%s timeout=%s command=%s",
-            request_id,
-            wait,
-            timeout_s,
-            command,
-        )
-        trigger_bridge_action_workflow_fn(
-            config=config,
-            raw_command=workflow_command,
-            artifact_paths=artifact_paths_list,
-            request_id=request_id,
-            denylist=merged_denylist,
-        )
-    except (GiteaError, GiteaAuthError) as e:
-        emit_error(
-            ctx,
-            error_type="GiteaError",
-            message=str(e),
-            exit_code=EXIT_GENERAL_ERROR,
-        )
-        return EXIT_GENERAL_ERROR
-
-    if not wait:
-        emit_success(
-            ctx,
-            payload={
-                "status": "triggered",
-                "request_id": request_id,
-                "command": command,
-            },
-            text=f"Triggered bridge exec request {request_id}",
-        )
-        return EXIT_SUCCESS
-
-    if _verbose_output(ctx):
-        emit_progress(ctx, f"Waiting for completion (timeout {timeout_s}s)...")
-
-    try:
-        result = wait_for_bridge_action_completion_fn(
-            config=config,
-            request_id=request_id,
-            timeout=timeout_s,
-        )
-        logger.debug("bridge_exec workflow result request_id=%s result=%s", request_id, result)
-    except TimeoutError as e:
-        emit_error(
-            ctx,
-            error_type="Timeout",
-            message=f"Timeout: {e}",
-            exit_code=EXIT_TIMEOUT,
-        )
-        return EXIT_TIMEOUT
-    except GiteaError as e:
-        emit_error(
-            ctx,
-            error_type="GiteaError",
-            message=str(e),
-            exit_code=EXIT_GENERAL_ERROR,
-        )
-        return EXIT_GENERAL_ERROR
-
-    output_log: Optional[str] = None
-    try:
-        output_log = fetch_bridge_output_log_fn(config, request_id)
-    except GiteaError:
-        pass
-    if output_log:
-        logger.debug("bridge_exec workflow output request_id=%s\n%s", request_id, output_log)
-
-    if output_log and not ctx.json_output:
-        if _verbose_output(ctx):
-            click.echo("")
-            click.echo("--- Command Output ---")
-            click.echo(output_log)
-            click.echo("--- End Output ---")
-            click.echo("")
-        else:
-            click.echo(output_log)
-
-    if result.get("conclusion") != "success":
-        hint = result.get("html_url") or None
-        emit_error(
-            ctx,
-            error_type="BridgeActionFailed",
-            message=f"Action failed: {result.get('conclusion')}",
-            exit_code=EXIT_GENERAL_ERROR,
-            hint=hint,
-        )
-        return EXIT_GENERAL_ERROR
-
-    if download:
-        if _verbose_output(ctx):
-            emit_progress(ctx, f"Downloading artifact to {download}...")
-        try:
-            download_bridge_artifact_fn(config, request_id, Path(download))
-        except GiteaError as e:
-            emit_error(
-                ctx,
-                error_type="ArtifactError",
-                message=f"Artifact download failed: {e}",
-                exit_code=EXIT_GENERAL_ERROR,
-            )
-            return EXIT_GENERAL_ERROR
-
-    if _verbose_output(ctx):
-        emit_success(
-            ctx,
-            payload={
-                "status": "success",
-                "request_id": request_id,
-                "artifact_downloaded": bool(download),
-                "output": output_log,
-            },
-            text="Action completed successfully",
-        )
-        if result.get("html_url"):
-            emit_info(ctx, f"Workflow: {result.get('html_url')}")
-        if download:
-            emit_info(ctx, "Artifacts downloaded")
-    else:
-        emit_success(
-            ctx,
-            payload={
-                "status": "success",
-                "request_id": request_id,
-                "artifact_downloaded": bool(download),
-                "output": output_log,
-            },
-            text="OK (artifacts downloaded)" if download else "OK",
-        )
-
-    return EXIT_SUCCESS
-
-
 @click.command("exec")
 @click.argument("command_parts", nargs=-1, type=click.UNPROCESSED, required=True)
 @click.option(
@@ -688,8 +502,7 @@ def exec_command(
     json_output = resolve_json_output(ctx, json_output)
     """Execute a command on the Bridge runner.
 
-    Uses SSH tunnel for command execution. Workflow transport is fallback-only
-    and is only used when artifact options are requested.
+    Uses SSH tunnel for command execution.
 
     COMMAND is the shell command to run on Bridge (in INSPIRE_TARGET_DIR).
     Command output (stdout/stderr) is automatically displayed after completion.
@@ -699,8 +512,6 @@ def exec_command(
         inspire bridge exec "uv venv .venv"
         inspire bridge exec "pip install torch" --timeout 600
         inspire bridge exec --stdin -- bash -s < scripts/watch_eval.sh
-        inspire bridge exec "uv venv .venv" \\
-            --artifact-path .venv --download ./local
         inspire bridge exec "python train.py" --no-wait
         inspire bridge exec "hostname" --bridge qz-bridge
     """
@@ -740,36 +551,27 @@ def exec_command(
         )
         sys.exit(EXIT_GENERAL_ERROR)
 
-    # SSH tunnel is the default command transport when artifacts are not requested.
-    if not artifact_path and not download:
-        effective_stdin_mode = stdin_mode or _should_auto_passthrough_stdin()
-        ssh_exit_code = try_exec_via_ssh_tunnel(
+    if artifact_path or download:
+        emit_error(
             ctx,
-            command=command,
-            bridge_name=bridge,
-            stdin_mode=effective_stdin_mode,
-            config=config,
-            env_exports=env_exports,
-            timeout_s=action_timeout,
-            is_tunnel_available_fn=is_tunnel_available,
-            run_ssh_command_fn=run_ssh_command,
-            run_ssh_command_streaming_fn=run_ssh_command_streaming,
+            error_type="UsageError",
+            message="--artifact-path/--download are no longer supported",
+            exit_code=EXIT_GENERAL_ERROR,
+            hint="Use 'inspire bridge scp' or 'inspire sync' for file transfer.",
         )
-        sys.exit(ssh_exit_code if ssh_exit_code is not None else EXIT_GENERAL_ERROR)
+        sys.exit(EXIT_GENERAL_ERROR)
 
-    workflow_exit_code = exec_via_workflow(
+    effective_stdin_mode = stdin_mode or _should_auto_passthrough_stdin()
+    ssh_exit_code = try_exec_via_ssh_tunnel(
         ctx,
         command=command,
-        env_exports=env_exports,
-        denylist=denylist,
-        artifact_path=artifact_path,
-        download=download,
-        wait=wait,
-        timeout_s=action_timeout,
+        bridge_name=bridge,
+        stdin_mode=effective_stdin_mode,
         config=config,
-        trigger_bridge_action_workflow_fn=trigger_bridge_action_workflow,
-        wait_for_bridge_action_completion_fn=wait_for_bridge_action_completion,
-        fetch_bridge_output_log_fn=fetch_bridge_output_log,
-        download_bridge_artifact_fn=download_bridge_artifact,
+        env_exports=env_exports,
+        timeout_s=action_timeout,
+        is_tunnel_available_fn=is_tunnel_available,
+        run_ssh_command_fn=run_ssh_command,
+        run_ssh_command_streaming_fn=run_ssh_command_streaming,
     )
-    sys.exit(workflow_exit_code)
+    sys.exit(ssh_exit_code if ssh_exit_code is not None else EXIT_GENERAL_ERROR)

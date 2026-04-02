@@ -1,1 +1,1 @@
-"""Bridge execution integrations (forge workflows, tunnels, SSH)."""
+"""Bridge execution integrations (tunnels and SSH)."""

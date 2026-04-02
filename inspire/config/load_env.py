@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from inspire.config.env import _parse_denylist, _parse_remote_timeout
+from inspire.config.env import _parse_denylist
 from inspire.config.models import Config, ConfigError
 
 
@@ -103,91 +103,9 @@ def config_from_env(*, require_target_dir: bool = False) -> Config:
         timeout=timeout,
         max_retries=max_retries,
         retry_delay=retry_delay,
-        git_platform=os.getenv("INSP_GIT_PLATFORM"),
-        gitea_repo=os.getenv("INSP_GITEA_REPO"),
-        gitea_token=os.getenv("INSP_GITEA_TOKEN"),
-        gitea_server=os.getenv("INSP_GITEA_SERVER", "https://codeberg.org"),
-        gitea_log_workflow=os.getenv("INSP_GITEA_LOG_WORKFLOW", "retrieve_job_log.yml"),
-        gitea_sync_workflow=os.getenv("INSP_GITEA_SYNC_WORKFLOW", "sync_code.yml"),
-        github_repo=os.getenv("INSP_GITHUB_REPO"),
-        github_token=os.getenv("INSP_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN"),
-        github_server=os.getenv("INSP_GITHUB_SERVER", "https://github.com"),
-        github_log_workflow=os.getenv("INSP_GITHUB_LOG_WORKFLOW", "retrieve_job_log.yml"),
-        github_sync_workflow=os.getenv("INSP_GITHUB_SYNC_WORKFLOW", "sync_code.yml"),
         log_cache_dir=os.getenv("INSP_LOG_CACHE_DIR")
         or os.getenv("INSPIRE_LOG_CACHE_DIR", "~/.inspire/logs"),
-        remote_timeout=_parse_remote_timeout(os.getenv("INSP_REMOTE_TIMEOUT", "90")),
         default_remote=os.getenv("INSPIRE_DEFAULT_REMOTE", "origin"),
-        bridge_action_timeout=bridge_action_timeout,
-        bridge_action_denylist=_parse_denylist(os.getenv("INSPIRE_BRIDGE_DENYLIST")),
-        ssh_port=_parse_ssh_port(os.getenv("INSPIRE_SSH_PORT")),
-    )
-
-
-def config_from_env_for_sync() -> Config:
-    """Create configuration for sync/bridge commands (doesn't require platform credentials)."""
-    target_dir = os.getenv("INSPIRE_TARGET_DIR")
-    if not target_dir:
-        raise ConfigError(
-            "Missing INSPIRE_TARGET_DIR environment variable.\n"
-            "This specifies the target directory on the Bridge.\n"
-            "Set it with: export INSPIRE_TARGET_DIR='/path/to/shared/directory'"
-        )
-
-    platform = os.getenv("INSP_GIT_PLATFORM", "gitea").strip().lower()
-    if platform == "github":
-        gitea_repo = None
-        gitea_token = None
-        gitea_server = "https://codeberg.org"
-        github_repo = os.getenv("INSP_GITHUB_REPO")
-        github_token = os.getenv("INSP_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN")
-        github_server = os.getenv("INSP_GITHUB_SERVER", "https://github.com")
-        if not github_repo:
-            raise ConfigError(
-                "Missing INSP_GITHUB_REPO environment variable for GitHub platform.\n"
-                "Set it with: export INSP_GITHUB_REPO='owner/repo'"
-            )
-    else:
-        gitea_repo = os.getenv("INSP_GITEA_REPO")
-        gitea_token = os.getenv("INSP_GITEA_TOKEN")
-        gitea_server = os.getenv("INSP_GITEA_SERVER", "https://codeberg.org")
-        github_repo = None
-        github_token = None
-        github_server = "https://github.com"
-        if not gitea_repo:
-            raise ConfigError(
-                "Missing INSP_GITEA_REPO environment variable for Gitea platform.\n"
-                "Set it with: export INSP_GITEA_REPO='owner/repo'\n"
-                "Or use GitHub by setting INSP_GIT_PLATFORM=github and INSP_GITHUB_REPO."
-            )
-
-    bridge_action_timeout = 600
-    bat_env = os.getenv("INSPIRE_BRIDGE_ACTION_TIMEOUT")
-    if bat_env:
-        try:
-            bridge_action_timeout = int(bat_env)
-        except ValueError as e:
-            raise ConfigError(
-                "Invalid INSPIRE_BRIDGE_ACTION_TIMEOUT value. It must be an integer number of seconds."
-            ) from e
-
-    return Config(
-        username="",
-        password="",
-        target_dir=target_dir,
-        git_platform=platform,
-        gitea_repo=gitea_repo,
-        gitea_token=gitea_token,
-        gitea_server=gitea_server,
-        gitea_log_workflow=os.getenv("INSP_GITEA_LOG_WORKFLOW", "retrieve_job_log.yml"),
-        gitea_sync_workflow=os.getenv("INSP_GITEA_SYNC_WORKFLOW", "sync_code.yml"),
-        github_repo=github_repo,
-        github_token=github_token,
-        github_server=github_server,
-        github_log_workflow=os.getenv("INSP_GITHUB_LOG_WORKFLOW", "retrieve_job_log.yml"),
-        github_sync_workflow=os.getenv("INSP_GITHUB_SYNC_WORKFLOW", "sync_code.yml"),
-        default_remote=os.getenv("INSPIRE_DEFAULT_REMOTE", "origin"),
-        remote_timeout=_parse_remote_timeout(os.getenv("INSP_REMOTE_TIMEOUT", "90")),
         bridge_action_timeout=bridge_action_timeout,
         bridge_action_denylist=_parse_denylist(os.getenv("INSPIRE_BRIDGE_DENYLIST")),
         ssh_port=_parse_ssh_port(os.getenv("INSPIRE_SSH_PORT")),

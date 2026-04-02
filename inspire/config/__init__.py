@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from inspire.config.env import (
     _parse_denylist,
-    _parse_remote_timeout,
     build_env_exports,
     resolve_remote_env,
 )
 from inspire.config.load import config_from_files_and_env, get_config_paths
-from inspire.config.load_env import config_from_env, config_from_env_for_sync
+from inspire.config.load_env import config_from_env
 from inspire.config.models import (
     CONFIG_FILENAME,
     PROJECT_CONFIG_DIR,
@@ -68,10 +67,8 @@ __all__ = [
     "_parse_float",
     "_parse_int",
     "_parse_list",
-    "_parse_remote_timeout",
     "build_env_exports",
     "config_from_env",
-    "config_from_env_for_sync",
     "config_from_files_and_env",
     "get_categories",
     "get_config_paths",

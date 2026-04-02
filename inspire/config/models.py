@@ -57,27 +57,7 @@ class Config:
     max_retries: int = 3
     retry_delay: float = 1.0
 
-    # Git platform selection
-    git_platform: Optional[str] = None
-
-    # Gitea / remote log settings
-    gitea_repo: Optional[str] = None
-    gitea_token: Optional[str] = None
-    gitea_server: str = "https://codeberg.org"
-    gitea_log_workflow: str = "retrieve_job_log.yml"
-    gitea_sync_workflow: str = "sync_code.yml"
-    gitea_bridge_workflow: str = "run_bridge_action.yml"
-
-    # GitHub settings
-    github_repo: Optional[str] = None
-    github_token: Optional[str] = None
-    github_server: str = "https://github.com"
-    github_log_workflow: str = "retrieve_job_log.yml"
-    github_sync_workflow: str = "sync_code.yml"
-    github_bridge_workflow: str = "run_bridge_action.yml"
-
     log_cache_dir: str = "~/.inspire/logs"
-    remote_timeout: int = 90
 
     # Sync settings
     default_remote: str = "origin"
@@ -243,12 +223,6 @@ class Config:
         from inspire.config.load_env import config_from_env
 
         return config_from_env(require_target_dir=require_target_dir)
-
-    @classmethod
-    def from_env_for_sync(cls) -> "Config":
-        from inspire.config.load_env import config_from_env_for_sync
-
-        return config_from_env_for_sync()
 
     @classmethod
     def from_files_and_env(

@@ -23,14 +23,13 @@
 - Formatters: `inspire/cli/formatters/human_formatter.py` (human-readable) and `json_formatter.py` (machine-readable).
 - Domain packages (preferred for shared logic used by CLI):
   - `inspire/config/`: config models, TOML/env loading, schema/options, runtime helpers.
-  - `inspire/config/options/`: option groups in `api.py`, `forge.py`, `hpc.py`, `infra.py`, `project.py`.
+  - `inspire/config/options/`: option groups in `api.py`, `hpc.py`, `infra.py`, `project.py`.
   - `inspire/platform/openapi/`: OpenAPI client/auth/jobs/hpc_jobs/nodes/resources.
   - `inspire/platform/web/`: web session (SSO) + browser-only APIs (`session/`, `browser_api/`, `resources.py`).
   - `inspire/platform/web/browser_api/`: split domain modules including `availability/`, `jobs.py`, `notebooks.py`, `images.py`, `projects.py`, `workspaces.py`, `playwright_notebooks.py`, `rtunnel.py`.
   - `inspire/bridge/tunnel/`: tunnel config/models + rtunnel/ssh/scp/sync helpers.
-  - `inspire/bridge/forge/`: Forge/Gitea workflow, logs, artifacts, and API helpers.
 - `tests/` contains pytest suites across CLI, bridge/tunnel, openapi, web session, and notebook flows (for example, `tests/test_cli_commands.py`, `tests/test_cli_smoke.py`).
-- `examples/` holds workflow YAML examples for Gitea/Forgejo usage.
+- `examples/` holds miscellaneous setup examples.
 - `scripts/` contains internal exploration/automation utilities and is gitignored.
 - `docs/` and `README.md` document usage; `bin/inspire` is a repo-local wrapper.
 
@@ -79,7 +78,6 @@
   2. `./.inspire/config.toml` (project)
   3. Environment variables
 - Typical required inputs for authenticated commands are `INSPIRE_USERNAME`, `INSPIRE_PASSWORD` (or `[accounts."<username>"].password`), and `INSPIRE_TARGET_DIR`.
-- Gitea/Forge workflow sync and remote logs rely on `INSP_GITEA_REPO`, `INSP_GITEA_TOKEN`, and `INSP_GITEA_SERVER`.
 - Optional: `INSPIRE_SHM_SIZE` (or `job.shm_size` in config) sets default shared memory (GiB) for job and notebook creation.
 - Optional: `INSPIRE_WORKSPACE_HPC_ID` (or `workspaces.hpc` in config) routes HPC jobs to the dedicated CPU/HPC workspace.
 - Optional: `INSPIRE_HPC_IMAGE`, `INSPIRE_HPC_IMAGE_TYPE`, and `INSPIRE_HPC_DEFAULT_PRESET` provide HPC-specific defaults.

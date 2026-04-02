@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- Removed deprecated `inspire bridge exec --no-tunnel` flag. SSH tunnel is now the default execution path for command execution; workflow path is selected by artifact options.
+- Removed deprecated `inspire bridge exec --no-tunnel` flag. SSH tunnel is now the only execution path for command execution.
 - Removed deprecated `inspire sync --via-action` and `--transport` flags. `inspire sync` now uses the SSH tunnel path only.
 
 ### Features
@@ -35,6 +35,6 @@
 - SSH tunnel management (add, remove, status, list, ssh-config)
 - Configuration management (show, check, env) with TOML + env var loading
 - Project initialization with environment detection
-- Dual execution paths: SSH tunnel (fast) and Gitea/GitHub Actions (fallback)
+- SSH tunnel execution for bridge commands
 - Human-readable and JSON output formatting
 - Remote environment variable injection via `[remote_env]` config

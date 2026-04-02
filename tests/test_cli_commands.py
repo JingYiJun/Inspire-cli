@@ -573,9 +573,7 @@ def test_resources_list_ignores_cpu_rows_outside_cpu_hpc_workspaces(
         lambda *args, **kwargs: FakeSession(),
     )
 
-    def fake_get_accurate_gpu_availability(
-        workspace_id=None, session=None, _retry=True
-    ):  # noqa: ARG001
+    def fake_get_accurate_gpu_availability(workspace_id=None, session=None, _retry=True):  # noqa: ARG001
         if workspace_id == "ws-gpu":
             return [
                 browser_api_module.GPUAvailability(
@@ -658,9 +656,7 @@ def test_resources_list_ignores_cpu_rows_outside_cpu_hpc_workspaces(
         fake_list_notebook_compute_groups,
     )
 
-    def fake_get_resource_prices(
-        workspace_id=None, logic_compute_group_id="", session=None
-    ):  # noqa: ARG001
+    def fake_get_resource_prices(workspace_id=None, logic_compute_group_id="", session=None):  # noqa: ARG001
         if workspace_id == "ws-asc" and logic_compute_group_id == "lcg-asc":
             return [
                 {"gpu_count": 0, "cpu_count": 32, "memory_size_gib": 256},
@@ -718,9 +714,7 @@ def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
         lambda *args, **kwargs: [],
     )
 
-    def fake_get_accurate_gpu_availability(
-        workspace_id=None, session=None, _retry=True
-    ):  # noqa: ARG001
+    def fake_get_accurate_gpu_availability(workspace_id=None, session=None, _retry=True):  # noqa: ARG001
         if workspace_id == "ws-net":
             return [
                 browser_api_module.GPUAvailability(
@@ -795,7 +789,9 @@ def test_resources_list_queries_configured_workspaces_by_default(
     calls: list[str | None] = []
 
     def fake_get_accurate_gpu_availability(
-        workspace_id=None, session=None, _retry=True  # noqa: ARG001
+        workspace_id=None,
+        session=None,
+        _retry=True,  # noqa: ARG001
     ):
         calls.append(workspace_id)
         ws_id = str(workspace_id)
@@ -926,9 +922,7 @@ def test_resources_list_prints_schedulable_specs_with_downward_bucketing(
         lambda *args, **kwargs: FakeSession(),
     )
 
-    def fake_get_accurate_gpu_availability(
-        workspace_id=None, session=None, _retry=True
-    ):  # noqa: ARG001
+    def fake_get_accurate_gpu_availability(workspace_id=None, session=None, _retry=True):  # noqa: ARG001
         if workspace_id == "ws-gpu":
             return [
                 browser_api_module.GPUAvailability(
@@ -982,9 +976,7 @@ def test_resources_list_prints_schedulable_specs_with_downward_bucketing(
         fake_fetch_workspace_availability,
     )
 
-    def fake_get_resource_prices(
-        workspace_id=None, logic_compute_group_id="", session=None
-    ):  # noqa: ARG001
+    def fake_get_resource_prices(workspace_id=None, logic_compute_group_id="", session=None):  # noqa: ARG001
         if workspace_id == "ws-gpu" and logic_compute_group_id == "lcg-gpu":
             return [
                 {"gpu_count": 8},
@@ -1946,16 +1938,9 @@ def test_job_logs_path_and_tail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
     local_log_path.write_text("line1\nline2\nline3\n", encoding="utf-8")
 
-    # Mock fetch_remote_log_via_bridge to do nothing (log already cached)
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
-
-    def fake_fetch(config, job_id, remote_log_path, cache_path, refresh):  # noqa: ARG001
-        pass  # Log already exists locally
-
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fake_fetch)
     monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
 
     runner = CliRunner()
@@ -1996,16 +1981,9 @@ def test_job_logs_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
     local_log_path.write_text("test log content\n", encoding="utf-8")
 
-    # Mock fetch_remote_log_via_bridge
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
-
-    def fake_fetch(config, job_id, remote_log_path, cache_path, refresh):  # noqa: ARG001
-        pass
-
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fake_fetch)
     monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
 
     runner = CliRunner()
@@ -2043,13 +2021,7 @@ def test_job_logs_legacy_filename_is_migrated(monkeypatch: pytest.MonkeyPatch, t
 
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
-
-    def fail_fetch(*args, **kwargs):  # noqa: ARG001
-        raise AssertionError("fetch should not be called when legacy cache exists")
-
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fail_fetch)
     monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
 
     runner = CliRunner()
@@ -2087,9 +2059,7 @@ def test_job_logs_missing_file_sets_exit_code(monkeypatch: pytest.MonkeyPatch, t
     assert f"No log file found for job {TEST_JOB_ID}" in result.output
 
 
-def test_job_logs_follow_json_skips_ssh_follow_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_job_logs_follow_json_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     patch_config_and_auth(monkeypatch, tmp_path)
 
     config = make_test_config(tmp_path)
@@ -2108,24 +2078,13 @@ def test_job_logs_follow_json_skips_ssh_follow_path(
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    called = {"workflow_follow": False}
     monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        job_logs_module,
-        "_follow_logs_via_ssh",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
-    )
-    monkeypatch.setattr(
-        job_logs_module,
-        "_follow_logs",
-        lambda *args, **kwargs: (called.__setitem__("workflow_follow", True) or EXIT_SUCCESS),
-    )
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--json", "job", "logs", TEST_JOB_ID, "--follow"])
 
-    assert result.exit_code == EXIT_SUCCESS
-    assert called["workflow_follow"] is True
+    assert result.exit_code == EXIT_VALIDATION_ERROR
+    assert "--json cannot be combined with --follow" in result.output
 
 
 def test_job_logs_follow_returns_follow_exit_code(
@@ -2150,12 +2109,12 @@ def test_job_logs_follow_returns_follow_exit_code(
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
     monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
-    monkeypatch.setattr(job_logs_module, "_follow_logs", lambda *args, **kwargs: EXIT_GENERAL_ERROR)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--follow"])
 
     assert result.exit_code == EXIT_GENERAL_ERROR
+    assert "SSH tunnel not available for bridge 'gpu-main'" in result.output
 
 
 def test_job_logs_bridge_option_uses_named_tunnel(
@@ -2210,47 +2169,6 @@ def test_job_logs_bridge_requires_job_id(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert "--bridge require a JOB_ID" in result.output
 
 
-def test_job_logs_fallback_mentions_connected_bridge_candidates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    patch_config_and_auth(monkeypatch, tmp_path)
-
-    config = make_test_config(tmp_path)
-    cache = JobCache(config.get_expanded_cache_path())
-    remote_log_path = f"/train/logs/.inspire/training_master_{TEST_JOB_ID}.log"
-    cache.add_job(
-        job_id=TEST_JOB_ID,
-        name="test-job",
-        resource="H200",
-        command="echo test",
-        status="RUNNING",
-        log_path=remote_log_path,
-    )
-
-    local_cache_dir = Path(config.log_cache_dir)
-    local_cache_dir.mkdir(parents=True, exist_ok=True)
-    local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
-    local_log_path.write_text("cached log content\n", encoding="utf-8")
-
-    from importlib import import_module
-
-    job_logs_module = import_module("inspire.cli.commands.job.job_logs")
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
-    monkeypatch.setattr(
-        job_logs_module,
-        "_find_connected_tunnel_bridges",
-        lambda exclude=None, timeout=5: ["gpu-main"],  # noqa: ARG005
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID])
-
-    assert result.exit_code == EXIT_SUCCESS
-    assert "Tunnel default bridge not available" in result.output
-    assert "Connected tunnel profile(s): gpu-main" in result.output
-    assert "may not share the same remote directory/log path" in result.output
-
-
 def test_job_logs_fail_fast_when_default_bridge_stopped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -2270,7 +2188,6 @@ def test_job_logs_fail_fast_when_default_bridge_stopped(
 
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
     fake_tunnel_config = tunnel_module.TunnelConfig(
@@ -2283,21 +2200,14 @@ def test_job_logs_fail_fast_when_default_bridge_stopped(
         default_bridge="gpu-main",
     )
 
-    called = {"fetch_remote_log": False}
-
-    def fake_fetch(*args, **kwargs):  # noqa: ANN002, ANN003
-        called["fetch_remote_log"] = True
-
     monkeypatch.setattr(job_logs_module, "load_tunnel_config", lambda: fake_tunnel_config)
     monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fake_fetch)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--tail", "80"])
 
     assert result.exit_code == EXIT_GENERAL_ERROR
     assert "SSH tunnel not available for bridge 'gpu-main'" in result.output
-    assert called["fetch_remote_log"] is False
 
 
 def test_tunnel_list_places_connected_bridges_first(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -16,20 +16,6 @@ _ENV_REF_RE = re.compile(
 )
 
 
-def _parse_remote_timeout(value: str) -> int:
-    """Parse INSP_REMOTE_TIMEOUT environment variable."""
-    try:
-        timeout = int(value)
-        if timeout < 5:
-            # Warn but allow small values for testing
-            pass
-        return timeout
-    except ValueError as e:
-        raise ConfigError(
-            "Invalid INSP_REMOTE_TIMEOUT value. It must be an integer number of seconds."
-        ) from e
-
-
 def _parse_denylist(value: Optional[str]) -> list[str]:
     """Parse denylist from env (comma or newline separated)."""
     if not value:
