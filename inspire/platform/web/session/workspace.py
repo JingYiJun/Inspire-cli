@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .models import WebSession
+
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_node_specs(
@@ -41,8 +45,8 @@ def fetch_workspace_availability(
     *,
     request_json_fn: Callable[..., dict],
     base_url: str = "https://api.example.com",
-    progress_callback: Optional[Callable[[int, int], None]] = None,
     workspace_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> list[dict]:
     """Fetch workspace-specific GPU availability.
 
@@ -67,36 +71,23 @@ def fetch_workspace_availability(
         if not session.cookies:
             raise ValueError("Session expired or invalid (missing storage state)")
 
-    effective_workspace_id = workspace_id or session.workspace_id
-    if not effective_workspace_id:
+    resolved_workspace_id = str(workspace_id or session.workspace_id or "").strip()
+    if not resolved_workspace_id:
         raise ValueError("No workspace_id in session. Please login again.")
 
-    referer = f"{base_url}/jobs/distributedTraining?spaceId={effective_workspace_id}"
-
-    try:
-        data = request_json_fn(
-            session,
-            "GET",
-            f"{base_url}/api/v1/cluster_nodes/workspace/{effective_workspace_id}",
-            headers={"Referer": referer},
-            timeout=30,
-        )
-        nodes = data.get("data", {}).get("nodes", [])
-        if isinstance(nodes, list):
-            return nodes
-    except Exception:
-        pass
+    url = f"{base_url}/api/v1/cluster_nodes/list"
+    body = {
+        "page_num": 1,
+        "page_size": -1,  # Get all nodes
+        "filter": {"workspace_id": resolved_workspace_id},
+    }
 
     data = request_json_fn(
         session,
         "POST",
-        f"{base_url}/api/v1/cluster_nodes/list",
-        body={
-            "page_num": 1,
-            "page_size": -1,
-            "filter": {"workspace_id": effective_workspace_id},
-        },
-        headers={"Referer": referer},
+        url,
+        body=body,
+        headers={"Referer": f"{base_url}/jobs/distributedTraining"},
         timeout=30,
     )
     return data.get("data", {}).get("nodes", [])
@@ -176,7 +167,7 @@ def fetch_gpu_availability(
 
         except Exception as e:
             # Skip groups that fail
-            print(f"Warning: Failed to fetch {group_id}: {e}")
+            logger.warning("Failed to fetch compute group %s: %s", group_id, e)
             continue
 
     return results

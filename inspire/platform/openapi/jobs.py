@@ -34,12 +34,24 @@ def create_training_job_smart(
     instance_count: Optional[int] = None,
     max_running_time_ms: Optional[str] = None,
     shm_gi: Optional[int] = None,
+    auto_fault_tolerance: bool = False,
 ) -> Dict[str, Any]:
     """Create training job with smart resource matching."""
     api._check_authentication()
 
     # Validate required parameters
     api._validate_required_params(name=name, command=command, resource=resource)
+
+    # Resolve workspace before resource matching so direct API callers do not
+    # need to manually warm the workspace-scoped spec cache first.
+    workspace_id = workspace_id or api.DEFAULT_WORKSPACE_ID
+
+    try:
+        api.resource_manager.ensure_specs_for_workspace(workspace_id)
+    except RuntimeError as e:
+        raise JobCreationError(
+            f"Failed to load resource specs for workspace {workspace_id}: {e}"
+        ) from e
 
     # Get recommended configuration
     try:
@@ -51,9 +63,10 @@ def create_training_job_smart(
 
     # Use defaults for optional parameters
     project_id = project_id or api.DEFAULT_PROJECT_ID
-    workspace_id = workspace_id or api.DEFAULT_WORKSPACE_ID
-    task_priority = task_priority or api.DEFAULT_TASK_PRIORITY
-    instance_count = instance_count or api.DEFAULT_INSTANCE_COUNT
+    if task_priority is None:
+        task_priority = api.DEFAULT_TASK_PRIORITY
+    if instance_count is None:
+        instance_count = api.DEFAULT_INSTANCE_COUNT
     max_running_time_ms = max_running_time_ms or api.DEFAULT_MAX_RUNNING_TIME
 
     # Set default shared memory size
@@ -84,6 +97,9 @@ def create_training_job_smart(
         "framework_config": [framework_item],
     }
 
+    if auto_fault_tolerance:
+        payload["auto_fault_tolerance"] = True
+
     try:
         result = api._make_request("POST", api.endpoints.TRAIN_JOB_CREATE, payload)
 
@@ -94,11 +110,61 @@ def create_training_job_smart(
 
         error_code = result.get("code")
         error_msg = result.get("message", "Unknown error")
+
+        # Check for invalid spec error and retry with refreshed specs
+        if _is_invalid_spec_error(error_code, error_msg):
+            logger.warning("Invalid spec_id detected, refreshing workspace specs...")
+            try:
+                api.resource_manager.refresh_workspace_specs(workspace_id)
+                # Get new recommended config with refreshed specs
+                spec_id, compute_group_id = api.resource_manager.get_recommended_config(
+                    resource, prefer_location
+                )
+                # Update payload with new spec_id
+                framework_item["spec_id"] = spec_id
+                payload["framework_config"] = [framework_item]
+                payload["logic_compute_group_id"] = compute_group_id
+
+                # Retry the request
+                result = api._make_request("POST", api.endpoints.TRAIN_JOB_CREATE, payload)
+
+                if result.get("code") == 0:
+                    job_id = result["data"].get("job_id")
+                    logger.info("🚀 Training job created successfully! Job ID: %s", job_id)
+                    return result
+
+                # If retry still fails, raise error
+                error_code = result.get("code")
+                error_msg = result.get("message", "Unknown error")
+                friendly_msg = _translate_api_error(error_code, error_msg)
+                raise JobCreationError(f"Failed to create training job: {friendly_msg}")
+
+            except RuntimeError as e:
+                raise JobCreationError(
+                    f"Failed to refresh resource specs for workspace {workspace_id}: {e}"
+                ) from e
+
         friendly_msg = _translate_api_error(error_code, error_msg)
         raise JobCreationError(f"Failed to create training job: {friendly_msg}")
 
     except requests.exceptions.RequestException as e:
         raise JobCreationError(f"Training job creation request failed: {str(e)}") from e
+
+
+def _is_invalid_spec_error(error_code: int, error_msg: str) -> bool:
+    """Check if API error indicates invalid spec_id."""
+    # Common patterns for invalid spec/quota errors
+    invalid_patterns = [
+        "quota",
+        "spec",
+        "resource",
+        "invalid",
+        "not found",
+        "not_exist",
+        "not exist",
+    ]
+    msg_lower = error_msg.lower()
+    return any(pattern in msg_lower for pattern in invalid_patterns)
 
 
 def get_job_detail(api, job_id: str) -> Dict[str, Any]:  # noqa: ANN001

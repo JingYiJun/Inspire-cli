@@ -29,6 +29,7 @@ from inspire.cli.utils.notebook_cli import (
     resolve_json_output,
 )
 from inspire.config import ConfigError
+from inspire.config.toml import _find_project_config
 from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web.session import DEFAULT_WORKSPACE_ID
@@ -113,7 +114,9 @@ def _resolve_image_id(
     return resolve_partial_id(ctx, partial, "image", matches, json_output)
 
 
-def _append_unique_workspace_id(candidates: list[str], seen: set[str], workspace_id: Optional[str]) -> None:
+def _append_unique_workspace_id(
+    candidates: list[str], seen: set[str], workspace_id: Optional[str]
+) -> None:
     value = str(workspace_id or "").strip()
     if not value or value == DEFAULT_WORKSPACE_ID or value in seen:
         return
@@ -251,9 +254,7 @@ def _choose_image_match(
     click.echo(f"{lookup_kind.capitalize()} '{query}' matches {len(matches)} images:")
     for idx, item in enumerate(matches, start=1):
         label = item.name or item.url or item.image_id
-        click.echo(
-            f"  [{idx}] {item.image_id}  {label}  {item.source}  {item.workspace_name}"
-        )
+        click.echo(f"  [{idx}] {item.image_id}  {label}  {item.source}  {item.workspace_name}")
 
     choice = click.prompt(
         "Select image",
@@ -427,11 +428,13 @@ def list_images_cmd(
             _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
             return
     else:
-        try:
-            resolved_workspace_id = select_workspace_id(config)
-        except ConfigError as e:
-            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-            return
+        resolved_workspace_id = str(getattr(config, "job_workspace_id", "") or "").strip() or None
+        if not resolved_workspace_id:
+            try:
+                resolved_workspace_id = select_workspace_id(config)
+            except ConfigError as e:
+                _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+                return
 
         resolved_workspace_id = resolved_workspace_id or getattr(session, "workspace_id", None)
         resolved_workspace_id = (
@@ -454,7 +457,7 @@ def list_images_cmd(
 
     try:
         if source == "all":
-            for src_key in ("official", "public", "private"):
+            for src_key in _IMAGE_SEARCH_SOURCES:
                 items = browser_api_module.list_images_by_source(
                     source=src_key,
                     workspace_id=resolved_workspace_id,
@@ -657,7 +660,7 @@ def register_image_cmd(
     visibility_value = (
         "VISIBILITY_PUBLIC" if visibility.lower() == "public" else "VISIBILITY_PRIVATE"
     )
-    add_method_value = 2 if method.lower() == "address" else 0
+    add_method_value = "EXTERNAL_ADDRESS" if method.lower() == "address" else "DIRECT_PUSH"
 
     try:
         result = browser_api_module.create_image(
@@ -844,9 +847,14 @@ def delete_image_cmd(
 
     image_id = _resolve_image_id(ctx, image_id, json_output, session)
 
-    if not force and not json_output:
+    if not force:
         if not click.confirm(f"Delete image '{image_id}'?"):
-            click.echo("Cancelled.")
+            if json_output:
+                click.echo(
+                    json_formatter.format_json({"image_id": image_id, "status": "cancelled"})
+                )
+            else:
+                click.echo("Cancelled.")
             return
 
     try:
@@ -916,7 +924,7 @@ def set_default_image_cmd(
         )
         return
 
-    config_path = Path(".inspire") / "config.toml"
+    config_path = _find_project_config() or Path.cwd() / ".inspire" / "config.toml"
 
     # Read existing config if present
     existing_data: dict = {}

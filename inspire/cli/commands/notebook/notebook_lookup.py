@@ -61,6 +61,41 @@ def _sort_notebook_items(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)
 
 
+def _normalize_notebook_id(notebook_id: str) -> str:
+    """Normalize notebook ID to UUID format (without notebook- prefix)."""
+    if notebook_id.startswith("notebook-"):
+        return notebook_id[len("notebook-") :]
+    return notebook_id
+
+
+def _sort_notebook_items_by_tunnel_priority(
+    items: list[dict], tunneled_ids: set[str]
+) -> list[dict]:
+    """Sort notebooks: those with tunnels first, then by created_at descending."""
+    # Normalize tunnel IDs to UUID format for comparison
+    normalized_tunnel_ids = {_normalize_notebook_id(tid) for tid in tunneled_ids}
+
+    # Separate tunneled and non-tunneled notebooks
+    tunneled = []
+    non_tunneled = []
+    for item in items:
+        notebook_id = item.get("notebook_id") or item.get("id", "")
+        normalized_id = _normalize_notebook_id(notebook_id)
+        if normalized_id in normalized_tunnel_ids:
+            tunneled.append(item)
+        else:
+            non_tunneled.append(item)
+
+    # Sort each group by created_at descending
+    tunneled = sorted(tunneled, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    non_tunneled = sorted(
+        non_tunneled, key=lambda item: str(item.get("created_at") or ""), reverse=True
+    )
+
+    # Tunneled notebooks come first
+    return tunneled + non_tunneled
+
+
 def _looks_like_notebook_id(value: str) -> bool:
     value = value.strip()
     if not value:
@@ -375,7 +410,6 @@ def _collect_workspace_ids_for_lookup(
         getattr(config, "workspace_cpu_id", None),
         getattr(config, "workspace_gpu_id", None),
         getattr(config, "workspace_internet_id", None),
-        getattr(config, "job_workspace_id", None),
     ):
         if ws_id:
             candidates.append(str(ws_id))
@@ -392,7 +426,12 @@ def _collect_workspace_ids_for_lookup(
 
     resolved_ws = None
     try:
-        resolved_ws = select_workspace_id(config)
+        resolved_ws = select_workspace_id(
+            config,
+            legacy_workspace_id=getattr(config, "job_workspace_id", None)
+            or getattr(config, "default_workspace_id", None)
+            or getattr(config, "notebook_workspace_id", None),
+        )
     except Exception:
         resolved_ws = None
 
@@ -486,7 +525,8 @@ def _resolve_notebook_id(
             "No workspace_id configured or available for notebook lookup.",
             EXIT_CONFIG_ERROR,
             hint=(
-                "Set [workspaces].cpu/[workspaces].gpu in config.toml, set INSPIRE_WORKSPACE_ID, "
+                'Set [accounts."<username>".workspaces].cpu/'
+                '[accounts."<username>".workspaces].gpu in config.toml, use --workspace, '
                 "or pass a notebook ID directly."
             ),
         )
@@ -604,6 +644,7 @@ __all__ = [
     "_get_current_user_detail",
     "_list_notebooks_for_workspace",
     "_looks_like_notebook_id",
+    "_normalize_notebook_id",
     "_notebook_id_from_item",
     "_resolve_notebook_id",
     "_resolve_partial_notebook_id",

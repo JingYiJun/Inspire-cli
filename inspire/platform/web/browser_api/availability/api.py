@@ -43,14 +43,44 @@ def list_compute_groups(
     return data.get("data", {}).get("logic_compute_groups", [])
 
 
+def _dedupe_workspace_ids(workspace_ids: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw_workspace_id in workspace_ids:
+        workspace_id = str(raw_workspace_id or "").strip()
+        if not workspace_id or workspace_id in seen:
+            continue
+        seen.add(workspace_id)
+        ordered.append(workspace_id)
+    return ordered
+
+
 def get_accurate_gpu_availability(
     workspace_id: Optional[str] = None,
+    workspace_ids: Optional[list[str]] = None,
     session: Optional[WebSession] = None,
     _retry: bool = True,
 ) -> list[GPUAvailability]:
     """Get accurate GPU availability for all compute groups."""
     if session is None:
         session = get_web_session()
+
+    if workspace_ids is not None:
+        merged: dict[str, GPUAvailability] = {}
+        for resolved_workspace_id in _dedupe_workspace_ids(workspace_ids):
+            scoped = get_accurate_gpu_availability(
+                workspace_id=resolved_workspace_id,
+                session=session,
+                _retry=_retry,
+            )
+            for item in scoped:
+                existing = merged.get(item.group_id)
+                if existing is None:
+                    merged[item.group_id] = item
+                    continue
+                if resolved_workspace_id not in existing.workspace_ids:
+                    existing.workspace_ids.append(resolved_workspace_id)
+        return list(merged.values())
 
     if workspace_id is None:
         workspace_id = session.workspace_id or DEFAULT_WORKSPACE_ID
@@ -107,6 +137,7 @@ def get_accurate_gpu_availability(
                 used_gpus=gpu_used,
                 available_gpus=gpu_available,
                 low_priority_gpus=gpu_low_priority,
+                workspace_ids=[workspace_id],
             )
         )
 

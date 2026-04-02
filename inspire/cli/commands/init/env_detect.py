@@ -66,6 +66,7 @@ def _generate_toml_content(
     section_order = [
         "auth",
         "api",
+        "defaults",
         "paths",
         "git",
         "gitea",

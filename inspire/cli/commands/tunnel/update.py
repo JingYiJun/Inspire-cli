@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import sys
 
 import click
 
+from ._ssh_config_sync import sync_installed_ssh_config
 from inspire.bridge.tunnel import load_tunnel_config, save_tunnel_config
 from inspire.cli.context import Context, EXIT_CONFIG_ERROR, pass_context
-from inspire.cli.formatters import human_formatter, json_formatter
+from inspire.cli.formatters import json_formatter
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.errors import exit_with_error as _handle_error
+from inspire.cli.utils.notebook_cli import resolve_json_output
+from inspire.cli.utils.output import emit_info, emit_success, emit_warning
 
 
 @click.command("update")
@@ -30,6 +34,7 @@ from inspire.cli.formatters import human_formatter, json_formatter
     default=None,
     help="Mark bridge as having no internet access",
 )
+@json_option
 @pass_context
 def tunnel_update(
     ctx: Context,
@@ -39,7 +44,9 @@ def tunnel_update(
     ssh_port: int,
     has_internet: bool,
     no_internet: bool,
+    json_output: bool = False,
 ) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Update an existing bridge profile.
 
     \b
@@ -52,37 +59,20 @@ def tunnel_update(
     config = load_tunnel_config()
 
     if name not in config.bridges:
-        if ctx.json_output:
-            click.echo(
-                json_formatter.format_json_error(
-                    "NotFound",
-                    f"Bridge '{name}' not found",
-                    EXIT_CONFIG_ERROR,
-                ),
-                err=True,
-            )
-        else:
-            click.echo(human_formatter.format_error(f"Bridge '{name}' not found"), err=True)
-        sys.exit(EXIT_CONFIG_ERROR)
+        _handle_error(
+            ctx,
+            "NotFound",
+            f"Bridge '{name}' not found",
+            EXIT_CONFIG_ERROR,
+        )
 
     if has_internet and no_internet:
-        if ctx.json_output:
-            click.echo(
-                json_formatter.format_json_error(
-                    "ValidationError",
-                    "Cannot specify both --has-internet and --no-internet",
-                    EXIT_CONFIG_ERROR,
-                ),
-                err=True,
-            )
-        else:
-            click.echo(
-                human_formatter.format_error(
-                    "Cannot specify both --has-internet and --no-internet"
-                ),
-                err=True,
-            )
-        sys.exit(EXIT_CONFIG_ERROR)
+        _handle_error(
+            ctx,
+            "ValidationError",
+            "Cannot specify both --has-internet and --no-internet",
+            EXIT_CONFIG_ERROR,
+        )
 
     bridge = config.bridges[name]
     updated_fields: list[str] = []
@@ -104,20 +94,15 @@ def tunnel_update(
         updated_fields.append("has_internet")
 
     if not updated_fields:
-        message = (
-            "No fields to update. Use --url, --ssh-user, --ssh-port, --has-internet, "
-            "or --no-internet."
+        _handle_error(
+            ctx,
+            "ValidationError",
+            "No fields to update. Use --url, --ssh-user, --ssh-port, --has-internet, or --no-internet.",
+            EXIT_CONFIG_ERROR,
         )
-        if ctx.json_output:
-            click.echo(
-                json_formatter.format_json_error("ValidationError", message, EXIT_CONFIG_ERROR),
-                err=True,
-            )
-        else:
-            click.echo(human_formatter.format_error(message), err=True)
-        sys.exit(EXIT_CONFIG_ERROR)
 
     save_tunnel_config(config)
+    ssh_synced, ssh_sync_error = sync_installed_ssh_config(config)
 
     if ctx.json_output:
         click.echo(
@@ -127,18 +112,33 @@ def tunnel_update(
                     "name": name,
                     "updated_fields": updated_fields,
                     "bridge": bridge.to_dict(),
+                    "ssh_config_synced": ssh_synced,
                 }
             )
         )
         return
 
-    click.echo(f"Updated bridge: {name}")
+    emit_success(
+        ctx,
+        payload={
+            "status": "updated",
+            "name": name,
+            "updated_fields": updated_fields,
+            "bridge": bridge.to_dict(),
+            "ssh_config_synced": ssh_synced,
+        },
+        text=f"Updated bridge: {name}",
+    )
     for field in updated_fields:
         if field == "url":
-            click.echo(f"  URL: {bridge.proxy_url}")
+            emit_info(ctx, f"  URL: {bridge.proxy_url}")
         elif field == "ssh_user":
-            click.echo(f"  SSH user: {bridge.ssh_user}")
+            emit_info(ctx, f"  SSH user: {bridge.ssh_user}")
         elif field == "ssh_port":
-            click.echo(f"  SSH port: {bridge.ssh_port}")
+            emit_info(ctx, f"  SSH port: {bridge.ssh_port}")
         elif field == "has_internet":
-            click.echo(f"  Internet: {'yes' if bridge.has_internet else 'no'}")
+            emit_info(ctx, f"  Internet: {'yes' if bridge.has_internet else 'no'}")
+    if ssh_synced:
+        emit_info(ctx, "  SSH config: synced")
+    elif ssh_sync_error:
+        emit_warning(ctx, f"  SSH config sync skipped: {ssh_sync_error}")

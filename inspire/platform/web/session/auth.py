@@ -198,7 +198,7 @@ def login_with_playwright(
 
         # Extract workspace_id (spaceId)
         # Priority: 1) env var override, 2) auto-detect from browser, 3) default placeholder
-        workspace_id = os.environ.get("INSPIRE_WORKSPACE_ID")
+        workspace_id = os.environ.get("INSPIRE_WORKSPACE_ID", "").strip()
         if not workspace_id:
             try:
                 detected = page.evaluate("() => window.localStorage.getItem('spaceId')")
@@ -290,7 +290,7 @@ def get_web_session(force_refresh: bool = False, require_workspace: bool = False
         A valid WebSession with storage_state and optionally workspace_id.
     """
     # Check for workspace override from environment
-    env_workspace_id = os.environ.get("INSPIRE_WORKSPACE_ID")
+    env_workspace_id = os.environ.get("INSPIRE_WORKSPACE_ID", "").strip()
 
     # Resolve credentials early so we can avoid reusing a cache from another user.
     credentials_error: Optional[ValueError] = None

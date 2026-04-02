@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import re
-import sys
-from pathlib import Path
 
 import click
 
@@ -13,18 +10,25 @@ from inspire.bridge.tunnel import (
     generate_all_ssh_configs,
     generate_ssh_config,
     get_rtunnel_path,
+    install_all_ssh_configs,
     install_ssh_config,
     load_tunnel_config,
 )
 from inspire.cli.context import Context, EXIT_CONFIG_ERROR, EXIT_GENERAL_ERROR, pass_context
-from inspire.cli.formatters import human_formatter, json_formatter
+from inspire.cli.formatters import json_formatter
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.errors import exit_with_error as _handle_error
+from inspire.cli.utils.notebook_cli import resolve_json_output
+from inspire.cli.utils.output import emit_info, emit_success
 
 
 @click.command("ssh-config")
 @click.option("--bridge", "-b", help="Generate config for specific bridge only")
 @click.option("--install", is_flag=True, help="Automatically append to ~/.ssh/config")
+@json_option
 @pass_context
-def tunnel_ssh_config(ctx: Context, bridge: str, install: bool) -> None:
+def tunnel_ssh_config(ctx: Context, bridge: str, install: bool, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Generate SSH config for direct SSH access to all bridges.
 
     This allows using 'ssh <bridge-name>', 'scp', 'rsync', etc.
@@ -52,21 +56,24 @@ def tunnel_ssh_config(ctx: Context, bridge: str, install: bool) -> None:
         config = load_tunnel_config()
 
         if not config.bridges:
-            click.echo(
-                human_formatter.format_error(
-                    "No bridges configured. Run 'inspire tunnel add <name> <URL>' first."
-                ),
-                err=True,
+            _handle_error(
+                ctx,
+                "ConfigError",
+                "No bridges configured. Run 'inspire tunnel add <name> <URL>' first.",
+                EXIT_CONFIG_ERROR,
             )
-            sys.exit(EXIT_CONFIG_ERROR)
 
         rtunnel_path = get_rtunnel_path(config)
 
         if bridge:
             bridge_profile = config.get_bridge(bridge)
             if not bridge_profile:
-                click.echo(human_formatter.format_error(f"Bridge '{bridge}' not found"), err=True)
-                sys.exit(EXIT_CONFIG_ERROR)
+                _handle_error(
+                    ctx,
+                    "NotFound",
+                    f"Bridge '{bridge}' not found",
+                    EXIT_CONFIG_ERROR,
+                )
 
             ssh_config = generate_ssh_config(bridge_profile, rtunnel_path, host_alias=bridge)
 
@@ -83,16 +90,30 @@ def tunnel_ssh_config(ctx: Context, bridge: str, install: bool) -> None:
                 return
 
             if install:
-                result = install_ssh_config(ssh_config, bridge_profile.name)
+                result = install_ssh_config(ssh_config, bridge)
                 if result["updated"]:
-                    click.echo(
-                        human_formatter.format_success(f"Updated '{bridge}' entry in ~/.ssh/config")
+                    emit_success(
+                        ctx,
+                        payload={
+                            "bridge": bridge,
+                            "action": "updated",
+                            "config_path": "~/.ssh/config",
+                        },
+                        text=f"Updated '{bridge}' entry in ~/.ssh/config",
                     )
                 else:
-                    click.echo(human_formatter.format_success(f"Added '{bridge}' to ~/.ssh/config"))
-                click.echo("")
-                click.echo("You can now use:")
-                click.echo(f"  ssh {bridge}")
+                    emit_success(
+                        ctx,
+                        payload={
+                            "bridge": bridge,
+                            "action": "added",
+                            "config_path": "~/.ssh/config",
+                        },
+                        text=f"Added '{bridge}' to ~/.ssh/config",
+                    )
+                emit_info(ctx, "")
+                emit_info(ctx, "You can now use:")
+                emit_info(ctx, f"  ssh {bridge}")
             else:
                 click.echo(f"SSH config for bridge '{bridge}':\n")
                 click.echo("-" * 50)
@@ -115,47 +136,34 @@ def tunnel_ssh_config(ctx: Context, bridge: str, install: bool) -> None:
             return
 
         if install:
-            ssh_config_path = Path.home() / ".ssh" / "config"
-            ssh_config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            install_all_ssh_configs(config)
 
-            if ssh_config_path.exists():
-                content = ssh_config_path.read_text()
-                for bridge_profile in config.list_bridges():
-                    for bridge_name in bridge_profile.all_host_aliases():
-                        pattern = rf"Host\s+.*?\b{re.escape(bridge_name)}\b.*?(?=\nHost\s|\Z)"
-                        content = re.sub(pattern, "", content, flags=re.DOTALL | re.MULTILINE)
-                ssh_config_path.write_text(content)
-
-            with ssh_config_path.open("a", encoding="utf-8") as f:
-                f.write("\n")
-                f.write("# Inspire Bridges (auto-generated)\n")
-                f.write(all_configs)
-                f.write("\n")
-
-            click.echo(
-                human_formatter.format_success(
-                    f"Added {len(config.bridges)} bridge(s) to ~/.ssh/config"
-                )
+            emit_success(
+                ctx,
+                payload={
+                    "bridges": list(config.bridges.keys()),
+                    "action": "added",
+                    "config_path": "~/.ssh/config",
+                },
+                text=f"Added {len(config.bridges)} bridge(s) to ~/.ssh/config",
             )
-            click.echo("")
-            click.echo("You can now use:")
+            emit_info(ctx, "")
+            emit_info(ctx, "You can now use:")
             for b in sorted(config.bridges.keys()):
-                click.echo(f"  ssh {b}")
+                emit_info(ctx, f"  ssh {b}")
         else:
             click.echo("SSH config for all bridges:\n")
             click.echo("-" * 50)
             click.echo(all_configs)
             click.echo("-" * 50)
-            click.echo("")
-            click.echo("Or run with --install to auto-add:")
-            click.echo("  inspire tunnel ssh-config --install")
+            emit_info(ctx, "")
+            emit_info(ctx, "Or run with --install to auto-add:")
+            emit_info(ctx, "  inspire tunnel ssh-config --install")
 
     except TunnelError as e:
-        if ctx.json_output:
-            click.echo(
-                json_formatter.format_json_error("TunnelError", str(e), EXIT_GENERAL_ERROR),
-                err=True,
-            )
-        else:
-            click.echo(human_formatter.format_error(str(e)), err=True)
-        sys.exit(EXIT_GENERAL_ERROR)
+        _handle_error(
+            ctx,
+            "TunnelError",
+            str(e),
+            EXIT_GENERAL_ERROR,
+        )

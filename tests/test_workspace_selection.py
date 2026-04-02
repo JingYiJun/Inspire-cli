@@ -45,6 +45,12 @@ def test_select_cpu_for_cpu_only_requests() -> None:
     assert select_workspace_id(cfg, cpu_only=True) == WS_CPU
 
 
+def test_legacy_workspace_id_fallback_is_used_only_when_routed_alias_missing() -> None:
+    cfg = _cfg(workspace_cpu_id=None, workspace_gpu_id=None, workspace_internet_id=None)
+    explicit = "ws-11111111-1111-1111-1111-111111111111"
+    assert select_workspace_id(cfg, gpu_type="H200", legacy_workspace_id=explicit) == explicit
+
+
 def test_explicit_workspace_id_overrides() -> None:
     cfg = _cfg(workspace_cpu_id=WS_CPU)
     explicit = "ws-11111111-1111-1111-1111-111111111111"
@@ -67,7 +73,7 @@ def test_placeholder_workspace_id_is_rejected() -> None:
         select_workspace_id(cfg)
 
 
-def test_config_loads_workspaces_from_project_toml(
+def test_config_loads_workspaces_from_account_scoped_project_toml(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project_root = tmp_path / "proj"
@@ -76,7 +82,10 @@ def test_config_loads_workspaces_from_project_toml(
 
     (project_root / ".inspire" / "config.toml").write_text(
         """
-[workspaces]
+[auth]
+username = "proj-user"
+
+[accounts."proj-user".workspaces]
 cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
 gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
 internet = "ws-6040202d-b785-4b37-98b0-c68d65dd52ce"
@@ -88,6 +97,8 @@ special = "ws-22222222-2222-2222-2222-222222222222"
 
     monkeypatch.chdir(project_root)
     monkeypatch.setattr(Config, "GLOBAL_CONFIG_PATH", tmp_path / "no-global-config.toml")
+    monkeypatch.delenv("INSPIRE_USERNAME", raising=False)
+    monkeypatch.delenv("INSPIRE_PASSWORD", raising=False)
     monkeypatch.delenv("INSPIRE_WORKSPACE_ID", raising=False)
     monkeypatch.delenv("INSPIRE_WORKSPACE_CPU_ID", raising=False)
     monkeypatch.delenv("INSPIRE_WORKSPACE_GPU_ID", raising=False)
@@ -99,3 +110,39 @@ special = "ws-22222222-2222-2222-2222-222222222222"
     assert cfg.workspace_internet_id == WS_INET
     assert cfg.workspace_hpc_id == WS_HPC
     assert cfg.workspaces.get("special") == WS_SPECIAL
+
+
+def test_config_ignores_legacy_top_level_workspaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    (project_root / ".inspire").mkdir()
+
+    (project_root / ".inspire" / "config.toml").write_text(
+        """
+[auth]
+username = "proj-user"
+
+[workspaces]
+cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
+gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
+special = "ws-22222222-2222-2222-2222-222222222222"
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(project_root)
+    monkeypatch.setattr(Config, "GLOBAL_CONFIG_PATH", tmp_path / "no-global-config.toml")
+    monkeypatch.delenv("INSPIRE_USERNAME", raising=False)
+    monkeypatch.delenv("INSPIRE_PASSWORD", raising=False)
+    monkeypatch.delenv("INSPIRE_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("INSPIRE_WORKSPACE_CPU_ID", raising=False)
+    monkeypatch.delenv("INSPIRE_WORKSPACE_GPU_ID", raising=False)
+    monkeypatch.delenv("INSPIRE_WORKSPACE_INTERNET_ID", raising=False)
+
+    cfg, _ = Config.from_files_and_env(require_credentials=False)
+    assert cfg.workspace_cpu_id is None
+    assert cfg.workspace_gpu_id is None
+    assert cfg.workspace_internet_id is None
+    assert cfg.workspaces == {}

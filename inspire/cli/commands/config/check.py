@@ -16,9 +16,10 @@ from inspire.cli.context import (
     EXIT_GENERAL_ERROR,
     pass_context,
 )
-from inspire.cli.formatters import human_formatter, json_formatter
+from inspire.cli.formatters import json_formatter
 from inspire.cli.utils.auth import AuthManager, AuthenticationError
 from inspire.cli.utils.errors import exit_with_error as _handle_error
+from inspire.cli.utils.output import emit_error, emit_info, emit_success, emit_warning
 from inspire.config import (
     Config,
     ConfigError,
@@ -200,20 +201,8 @@ def _build_base_url_resolution(
 # ---------------------------------------------------------------------------
 
 
-@click.command("check")
-@click.option(
-    "--json",
-    "json_output_local",
-    is_flag=True,
-    help="Output as JSON (machine-readable). Equivalent to top-level --json.",
-)
-@pass_context
-def check_config(ctx: Context, json_output_local: bool) -> None:
-    """Check environment configuration and API authentication.
-
-    Verifies configuration (from files and environment) and attempts to
-    authenticate with the Inspire API.
-    """
+def _run_check_impl(ctx: Context, *, json_output_local: bool) -> None:
+    """Run config validation logic without going through Click wrappers."""
     ctx.json_output = bool(ctx.json_output or json_output_local)
     effective_json = ctx.json_output
 
@@ -272,40 +261,45 @@ def check_config(ctx: Context, json_output_local: bool) -> None:
             click.echo(json_formatter.format_json(result, success=auth_ok))
         else:
             if auth_ok:
-                click.echo(human_formatter.format_success("Configuration looks good"))
+                emit_success(ctx, payload=result, text="Configuration looks good")
             else:
-                click.echo(human_formatter.format_error("Authentication failed"))
+                emit_error(
+                    ctx,
+                    error_type="AuthenticationError",
+                    message="Authentication failed",
+                    exit_code=EXIT_AUTH_ERROR,
+                )
 
-            click.echo(f"\nUsername:     {cfg.username}")
-            click.echo(f"Base URL:     {cfg.base_url}")
-            click.echo(f"Target dir:   {cfg.target_dir or '(not set - required for logs)'}")
-            click.echo(f"Log pattern:  {cfg.log_pattern}")
-            click.echo(f"Job cache:    {cfg.get_expanded_cache_path()}")
-            click.echo(f"Timeout:      {cfg.timeout}s")
-            click.echo(f"Max retries:  {cfg.max_retries}")
-            click.echo(f"Retry delay:  {cfg.retry_delay}s")
-            click.echo("\nBase URL resolution:")
-            click.echo(f"  Value:                {base_url_resolution['value']}")
-            click.echo(f"  Source:               {base_url_resolution['source']}")
-            click.echo(f"  Precedence:           {base_url_resolution['precedence']}")
-            click.echo(
-                "  INSPIRE_BASE_URL set: "
-                f"{'yes' if base_url_resolution['env_present'] else 'no'}"
+            emit_info(ctx, f"\nUsername:     {cfg.username}")
+            emit_info(ctx, f"Base URL:     {cfg.base_url}")
+            emit_info(ctx, f"Target dir:   {cfg.target_dir or '(not set - required for logs)'}")
+            emit_info(ctx, f"Log pattern:  {cfg.log_pattern}")
+            emit_info(ctx, f"Job cache:    {cfg.get_expanded_cache_path()}")
+            emit_info(ctx, f"Timeout:      {cfg.timeout}s")
+            emit_info(ctx, f"Max retries:  {cfg.max_retries}")
+            emit_info(ctx, f"Retry delay:  {cfg.retry_delay}s")
+            emit_info(ctx, "\nBase URL resolution:")
+            emit_info(ctx, f"  Value:                {base_url_resolution['value']}")
+            emit_info(ctx, f"  Source:               {base_url_resolution['source']}")
+            emit_info(ctx, f"  Precedence:           {base_url_resolution['precedence']}")
+            emit_info(
+                ctx,
+                f"  INSPIRE_BASE_URL set: {'yes' if base_url_resolution['env_present'] else 'no'}",
             )
-            click.echo(
-                "  Global config:        "
-                f"{base_url_resolution['global_config_path'] or '(not found)'}"
+            emit_info(
+                ctx,
+                f"  Global config:        {base_url_resolution['global_config_path'] or '(not found)'}",
             )
-            click.echo(
-                "  Project config:       "
-                f"{base_url_resolution['project_config_path'] or '(not found)'}"
+            emit_info(
+                ctx,
+                f"  Project config:       {base_url_resolution['project_config_path'] or '(not found)'}",
             )
 
             if default_base_url_hint:
-                click.echo(click.style(f"  Note: {default_base_url_hint}", fg="yellow"))
+                emit_warning(ctx, f"  Note: {default_base_url_hint}")
 
             if auth_error:
-                click.echo(f"\nDetails: {auth_error}")
+                emit_info(ctx, f"\nDetails: {auth_error}")
 
         if not auth_ok:
             sys.exit(EXIT_AUTH_ERROR)
@@ -314,3 +308,20 @@ def check_config(ctx: Context, json_output_local: bool) -> None:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
     except Exception as e:
         _handle_error(ctx, "Error", str(e), EXIT_GENERAL_ERROR)
+
+
+@click.command("check")
+@click.option(
+    "--json",
+    "json_output_local",
+    is_flag=True,
+    help="Output as JSON (machine-readable). Equivalent to top-level --json.",
+)
+@pass_context
+def check_config(ctx: Context, json_output_local: bool) -> None:
+    """Check environment configuration and API authentication.
+
+    Verifies configuration (from files and environment) and attempts to
+    authenticate with the Inspire API.
+    """
+    _run_check_impl(ctx, json_output_local=json_output_local)

@@ -4,8 +4,28 @@ from __future__ import annotations
 
 import os
 
-from inspire.config.env import _parse_remote_timeout
+from inspire.config.env import _parse_denylist, _parse_remote_timeout
 from inspire.config.models import Config, ConfigError
+
+
+def _parse_ssh_port(value: str | None) -> int:
+    """Parse SSH port from environment variable.
+
+    Args:
+        value: The environment variable value (e.g., "22222")
+
+    Returns:
+        The parsed port number, or 22222 if not set/invalid
+    """
+    if not value:
+        return 22222
+    try:
+        port = int(value)
+        if 1 <= port <= 65535:
+            return port
+    except ValueError:
+        pass
+    return 22222
 
 
 def config_from_env(*, require_target_dir: bool = False) -> Config:
@@ -99,6 +119,8 @@ def config_from_env(*, require_target_dir: bool = False) -> Config:
         remote_timeout=_parse_remote_timeout(os.getenv("INSP_REMOTE_TIMEOUT", "90")),
         default_remote=os.getenv("INSPIRE_DEFAULT_REMOTE", "origin"),
         bridge_action_timeout=bridge_action_timeout,
+        bridge_action_denylist=_parse_denylist(os.getenv("INSPIRE_BRIDGE_DENYLIST")),
+        ssh_port=_parse_ssh_port(os.getenv("INSPIRE_SSH_PORT")),
     )
 
 
@@ -167,4 +189,6 @@ def config_from_env_for_sync() -> Config:
         default_remote=os.getenv("INSPIRE_DEFAULT_REMOTE", "origin"),
         remote_timeout=_parse_remote_timeout(os.getenv("INSP_REMOTE_TIMEOUT", "90")),
         bridge_action_timeout=bridge_action_timeout,
+        bridge_action_denylist=_parse_denylist(os.getenv("INSPIRE_BRIDGE_DENYLIST")),
+        ssh_port=_parse_ssh_port(os.getenv("INSPIRE_SSH_PORT")),
     )

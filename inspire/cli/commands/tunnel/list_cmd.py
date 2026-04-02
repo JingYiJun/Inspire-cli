@@ -10,6 +10,8 @@ from inspire.bridge.tunnel import load_tunnel_config
 from inspire.bridge.tunnel.ssh import _test_ssh_connection
 from inspire.cli.context import Context, pass_context
 from inspire.cli.formatters import human_formatter, json_formatter
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.notebook_cli import resolve_json_output
 
 
 def _check_bridges(bridges, config, timeout=5):
@@ -52,8 +54,10 @@ def _sort_bridges_for_display(bridges, *, ssh_status: dict[str, bool], no_check:
     is_flag=True,
     help="Skip live SSH connectivity check (faster output).",
 )
+@json_option
 @pass_context
-def tunnel_list(ctx: Context, no_check: bool) -> None:
+def tunnel_list(ctx: Context, no_check: bool, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """List all configured bridges.
 
     \b
@@ -66,7 +70,7 @@ def tunnel_list(ctx: Context, no_check: bool) -> None:
     bridges = config.list_bridges()
 
     if not bridges:
-        if ctx.json_output:
+        if json_output:
             click.echo(json_formatter.format_json({"bridges": [], "default": None}))
         else:
             click.echo("No bridges configured.")
@@ -81,7 +85,7 @@ def tunnel_list(ctx: Context, no_check: bool) -> None:
 
     ordered_bridges = _sort_bridges_for_display(bridges, ssh_status=ssh_status, no_check=no_check)
 
-    if ctx.json_output:
+    if json_output:
         bridge_dicts = []
         for b in ordered_bridges:
             d = b.to_dict()

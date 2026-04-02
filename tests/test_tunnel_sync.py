@@ -1,7 +1,5 @@
-from pathlib import Path
 from typing import Any
 
-from inspire.bridge.tunnel.models import BridgeProfile, TunnelConfig
 from inspire.bridge.tunnel import sync as sync_module
 
 
@@ -12,225 +10,262 @@ class FakeCompletedProcess:
         self.stderr = stderr
 
 
-def test_sync_via_rsync_runs_preflight_and_rsync(monkeypatch, tmp_path: Path) -> None:
-    source_dir = tmp_path / "src"
-    source_dir.mkdir()
-    (source_dir / "train.py").write_text("print('ok')\n", encoding="utf-8")
-
-    tunnel_config = TunnelConfig()
-    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
-    tunnel_config.add_bridge(bridge)
-
-    captured: dict[str, Any] = {}
-
-    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
-    monkeypatch.setattr(
-        sync_module,
-        "_resolve_bridge_and_proxy",
-        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
-    )
+def test_sync_via_ssh_uses_remote_and_commit(monkeypatch) -> None:
+    captured = {"command": "", "kwargs": {}}
+    commit_sha = "a" * 40
 
     def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["preflight"] = command
-        captured["preflight_kwargs"] = kwargs
-        return FakeCompletedProcess(returncode=0)
-
-    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["rsync_args"] = args
-        captured["rsync_kwargs"] = kwargs
-        return FakeCompletedProcess(returncode=0)
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeCompletedProcess(returncode=0, stdout=f"info\n{commit_sha}\n")
 
     monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
-    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
 
-    result = sync_module.sync_via_rsync(
-        source_dir=str(source_dir),
+    result = sync_module.sync_via_ssh(
         target_dir="/remote/project",
-        bridge_name="cpu-main",
-        config=tunnel_config,
-        timeout=123,
-        delete=True,
+        branch="main",
+        commit_sha=commit_sha,
+        remote="upstream",
     )
 
     assert result["success"] is True
-    assert result["bridge_name"] == "cpu-main"
-    assert "command -v rsync" in captured["preflight"]
-    assert "mkdir -p /remote/project" in captured["preflight"]
-    assert captured["preflight_kwargs"]["bridge_name"] == "cpu-main"
-
-    rsync_args = captured["rsync_args"]
-    assert rsync_args[0] == "rsync"
-    assert "-az" in rsync_args
-    assert "--numeric-ids" in rsync_args
-    assert "--exclude=.inspire/" in rsync_args
-    assert "--delete" in rsync_args
-    assert any("ProxyCommand=rtunnel client --stdio" in arg for arg in rsync_args)
-    assert any(arg.endswith("/src/") for arg in rsync_args)
-    assert rsync_args[-1] == "root@localhost:/remote/project/"
-    assert captured["rsync_kwargs"]["timeout"] == 123
+    assert "git fetch upstream main" in captured["command"]
+    assert f"git merge --ff-only {commit_sha}" in captured["command"]
+    assert "expected_sha=" in captured["command"]
+    assert captured["kwargs"]["capture_output"] is True
+    assert captured["kwargs"]["check"] is False
 
 
-def test_sync_via_rsync_can_skip_delete(monkeypatch, tmp_path: Path) -> None:
-    source_dir = tmp_path / "src"
-    source_dir.mkdir()
-
-    tunnel_config = TunnelConfig()
-    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
-    tunnel_config.add_bridge(bridge)
-
-    captured: dict[str, Any] = {}
-
-    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
-    monkeypatch.setattr(
-        sync_module,
-        "_resolve_bridge_and_proxy",
-        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
-    )
-    monkeypatch.setattr(
-        sync_module,
-        "run_ssh_command",
-        lambda *args, **kwargs: FakeCompletedProcess(returncode=0),
-    )
-
-    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["rsync_args"] = args
-        return FakeCompletedProcess(returncode=0)
-
-    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
-
-    result = sync_module.sync_via_rsync(
-        source_dir=str(source_dir),
-        target_dir="/remote/project",
-        bridge_name="cpu-main",
-        config=tunnel_config,
-        delete=False,
-    )
-
-    assert result["success"] is True
-    assert "--delete" not in captured["rsync_args"]
-
-
-def test_sync_via_rsync_returns_error_when_remote_preflight_fails(
-    monkeypatch, tmp_path: Path
-) -> None:
-    source_dir = tmp_path / "src"
-    source_dir.mkdir()
-
-    tunnel_config = TunnelConfig()
-    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
-    tunnel_config.add_bridge(bridge)
-
-    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
-    monkeypatch.setattr(
-        sync_module,
-        "_resolve_bridge_and_proxy",
-        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
-    )
-    monkeypatch.setattr(
-        sync_module,
-        "run_ssh_command",
-        lambda *args, **kwargs: FakeCompletedProcess(
-            returncode=1, stderr="rsync missing on bridge"
-        ),
-    )
-
-    result = sync_module.sync_via_rsync(
-        source_dir=str(source_dir),
-        target_dir="/remote/project",
-        bridge_name="cpu-main",
-        config=tunnel_config,
-    )
-
-    assert result["success"] is False
-    assert "rsync missing on bridge" in result["error"]
-
-
-def test_sync_paths_via_rsync_push_file_to_remote_file(monkeypatch, tmp_path: Path) -> None:
-    source_file = tmp_path / "train.py"
-    source_file.write_text("print('ok')\n", encoding="utf-8")
-
-    tunnel_config = TunnelConfig()
-    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
-    tunnel_config.add_bridge(bridge)
-
-    captured: dict[str, Any] = {}
-
-    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
-    monkeypatch.setattr(
-        sync_module,
-        "_resolve_bridge_and_proxy",
-        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
-    )
+def test_sync_via_ssh_force_uses_hard_reset(monkeypatch) -> None:
+    captured = {"command": ""}
 
     def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["preflight"] = command
-        return FakeCompletedProcess(returncode=0)
-
-    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["rsync_args"] = args
-        return FakeCompletedProcess(returncode=0)
+        captured["command"] = command
+        return FakeCompletedProcess(returncode=0, stdout="ok\n")
 
     monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
-    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
 
-    result = sync_module.sync_paths_via_rsync(
-        source_path=str(source_file),
-        target_path="/remote/project/train.py",
-        direction="push",
-        bridge_name="cpu-main",
-        config=tunnel_config,
+    sync_module.sync_via_ssh(
+        target_dir="/remote/project",
+        branch="main",
+        commit_sha="b" * 40,
+        remote="origin",
+        force=True,
     )
 
-    assert result["success"] is True
-    assert result["source_kind"] == "file"
-    assert "mkdir -p /remote/project" in captured["preflight"]
-    assert captured["rsync_args"][-2] == str(source_file.resolve())
-    assert captured["rsync_args"][-1] == "root@localhost:/remote/project/train.py"
-    assert "--delete" not in captured["rsync_args"]
+    assert "git reset --hard" in captured["command"]
 
 
-def test_sync_paths_via_rsync_pull_directory_to_local_directory(
-    monkeypatch, tmp_path: Path
-) -> None:
-    target_dir = tmp_path / "downloaded"
-
-    tunnel_config = TunnelConfig()
-    bridge = BridgeProfile(name="cpu-main", proxy_url="https://bridge.example.com")
-    tunnel_config.add_bridge(bridge)
-
+def test_sync_via_ssh_bundle_uses_scp_and_remote_fetch(monkeypatch) -> None:
     captured: dict[str, Any] = {}
+    commit_sha = "c" * 40
+    call_count = {"run_ssh_command": 0}
 
-    monkeypatch.setattr(sync_module.shutil, "which", lambda name: "/usr/bin/rsync")
-    monkeypatch.setattr(
-        sync_module,
-        "_resolve_bridge_and_proxy",
-        lambda bridge_name, config, quiet=True: (tunnel_config, bridge, "rtunnel client --stdio"),
-    )
+    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
+        captured["bundle_args"] = args
+        assert kwargs.get("check") is True
+        return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+
+    def fake_run_scp_transfer(*args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        captured["scp_kwargs"] = kwargs
+        captured["scp_local_path"] = kwargs["local_path"]
+        return FakeCompletedProcess(returncode=0)
 
     def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["preflight"] = command
-        return FakeCompletedProcess(returncode=0, stdout="directory\n")
+        call_count["run_ssh_command"] += 1
+        if call_count["run_ssh_command"] == 1:
+            # probe command: no existing branch tip on remote
+            return FakeCompletedProcess(returncode=0, stdout="")
+        captured["remote_command"] = command
+        captured["ssh_kwargs"] = kwargs
+        return FakeCompletedProcess(returncode=0, stdout=f"done\n{commit_sha}\n")
 
-    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
-        captured["rsync_args"] = args
-        return FakeCompletedProcess(returncode=0)
-
-    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
     monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(sync_module, "run_scp_transfer", fake_run_scp_transfer)
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
 
-    result = sync_module.sync_paths_via_rsync(
-        source_path="/remote/project",
-        target_path=str(target_dir),
-        direction="pull",
-        bridge_name="cpu-main",
-        config=tunnel_config,
-        delete=True,
+    result = sync_module.sync_via_ssh_bundle(
+        target_dir="/remote/project",
+        branch="main",
+        commit_sha=commit_sha,
+        bridge_name="gpu-offline",
     )
 
     assert result["success"] is True
-    assert result["source_kind"] == "directory"
-    assert target_dir.exists()
-    assert "test -d /remote/project" in captured["preflight"]
-    assert captured["rsync_args"][-2] == "root@localhost:/remote/project/"
-    assert captured["rsync_args"][-1] == str(target_dir.resolve()) + "/"
-    assert "--delete" in captured["rsync_args"]
+    assert result["synced_sha"] == commit_sha
+    assert captured["bundle_args"][:3] == ["git", "bundle", "create"]
+    assert captured["bundle_args"][-1] == "HEAD"
+    assert captured["scp_kwargs"]["bridge_name"] == "gpu-offline"
+    assert "git fetch" in captured["remote_command"]
+    assert commit_sha in captured["remote_command"]
+    assert captured["ssh_kwargs"]["capture_output"] is True
+    assert captured["ssh_kwargs"]["check"] is False
+
+
+def test_sync_via_ssh_bundle_uses_incremental_range(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    commit_sha = "c" * 40
+    base_sha = "b" * 40
+    call_count = {"run_ssh_command": 0}
+
+    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
+        if args[:3] == ["git", "cat-file", "-e"]:
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        if args[:3] == ["git", "rev-list", "--count"]:
+            return FakeCompletedProcess(returncode=0, stdout="2\n", stderr="")
+        if args[:3] == ["git", "bundle", "create"]:
+            captured["bundle_args"] = args
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    def fake_run_scp_transfer(*args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        return FakeCompletedProcess(returncode=0)
+
+    def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        call_count["run_ssh_command"] += 1
+        if call_count["run_ssh_command"] == 1:
+            # probe command
+            return FakeCompletedProcess(returncode=0, stdout=f"{base_sha}\n")
+        return FakeCompletedProcess(returncode=0, stdout=f"{commit_sha}\n")
+
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(sync_module, "run_scp_transfer", fake_run_scp_transfer)
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
+
+    result = sync_module.sync_via_ssh_bundle(
+        target_dir="/remote/project",
+        branch="main",
+        commit_sha=commit_sha,
+        bridge_name="gpu-offline",
+    )
+
+    assert result["success"] is True
+    assert result["bundle_mode"] == "incremental"
+    assert result["bundle_base_sha"] == base_sha
+    assert captured["bundle_args"][-1] == f"{base_sha}..{commit_sha}"
+
+
+def test_sync_via_ssh_bundle_treats_empty_incremental_range_as_up_to_date(monkeypatch) -> None:
+    commit_sha = "e" * 40
+    base_sha = "f" * 40
+    called = {"scp": False, "bundle_create": False}
+
+    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
+        if args[:3] == ["git", "cat-file", "-e"]:
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        if args[:3] == ["git", "rev-list", "--count"]:
+            return FakeCompletedProcess(returncode=0, stdout="0\n", stderr="")
+        if args[:3] == ["git", "bundle", "create"]:
+            called["bundle_create"] = True
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    def fake_run_scp_transfer(*args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        called["scp"] = True
+        return FakeCompletedProcess(returncode=0)
+
+    def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        return FakeCompletedProcess(returncode=0, stdout=f"{base_sha}\n")
+
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(sync_module, "run_scp_transfer", fake_run_scp_transfer)
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
+
+    result = sync_module.sync_via_ssh_bundle(
+        target_dir="/remote/project",
+        branch="main",
+        commit_sha=commit_sha,
+        bridge_name="gpu-offline",
+    )
+
+    assert result["success"] is True
+    assert result["synced_sha"] == commit_sha
+    assert result["bundle_mode"] == "up_to_date"
+    assert result["bundle_base_sha"] == base_sha
+    assert called["bundle_create"] is False
+    assert called["scp"] is False
+
+
+def test_sync_via_ssh_bundle_falls_back_to_full_when_incremental_create_fails(monkeypatch) -> None:
+    captured: dict[str, Any] = {"bundle_revs": []}
+    commit_sha = "1" * 40
+    base_sha = "2" * 40
+    call_count = {"run_ssh_command": 0}
+
+    def fake_subprocess_run(args: list[str], *unused: Any, **kwargs: Any) -> FakeCompletedProcess:
+        if args[:3] == ["git", "cat-file", "-e"]:
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        if args[:3] == ["git", "rev-list", "--count"]:
+            return FakeCompletedProcess(returncode=0, stdout="3\n", stderr="")
+        if args[:3] == ["git", "bundle", "create"]:
+            captured["bundle_revs"].append(args[-1])
+            if args[-1] != "HEAD":
+                raise sync_module.subprocess.CalledProcessError(
+                    1, args, stderr="incremental failed"
+                )
+            return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"Unexpected git call: {args}")
+
+    def fake_run_scp_transfer(*args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        return FakeCompletedProcess(returncode=0)
+
+    def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        call_count["run_ssh_command"] += 1
+        if call_count["run_ssh_command"] == 1:
+            return FakeCompletedProcess(returncode=0, stdout=f"{base_sha}\n")
+        return FakeCompletedProcess(returncode=0, stdout=f"{commit_sha}\n")
+
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(sync_module, "run_scp_transfer", fake_run_scp_transfer)
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
+
+    result = sync_module.sync_via_ssh_bundle(
+        target_dir="/remote/project",
+        branch="main",
+        commit_sha=commit_sha,
+        bridge_name="gpu-offline",
+    )
+
+    assert result["success"] is True
+    assert result["bundle_mode"] == "full"
+    assert captured["bundle_revs"] == [f"{base_sha}..{commit_sha}", "HEAD"]
+
+
+def test_sync_via_ssh_bundle_returns_fast_when_up_to_date(monkeypatch) -> None:
+    commit_sha = "d" * 40
+    called = {"scp": False, "git": False}
+
+    def fake_subprocess_run(*args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        called["git"] = True
+        return FakeCompletedProcess(returncode=0, stdout="", stderr="")
+
+    def fake_run_scp_transfer(*args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        called["scp"] = True
+        return FakeCompletedProcess(returncode=0)
+
+    def fake_run_ssh_command(command: str, *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        # probe command sees target already at commit_sha
+        return FakeCompletedProcess(returncode=0, stdout=f"{commit_sha}\n")
+
+    monkeypatch.setattr(sync_module.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(sync_module, "run_scp_transfer", fake_run_scp_transfer)
+    monkeypatch.setattr(sync_module, "run_ssh_command", fake_run_ssh_command)
+
+    result = sync_module.sync_via_ssh_bundle(
+        target_dir="/remote/project",
+        branch="main",
+        commit_sha=commit_sha,
+        bridge_name="gpu-offline",
+    )
+
+    assert result["success"] is True
+    assert result["synced_sha"] == commit_sha
+    assert result["bundle_mode"] == "up_to_date"
+    assert called["scp"] is False
+    assert called["git"] is False

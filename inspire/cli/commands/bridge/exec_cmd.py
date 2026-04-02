@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import logging
+import shlex
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 import click
@@ -19,6 +22,14 @@ from inspire.cli.context import (
     pass_context,
 )
 from inspire.config import Config, ConfigError, build_env_exports
+from inspire.bridge.forge import (
+    GiteaAuthError,
+    GiteaError,
+    trigger_bridge_action_workflow,
+    wait_for_bridge_action_completion,
+    download_bridge_artifact,
+    fetch_bridge_output_log,
+)
 from inspire.bridge.tunnel import (
     BridgeProfile,
     TunnelNotAvailableError,
@@ -27,11 +38,16 @@ from inspire.bridge.tunnel import (
     run_ssh_command_streaming,
     load_tunnel_config,
 )
+from inspire.cli.utils.common import json_option
 from inspire.cli.utils.errors import emit_error as _emit_error
+from inspire.cli.utils.notebook_cli import resolve_json_output
 from inspire.cli.utils.notebook_cli import require_web_session
 from inspire.cli.utils.output import (
-    emit_error as emit_output_error,
-    emit_success as emit_output_success,
+    emit_error,
+    emit_info,
+    emit_progress,
+    emit_success,
+    emit_warning,
 )
 from inspire.cli.utils.tunnel_reconnect import (
     NotebookBridgeReconnectState,
@@ -45,12 +61,40 @@ from inspire.config.ssh_runtime import resolve_ssh_runtime_config
 from inspire.platform.web import browser_api as browser_api_module
 
 logger = logging.getLogger(__name__)
-_TERMINAL_NOTEBOOK_STATUSES = frozenset({"FAILED", "ERROR", "STOPPED", "DELETED"})
+_RUNNING_NOTEBOOK_STATUS = "RUNNING"
 
 
-def _build_remote_command(*, command: str, target_dir: str, remote_env: dict[str, str]) -> str:
-    env_exports = build_env_exports(remote_env)
+def split_denylist(items: tuple[str, ...]) -> list[str]:
+    parts: list[str] = []
+    for raw in items:
+        for chunk in raw.replace("\r", "").replace("\n", ",").split(","):
+            item = chunk.strip()
+            if item:
+                parts.append(item)
+    return parts
+
+
+def _build_remote_command(*, command: str, target_dir: str, env_exports: str) -> str:
     return f'{env_exports}cd "{target_dir}" && {command}'
+
+
+def _normalize_exec_command(command_parts: tuple[str, ...]) -> str:
+    if not command_parts:
+        raise click.UsageError("Provide a command to execute.")
+    if len(command_parts) == 1:
+        # Preserve legacy behavior when users pass a single quoted command string.
+        return command_parts[0]
+    return shlex.join(command_parts)
+
+
+def _should_auto_passthrough_stdin() -> bool:
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None:
+        return False
+    try:
+        return not stdin.isatty()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _verbose_output(ctx: Context) -> bool:
@@ -66,13 +110,20 @@ def try_exec_via_ssh_tunnel(
     *,
     command: str,
     bridge_name: Optional[str],
+    stdin_mode: bool,
     config: Config,
+    env_exports: str,
     timeout_s: int,
     is_tunnel_available_fn: Callable[..., bool],
     run_ssh_command_fn: Callable[..., object],
     run_ssh_command_streaming_fn: Callable[..., int],
 ) -> Optional[int]:
-    """Execute a bridge command via the SSH tunnel path only."""
+    """Attempt the fast-path SSH tunnel execution.
+
+    Returns:
+        Exit code if the SSH path handled the request (success/failure/timeout),
+        otherwise None to fall back to workflow execution.
+    """
     reconnect_limit = max(0, int(getattr(config, "tunnel_retries", 0)))
     reconnect_pause = float(getattr(config, "tunnel_retry_pause", 0.0) or 0.0)
     reconnect_state = NotebookBridgeReconnectState(
@@ -86,7 +137,7 @@ def try_exec_via_ssh_tunnel(
     full_command = _build_remote_command(
         command=command,
         target_dir=str(config.target_dir),
-        remote_env=config.remote_env,
+        env_exports=env_exports,
     )
 
     def _require_rebuild(
@@ -101,7 +152,7 @@ def try_exec_via_ssh_tunnel(
             hint = (
                 "Run 'inspire tunnel status' to troubleshoot. "
                 "If needed, re-create the bridge via "
-                "'inspire notebook ssh <notebook-id> --alias <name>'."
+                "'inspire notebook ssh <notebook-id> --save-as <name>'."
             )
             return _emit_error(
                 ctx,
@@ -119,7 +170,7 @@ def try_exec_via_ssh_tunnel(
                 "SSH tunnel not available",
                 hint=(
                     "Auto-rebuild retries exhausted. Run 'inspire tunnel status' and "
-                    "retry 'inspire notebook ssh <notebook-id> --alias <name>'."
+                    "retry 'inspire notebook ssh <notebook-id> --save-as <name>'."
                 ),
             )
 
@@ -140,16 +191,20 @@ def try_exec_via_ssh_tunnel(
                     session=reconnect_state.web_session,
                 )
                 notebook_status = str((notebook_detail or {}).get("status") or "").strip().upper()
-                if notebook_status in _TERMINAL_NOTEBOOK_STATUSES:
+                if notebook_status != _RUNNING_NOTEBOOK_STATUS:
+                    rendered_status = notebook_status or "UNKNOWN"
                     return _emit_error(
                         ctx,
                         "TunnelError",
                         (
                             "SSH tunnel not available. "
                             f"Bridge '{bridge.name}' notebook '{notebook_id}' "
-                            f"is {notebook_status}."
+                            f"is {rendered_status}."
                         ),
-                        hint=f"Start it with 'inspire notebook start {notebook_id}' and retry.",
+                        hint=(
+                            "Wait until it reports RUNNING via "
+                            f"'inspire notebook status {notebook_id}', then retry."
+                        ),
                     )
             except Exception as status_error:  # noqa: BLE001
                 logger.debug(
@@ -294,17 +349,22 @@ def try_exec_via_ssh_tunnel(
 
             if ctx.json_output:
                 ssh_execution_started = True
+                run_kwargs: dict[str, object] = {
+                    "command": full_command,
+                    "bridge_name": resolved_bridge_name,
+                    "timeout": timeout_s,
+                    "capture_output": True,
+                }
+                if stdin_mode:
+                    run_kwargs["pass_stdin"] = True
                 result = run_ssh_command_fn(
-                    command=full_command,
-                    bridge_name=resolved_bridge_name,
-                    timeout=timeout_s,
-                    capture_output=True,
+                    **run_kwargs,
                 )
                 returncode = getattr(result, "returncode", 1)
                 if returncode == 0:
                     stdout = getattr(result, "stdout", "") or ""
                     stderr = getattr(result, "stderr", "") or ""
-                    emit_output_success(
+                    emit_success(
                         ctx,
                         payload={
                             "status": "success",
@@ -326,24 +386,33 @@ def try_exec_via_ssh_tunnel(
                 return _emit_command_failed(ctx, returncode=returncode)
 
             if _verbose_output(ctx) and not opened_once:
-                click.echo("Using SSH tunnel (fast path)")
-                click.echo(f"Bridge: {resolved_bridge_name}")
-                click.echo(f"Command: {command}")
-                click.echo(f"Working dir: {config.target_dir}")
-                click.echo("--- Command Output ---")
+                emit_info(ctx, "Using SSH tunnel (fast path)")
+                emit_info(ctx, f"Bridge: {resolved_bridge_name}")
+                emit_info(ctx, f"Command: {command}")
+                emit_info(ctx, f"Working dir: {config.target_dir}")
+                if stdin_mode:
+                    emit_info(ctx, "Stdin: passthrough")
+                emit_info(ctx, "--- Command Output ---")
                 opened_once = True
 
             ssh_execution_started = True
-            exit_code = run_ssh_command_streaming_fn(
-                command=full_command,
-                bridge_name=resolved_bridge_name,
-                timeout=timeout_s,
-            )
+            stream_kwargs: dict[str, object] = {
+                "command": full_command,
+                "bridge_name": resolved_bridge_name,
+                "timeout": timeout_s,
+            }
+            if stdin_mode:
+                stream_kwargs["pass_stdin"] = True
+            exit_code = run_ssh_command_streaming_fn(**stream_kwargs)
             if _verbose_output(ctx):
-                click.echo("--- End Output ---")
+                emit_info(ctx, "--- End Output ---")
 
             if exit_code == 0:
-                click.echo("OK")
+                emit_success(
+                    ctx,
+                    payload={"status": "success", "method": "ssh_tunnel", "returncode": 0},
+                    text="command executed successfully",
+                )
                 return EXIT_SUCCESS
 
             if _should_retry_after_disconnect_code(
@@ -366,12 +435,11 @@ def try_exec_via_ssh_tunnel(
             force_rebuild = True
             continue
         except subprocess.TimeoutExpired:
-            emit_output_error(
+            emit_error(
                 ctx,
                 error_type="Timeout",
                 message=f"Command timed out after {timeout_s}s",
                 exit_code=EXIT_TIMEOUT,
-                human_lines=[f"Command timed out after {timeout_s}s"],
             )
             return EXIT_TIMEOUT
         except Exception as e:
@@ -388,8 +456,201 @@ def try_exec_via_ssh_tunnel(
             )
 
 
+def exec_via_workflow(
+    ctx: Context,
+    *,
+    command: str,
+    env_exports: str,
+    denylist: tuple[str, ...],
+    artifact_path: tuple[str, ...],
+    download: Optional[str],
+    wait: bool,
+    timeout_s: int,
+    config: Config,
+    trigger_bridge_action_workflow_fn: Callable[..., None],
+    wait_for_bridge_action_completion_fn: Callable[..., dict],
+    fetch_bridge_output_log_fn: Callable[..., Optional[str]],
+    download_bridge_artifact_fn: Callable[..., None],
+) -> int:
+    workflow_command = f"{env_exports}{command}" if env_exports else command
+
+    merged_denylist: list[str] = []
+    if config.bridge_action_denylist:
+        merged_denylist.extend(config.bridge_action_denylist)
+    merged_denylist.extend(split_denylist(denylist))
+
+    if not merged_denylist and _verbose_output(ctx):
+        emit_warning(ctx, "no denylist provided; proceeding")
+
+    request_id = f"{int(time.time())}-{os.getpid()}"
+    artifact_paths_list = list(artifact_path)
+
+    if _verbose_output(ctx):
+        emit_info(ctx, f"Triggering bridge exec (request {request_id})")
+        emit_info(ctx, f"Command: {command}")
+        emit_info(ctx, f"Working dir: {config.target_dir}")
+        if merged_denylist:
+            emit_info(ctx, f"Denylist: {merged_denylist}")
+        if artifact_paths_list:
+            emit_info(ctx, f"Artifact paths: {artifact_paths_list}")
+
+    try:
+        logger.debug(
+            "bridge_exec workflow trigger request_id=%s wait=%s timeout=%s command=%s",
+            request_id,
+            wait,
+            timeout_s,
+            command,
+        )
+        trigger_bridge_action_workflow_fn(
+            config=config,
+            raw_command=workflow_command,
+            artifact_paths=artifact_paths_list,
+            request_id=request_id,
+            denylist=merged_denylist,
+        )
+    except (GiteaError, GiteaAuthError) as e:
+        emit_error(
+            ctx,
+            error_type="GiteaError",
+            message=str(e),
+            exit_code=EXIT_GENERAL_ERROR,
+        )
+        return EXIT_GENERAL_ERROR
+
+    if not wait:
+        emit_success(
+            ctx,
+            payload={
+                "status": "triggered",
+                "request_id": request_id,
+                "command": command,
+            },
+            text=f"Triggered bridge exec request {request_id}",
+        )
+        return EXIT_SUCCESS
+
+    if _verbose_output(ctx):
+        emit_progress(ctx, f"Waiting for completion (timeout {timeout_s}s)...")
+
+    try:
+        result = wait_for_bridge_action_completion_fn(
+            config=config,
+            request_id=request_id,
+            timeout=timeout_s,
+        )
+        logger.debug("bridge_exec workflow result request_id=%s result=%s", request_id, result)
+    except TimeoutError as e:
+        emit_error(
+            ctx,
+            error_type="Timeout",
+            message=f"Timeout: {e}",
+            exit_code=EXIT_TIMEOUT,
+        )
+        return EXIT_TIMEOUT
+    except GiteaError as e:
+        emit_error(
+            ctx,
+            error_type="GiteaError",
+            message=str(e),
+            exit_code=EXIT_GENERAL_ERROR,
+        )
+        return EXIT_GENERAL_ERROR
+
+    output_log: Optional[str] = None
+    try:
+        output_log = fetch_bridge_output_log_fn(config, request_id)
+    except GiteaError:
+        pass
+    if output_log:
+        logger.debug("bridge_exec workflow output request_id=%s\n%s", request_id, output_log)
+
+    if output_log and not ctx.json_output:
+        if _verbose_output(ctx):
+            click.echo("")
+            click.echo("--- Command Output ---")
+            click.echo(output_log)
+            click.echo("--- End Output ---")
+            click.echo("")
+        else:
+            click.echo(output_log)
+
+    if result.get("conclusion") != "success":
+        hint = result.get("html_url") or None
+        emit_error(
+            ctx,
+            error_type="BridgeActionFailed",
+            message=f"Action failed: {result.get('conclusion')}",
+            exit_code=EXIT_GENERAL_ERROR,
+            hint=hint,
+        )
+        return EXIT_GENERAL_ERROR
+
+    if download:
+        if _verbose_output(ctx):
+            emit_progress(ctx, f"Downloading artifact to {download}...")
+        try:
+            download_bridge_artifact_fn(config, request_id, Path(download))
+        except GiteaError as e:
+            emit_error(
+                ctx,
+                error_type="ArtifactError",
+                message=f"Artifact download failed: {e}",
+                exit_code=EXIT_GENERAL_ERROR,
+            )
+            return EXIT_GENERAL_ERROR
+
+    if _verbose_output(ctx):
+        emit_success(
+            ctx,
+            payload={
+                "status": "success",
+                "request_id": request_id,
+                "artifact_downloaded": bool(download),
+                "output": output_log,
+            },
+            text="Action completed successfully",
+        )
+        if result.get("html_url"):
+            emit_info(ctx, f"Workflow: {result.get('html_url')}")
+        if download:
+            emit_info(ctx, "Artifacts downloaded")
+    else:
+        emit_success(
+            ctx,
+            payload={
+                "status": "success",
+                "request_id": request_id,
+                "artifact_downloaded": bool(download),
+                "output": output_log,
+            },
+            text="OK (artifacts downloaded)" if download else "OK",
+        )
+
+    return EXIT_SUCCESS
+
+
 @click.command("exec")
-@click.argument("command")
+@click.argument("command_parts", nargs=-1, type=click.UNPROCESSED, required=True)
+@click.option(
+    "denylist",
+    "--denylist",
+    multiple=True,
+    help="Denylist pattern to block (repeatable or comma-separated)",
+)
+@click.option(
+    "artifact_path",
+    "--artifact-path",
+    multiple=True,
+    help="Path relative to INSPIRE_TARGET_DIR to upload as artifact (repeatable)",
+)
+@click.option(
+    "download",
+    "--download",
+    type=click.Path(),
+    help="Local directory to download artifact contents",
+)
+@click.option("wait", "--wait/--no-wait", default=True, help="Wait for completion (default: wait)")
 @click.option(
     "timeout",
     "--timeout",
@@ -403,14 +664,32 @@ def try_exec_via_ssh_tunnel(
     "-b",
     help="Bridge profile to use for SSH tunnel execution",
 )
+@click.option(
+    "stdin_mode",
+    "--stdin",
+    "--bash-stdin",
+    is_flag=True,
+    help="Force stdin passthrough to remote command over SSH (auto when stdin is piped)",
+)
+@json_option
 @pass_context
 def exec_command(
     ctx: Context,
-    command: str,
+    command_parts: tuple[str, ...],
+    denylist: tuple[str, ...],
+    artifact_path: tuple[str, ...],
+    download: Optional[str],
+    wait: bool,
     timeout: Optional[int],
     bridge: Optional[str],
+    stdin_mode: bool,
+    json_output: bool = False,
 ) -> None:
-    """Execute a command on the Bridge runner via SSH tunnel.
+    json_output = resolve_json_output(ctx, json_output)
+    """Execute a command on the Bridge runner.
+
+    Uses SSH tunnel for command execution. Workflow transport is fallback-only
+    and is only used when artifact options are requested.
 
     COMMAND is the shell command to run on Bridge (in INSPIRE_TARGET_DIR).
     Command output (stdout/stderr) is automatically displayed after completion.
@@ -419,30 +698,78 @@ def exec_command(
     Examples:
         inspire bridge exec "uv venv .venv"
         inspire bridge exec "pip install torch" --timeout 600
+        inspire bridge exec --stdin -- bash -s < scripts/watch_eval.sh
+        inspire bridge exec "uv venv .venv" \\
+            --artifact-path .venv --download ./local
+        inspire bridge exec "python train.py" --no-wait
         inspire bridge exec "hostname" --bridge qz-bridge
     """
+
+    command = _normalize_exec_command(command_parts)
 
     try:
         config, _ = Config.from_files_and_env(require_target_dir=True, require_credentials=False)
     except ConfigError as e:
-        emit_output_error(
+        emit_error(
             ctx,
             error_type="ConfigError",
-            message=str(e),
+            message=f"Configuration error: {e}",
             exit_code=EXIT_CONFIG_ERROR,
-            human_lines=[f"Configuration error: {e}"],
         )
         sys.exit(EXIT_CONFIG_ERROR)
 
-    exec_timeout = int(timeout) if timeout is not None else int(config.bridge_action_timeout)
-    ssh_exit_code = try_exec_via_ssh_tunnel(
+    try:
+        env_exports = build_env_exports(config.remote_env)
+    except ConfigError as e:
+        emit_error(
+            ctx,
+            error_type="ConfigError",
+            message=f"Configuration error: {e}",
+            exit_code=EXIT_CONFIG_ERROR,
+        )
+        sys.exit(EXIT_CONFIG_ERROR)
+
+    action_timeout = int(timeout) if timeout is not None else int(config.bridge_action_timeout)
+
+    if stdin_mode and (artifact_path or download):
+        emit_error(
+            ctx,
+            error_type="UsageError",
+            message="--stdin/--bash-stdin cannot be combined with --artifact-path/--download",
+            exit_code=EXIT_GENERAL_ERROR,
+        )
+        sys.exit(EXIT_GENERAL_ERROR)
+
+    # SSH tunnel is the default command transport when artifacts are not requested.
+    if not artifact_path and not download:
+        effective_stdin_mode = stdin_mode or _should_auto_passthrough_stdin()
+        ssh_exit_code = try_exec_via_ssh_tunnel(
+            ctx,
+            command=command,
+            bridge_name=bridge,
+            stdin_mode=effective_stdin_mode,
+            config=config,
+            env_exports=env_exports,
+            timeout_s=action_timeout,
+            is_tunnel_available_fn=is_tunnel_available,
+            run_ssh_command_fn=run_ssh_command,
+            run_ssh_command_streaming_fn=run_ssh_command_streaming,
+        )
+        sys.exit(ssh_exit_code if ssh_exit_code is not None else EXIT_GENERAL_ERROR)
+
+    workflow_exit_code = exec_via_workflow(
         ctx,
         command=command,
-        bridge_name=bridge,
+        env_exports=env_exports,
+        denylist=denylist,
+        artifact_path=artifact_path,
+        download=download,
+        wait=wait,
+        timeout_s=action_timeout,
         config=config,
-        timeout_s=exec_timeout,
-        is_tunnel_available_fn=is_tunnel_available,
-        run_ssh_command_fn=run_ssh_command,
-        run_ssh_command_streaming_fn=run_ssh_command_streaming,
+        trigger_bridge_action_workflow_fn=trigger_bridge_action_workflow,
+        wait_for_bridge_action_completion_fn=wait_for_bridge_action_completion,
+        fetch_bridge_output_log_fn=fetch_bridge_output_log,
+        download_bridge_artifact_fn=download_bridge_artifact,
     )
-    sys.exit(ssh_exit_code if ssh_exit_code is not None else EXIT_GENERAL_ERROR)
+    sys.exit(workflow_exit_code)

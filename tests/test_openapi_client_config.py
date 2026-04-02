@@ -11,7 +11,7 @@ from inspire.platform.openapi import InspireAPI, InspireConfig
 def test_inspire_api_honors_verify_ssl_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("INSPIRE_SKIP_SSL_VERIFY", raising=False)
 
-    api = InspireAPI(InspireConfig(verify_ssl=False))
+    api = InspireAPI(InspireConfig(verify_ssl=False), skip_live_probe=True)
 
     assert api.config.verify_ssl is False
 
@@ -19,7 +19,7 @@ def test_inspire_api_honors_verify_ssl_from_config(monkeypatch: pytest.MonkeyPat
 def test_inspire_api_env_override_disables_verify_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("INSPIRE_SKIP_SSL_VERIFY", "1")
 
-    api = InspireAPI(InspireConfig(verify_ssl=True))
+    api = InspireAPI(InspireConfig(verify_ssl=True), skip_live_probe=True)
 
     assert api.config.verify_ssl is False
 
@@ -31,7 +31,7 @@ def test_inspire_api_force_proxy_from_config(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy-secure.example.com:8443")
 
-    api = InspireAPI(InspireConfig(force_proxy=True))
+    api = InspireAPI(InspireConfig(force_proxy=True), skip_live_probe=True)
 
     assert api.session.proxies == {
         "http": "http://proxy.example.com:8080",
@@ -46,7 +46,7 @@ def test_inspire_api_force_proxy_env_override(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy-secure.example.com:8443")
 
-    api = InspireAPI(InspireConfig(force_proxy=False))
+    api = InspireAPI(InspireConfig(force_proxy=False), skip_live_probe=True)
 
     assert api.session.proxies == {
         "http": "http://proxy.example.com:8080",

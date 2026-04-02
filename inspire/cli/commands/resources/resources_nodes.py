@@ -8,6 +8,8 @@ import click
 
 from inspire.cli.context import Context, EXIT_API_ERROR, EXIT_AUTH_ERROR, pass_context
 from inspire.cli.formatters import json_formatter
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.notebook_cli import resolve_json_output
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.platform.web.session import SessionExpiredError
@@ -31,8 +33,10 @@ def _make_console() -> Console | None:
 
 @click.command("nodes")
 @click.option("--group", help="Filter by compute group name (partial match)")
+@json_option
 @pass_context
-def list_nodes(ctx: Context, group: str) -> None:
+def list_nodes(ctx: Context, group: str, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Show how many FULL 8-GPU nodes are currently free per compute group.
 
     This uses the browser-only endpoint POST /api/v1/cluster_nodes/list

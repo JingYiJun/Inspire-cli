@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
-from inspire.config.models import SOURCE_GLOBAL, SOURCE_PROJECT, Config, ConfigError
+from inspire.config.models import (
+    SOURCE_GLOBAL,
+    SOURCE_PROJECT,
+    Config,
+    ConfigDeprecationWarning,
+    ConfigError,
+)
 from inspire.config.toml import (
     _find_project_config,
     _flatten_toml,
     _load_toml,
-    _toml_key_to_field,
+    _validate_toml_value,
 )
+from inspire.config.schema import get_option_by_toml
 
 from .load_accounts import _parse_global_accounts
 from .load_common import (
@@ -21,6 +29,64 @@ from .load_common import (
     _parse_alias_map,
 )
 from inspire.config.hpc_presets import merge_hpc_presets, normalize_hpc_presets
+
+
+def _apply_legacy_paths_target_dir(
+    *,
+    raw_data: dict[str, Any],
+    config_dict: dict[str, Any],
+    sources: dict[str, str],
+    source_name: str,
+    config_path: Path | None,
+) -> None:
+    """Handle legacy paths.target_dir with fallback to defaults.target_dir."""
+    # Check if defaults.target_dir is already set
+    if config_dict.get("target_dir"):
+        return
+
+    # Check for legacy paths.target_dir
+    paths_section = raw_data.get("paths")
+    if not isinstance(paths_section, dict):
+        return
+
+    legacy_value = paths_section.get("target_dir")
+    if legacy_value is None or legacy_value == "":
+        return
+
+    # Apply the legacy value
+    config_dict["target_dir"] = str(legacy_value)
+    sources["target_dir"] = source_name
+
+    # Emit deprecation warning
+    path_label = str(config_path) if config_path else f"{source_name} config"
+    warnings.warn(
+        f"{path_label} uses deprecated [paths].target_dir. "
+        f"Use [defaults].target_dir instead. "
+        f"The legacy key still works but will be removed in a future release.",
+        ConfigDeprecationWarning,
+        stacklevel=4,
+    )
+
+
+def _apply_legacy_workspace_id_section(
+    *,
+    raw_data: dict[str, Any],
+    config_dict: dict[str, Any],
+    sources: dict[str, str],
+    source_name: str,
+) -> None:
+    for section_name, field_name in (
+        ("job", "job_workspace_id"),
+        ("notebook", "notebook_workspace_id"),
+    ):
+        section = raw_data.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        raw_value = section.get("workspace_id")
+        if raw_value is None or raw_value == "":
+            continue
+        config_dict[field_name] = str(raw_value)
+        sources[field_name] = source_name
 
 
 def _apply_global_layer(
@@ -41,6 +107,8 @@ def _apply_global_layer(
     global_accounts, global_account_catalogs = _parse_global_accounts(
         global_raw.pop("accounts", {})
     )
+    global_workspace_specs = global_raw.pop("workspace_specs", {})
+    global_workspace_names = global_raw.pop("workspace_names", {})
 
     global_defaults: dict[str, Any] = {}
     raw_global_defaults = global_raw.pop("defaults", {})
@@ -48,17 +116,16 @@ def _apply_global_layer(
         global_defaults = raw_global_defaults
     raw_global_hpc = global_raw.get("hpc") or {}
 
-    global_workspaces: dict[str, str] = {}
-    raw_workspaces = global_raw.get("workspaces") or {}
-    if isinstance(raw_workspaces, dict):
-        global_workspaces = {str(k): str(v) for k, v in raw_workspaces.items()}
+    raw_legacy_workspaces = _parse_alias_map(global_raw.pop("workspaces", {}))
+    legacy_workspaces = {key: value for key, value in raw_legacy_workspaces.items() if key == "hpc"}
 
     flat_global = _flatten_toml(global_raw)
     for toml_key, value in flat_global.items():
-        field_name = _toml_key_to_field(toml_key)
-        if field_name and field_name in config_dict:
-            config_dict[field_name] = value
-            sources[field_name] = SOURCE_GLOBAL
+        option = get_option_by_toml(toml_key)
+        if not option or option.field_name not in config_dict:
+            continue
+        config_dict[option.field_name] = _validate_toml_value(option, value)
+        sources[option.field_name] = SOURCE_GLOBAL
 
     if global_compute_groups:
         config_dict["compute_groups"] = global_compute_groups
@@ -66,12 +133,30 @@ def _apply_global_layer(
     if global_remote_env:
         config_dict["remote_env"] = global_remote_env
         sources["remote_env"] = SOURCE_GLOBAL
-    if global_workspaces:
-        config_dict["workspaces"] = global_workspaces
-        sources["workspaces"] = SOURCE_GLOBAL
     if global_accounts:
         config_dict["accounts"] = global_accounts
         sources["accounts"] = SOURCE_GLOBAL
+    if legacy_workspaces:
+        merged_workspaces = dict(config_dict.get("workspaces", {}))
+        merged_workspaces.update(legacy_workspaces)
+        config_dict["workspaces"] = merged_workspaces
+        sources["workspaces"] = SOURCE_GLOBAL
+        if not config_dict.get("workspace_hpc_id") and legacy_workspaces.get("hpc"):
+            config_dict["workspace_hpc_id"] = legacy_workspaces["hpc"]
+            sources["workspace_hpc_id"] = SOURCE_GLOBAL
+    if global_workspace_specs:
+        config_dict["workspace_specs"] = global_workspace_specs
+        sources["workspace_specs"] = SOURCE_GLOBAL
+    if global_workspace_names:
+        config_dict["workspace_names"] = global_workspace_names
+        sources["workspace_names"] = SOURCE_GLOBAL
+
+    _apply_legacy_workspace_id_section(
+        raw_data=global_raw,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_GLOBAL,
+    )
 
     _apply_hpc_config(
         raw_hpc=raw_global_hpc,
@@ -90,6 +175,15 @@ def _apply_global_layer(
         sources=sources,
         source_name=SOURCE_GLOBAL,
     )
+
+    _apply_legacy_paths_target_dir(
+        raw_data=global_raw,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_GLOBAL,
+        config_path=global_config_path,
+    )
+
     return global_config_path, global_account_catalogs
 
 
@@ -139,17 +233,16 @@ def _apply_project_layer(
     layer_state.project_accounts = project_accounts
     layer_state.project_account_catalogs = project_account_catalogs
 
-    project_workspaces: dict[str, str] = {}
-    raw_workspaces = project_raw.get("workspaces") or {}
-    if isinstance(raw_workspaces, dict):
-        project_workspaces = {str(k): str(v) for k, v in raw_workspaces.items()}
+    raw_legacy_workspaces = _parse_alias_map(project_raw.pop("workspaces", {}))
+    legacy_workspaces = {key: value for key, value in raw_legacy_workspaces.items() if key == "hpc"}
 
     flat_project = _flatten_toml(project_raw)
     for toml_key, value in flat_project.items():
-        field_name = _toml_key_to_field(toml_key)
-        if field_name and field_name in config_dict:
-            config_dict[field_name] = value
-            sources[field_name] = SOURCE_PROJECT
+        option = get_option_by_toml(toml_key)
+        if not option or option.field_name not in config_dict:
+            continue
+        config_dict[option.field_name] = _validate_toml_value(option, value)
+        sources[option.field_name] = SOURCE_PROJECT
 
     if project_compute_groups:
         config_dict["compute_groups"] = project_compute_groups
@@ -159,16 +252,26 @@ def _apply_project_layer(
         merged_remote_env.update(project_remote_env)
         config_dict["remote_env"] = merged_remote_env
         sources["remote_env"] = SOURCE_PROJECT
-    if project_workspaces:
-        merged_workspaces = dict(config_dict.get("workspaces", {}))
-        merged_workspaces.update(project_workspaces)
-        config_dict["workspaces"] = merged_workspaces
-        sources["workspaces"] = SOURCE_PROJECT
     if project_accounts:
         merged_accounts = dict(config_dict.get("accounts", {}))
         merged_accounts.update(project_accounts)
         config_dict["accounts"] = merged_accounts
         sources["accounts"] = SOURCE_PROJECT
+    if legacy_workspaces:
+        merged_workspaces = dict(config_dict.get("workspaces", {}))
+        merged_workspaces.update(legacy_workspaces)
+        config_dict["workspaces"] = merged_workspaces
+        sources["workspaces"] = SOURCE_PROJECT
+        if not config_dict.get("workspace_hpc_id") and legacy_workspaces.get("hpc"):
+            config_dict["workspace_hpc_id"] = legacy_workspaces["hpc"]
+            sources["workspace_hpc_id"] = SOURCE_PROJECT
+
+    _apply_legacy_workspace_id_section(
+        raw_data=project_raw,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_PROJECT,
+    )
 
     _apply_hpc_config(
         raw_hpc=raw_hpc,
@@ -183,6 +286,14 @@ def _apply_project_layer(
             project_hpc_presets,
         )
         sources["hpc_presets"] = SOURCE_PROJECT
+
+    _apply_legacy_paths_target_dir(
+        raw_data=project_raw,
+        config_dict=config_dict,
+        sources=sources,
+        source_name=SOURCE_PROJECT,
+        config_path=project_config_path,
+    )
 
     return layer_state
 

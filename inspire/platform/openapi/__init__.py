@@ -19,6 +19,11 @@ from inspire.platform.openapi.errors import (
 )
 from inspire.platform.openapi.models import ComputeGroup, GPUType, InspireConfig, ResourceSpec
 from inspire.platform.openapi.resources import ResourceManager
+from inspire.platform.openapi.workspace_specs import (
+    fetch_workspace_specs,
+    load_specs_from_config,
+    save_specs_to_config,
+)
 
 __all__ = [
     "APIEndpoints",
@@ -35,6 +40,9 @@ __all__ = [
     "ResourceManager",
     "ResourceSpec",
     "ValidationError",
+    "fetch_workspace_specs",
+    "load_specs_from_config",
+    "save_specs_to_config",
     "_translate_api_error",
     "_validate_job_id_format",
 ]

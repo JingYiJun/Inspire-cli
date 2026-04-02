@@ -29,16 +29,19 @@ from .ssh import (
     generate_all_ssh_configs,
     generate_ssh_config,
     get_tunnel_status,
+    has_installed_ssh_config,
+    install_all_ssh_configs,
     install_ssh_config,
     is_tunnel_available,
 )
 from .scp import run_scp_transfer
 from .ssh_exec import (
+    build_ssh_process_env,
     get_ssh_command_args,
     run_ssh_command,
     run_ssh_command_streaming,
 )
-from .sync import sync_paths_via_rsync, sync_via_rsync
+from .sync import sync_paths_via_rsync, sync_via_rsync, sync_via_ssh, sync_via_ssh_bundle
 
 __all__ = [
     # Models / errors
@@ -61,6 +64,7 @@ __all__ = [
     # SSH helpers
     "_get_proxy_command",
     "_test_ssh_connection",
+    "build_ssh_process_env",
     "get_ssh_command_args",
     "get_tunnel_status",
     "is_tunnel_available",
@@ -70,8 +74,12 @@ __all__ = [
     # ssh-config
     "generate_all_ssh_configs",
     "generate_ssh_config",
+    "has_installed_ssh_config",
+    "install_all_ssh_configs",
     "install_ssh_config",
     # Sync
     "sync_paths_via_rsync",
     "sync_via_rsync",
+    "sync_via_ssh",
+    "sync_via_ssh_bundle",
 ]

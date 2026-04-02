@@ -1,9 +1,21 @@
 from types import SimpleNamespace
 
+import pytest
+
+from inspire.platform.openapi.errors import JobCreationError
 from inspire.platform.openapi.jobs import create_training_job_smart
 
 
 class _DummyResourceManager:
+    def __init__(self) -> None:
+        self.ensured_workspaces: list[str] = []
+        self.ensure_error: RuntimeError | None = None
+
+    def ensure_specs_for_workspace(self, workspace_id: str) -> None:
+        self.ensured_workspaces.append(workspace_id)
+        if self.ensure_error is not None:
+            raise self.ensure_error
+
     def get_recommended_config(self, resource: str, prefer_location: str | None) -> tuple[str, str]:
         assert resource == "1xH200"
         assert prefer_location is None
@@ -60,6 +72,7 @@ def test_create_training_job_smart_builds_framework_config_payload() -> None:
     assert payload["logic_compute_group_id"] == "lcg-h200-1"
     assert payload["project_id"] == "project-default"
     assert payload["workspace_id"] == "ws-default"
+    assert api.resource_manager.ensured_workspaces == ["ws-default"]
     assert payload["framework_config"] == [
         {
             "image_type": "SOURCE_PRIVATE",
@@ -95,3 +108,96 @@ def test_create_training_job_smart_uses_overrides_for_framework_config() -> None
     assert framework_item["image"] == "custom.registry/pytorch:tag"
     assert framework_item["instance_count"] == 2
     assert framework_item["shm_gi"] == 256
+
+
+def test_create_training_job_smart_ensures_explicit_workspace_before_matching() -> None:
+    api = _DummyAPI()
+
+    create_training_job_smart(
+        api,
+        name="demo",
+        command="echo demo",
+        resource="1xH200",
+        workspace_id="ws-explicit",
+    )
+
+    assert api.resource_manager.ensured_workspaces == ["ws-explicit"]
+    assert api.last_request is not None
+    assert api.last_request[2]["workspace_id"] == "ws-explicit"
+
+
+def test_create_training_job_smart_wraps_probe_failures() -> None:
+    api = _DummyAPI()
+    api.resource_manager.ensure_error = RuntimeError("browser session unavailable")
+
+    with pytest.raises(JobCreationError, match="Failed to load resource specs for workspace"):
+        create_training_job_smart(
+            api,
+            name="demo",
+            command="echo demo",
+            resource="1xH200",
+        )
+
+
+def test_task_priority_zero_preserved() -> None:
+    """priority=0 must not be replaced by the default (was a falsy-or bug)."""
+    api = _DummyAPI()
+
+    create_training_job_smart(
+        api,
+        name="demo",
+        command="echo demo",
+        resource="1xH200",
+        task_priority=0,
+    )
+
+    assert api.last_request is not None
+    payload = api.last_request[2]
+    assert payload["task_priority"] == 0
+
+
+def test_instance_count_zero_preserved() -> None:
+    """instance_count=0 must not be replaced by the default."""
+    api = _DummyAPI()
+
+    create_training_job_smart(
+        api,
+        name="demo",
+        command="echo demo",
+        resource="1xH200",
+        instance_count=0,
+    )
+
+    assert api.last_request is not None
+    payload = api.last_request[2]
+    assert payload["framework_config"][0]["instance_count"] == 0
+
+
+def test_auto_fault_tolerance_included_when_true() -> None:
+    api = _DummyAPI()
+
+    create_training_job_smart(
+        api,
+        name="demo",
+        command="echo demo",
+        resource="1xH200",
+        auto_fault_tolerance=True,
+    )
+
+    payload = api.last_request[2]
+    assert payload["auto_fault_tolerance"] is True
+
+
+def test_auto_fault_tolerance_absent_when_false() -> None:
+    api = _DummyAPI()
+
+    create_training_job_smart(
+        api,
+        name="demo",
+        command="echo demo",
+        resource="1xH200",
+        auto_fault_tolerance=False,
+    )
+
+    payload = api.last_request[2]
+    assert "auto_fault_tolerance" not in payload

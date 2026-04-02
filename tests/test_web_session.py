@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 from pathlib import Path
 
@@ -155,7 +156,9 @@ def test_browser_client_reset_on_expired(monkeypatch: pytest.MonkeyPatch):
     assert closed["called"] is True
 
 
-def test_request_json_reauth_refreshes_session_in_place(monkeypatch: pytest.MonkeyPatch):
+def test_request_json_reauth_refreshes_session_in_place(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.CaptureFixture[str]
+):
     session = WebSession(
         storage_state={"cookies": [{"name": "session", "value": "old"}]},
         cookies={"session": "old"},
@@ -187,9 +190,7 @@ def test_request_json_reauth_refreshes_session_in_place(monkeypatch: pytest.Monk
     refresh_calls = {"count": 0}
 
     def fake_get_browser_client(current_session: WebSession):  # type: ignore[no-untyped-def]
-        cookie_value = current_session.storage_state.get("cookies", [{}])[0].get(
-            "value"
-        )  # type: ignore[index]
+        cookie_value = current_session.storage_state.get("cookies", [{}])[0].get("value")  # type: ignore[index]
         if cookie_value == "old":
             return ExpiringBrowserClient()
         return working
@@ -204,7 +205,8 @@ def test_request_json_reauth_refreshes_session_in_place(monkeypatch: pytest.Monk
     monkeypatch.setattr(ws, "get_web_session", fake_get_web_session)
     monkeypatch.setattr(ws, "_BROWSER_API_FORCE_BROWSER", True)
 
-    result = ws.request_json(session, "GET", "https://example.test")
+    with caplog.at_level(logging.WARNING, logger="inspire.platform.web.session"):
+        result = ws.request_json(session, "GET", "https://example.test")
     assert result == {"ok": True}
     assert refresh_calls["count"] == 1
     assert session.storage_state == refreshed.storage_state
@@ -213,11 +215,15 @@ def test_request_json_reauth_refreshes_session_in_place(monkeypatch: pytest.Monk
     assert session.login_username == refreshed.login_username
     assert session.created_at == refreshed.created_at
     assert working.calls == 1
+    assert "Session expired, re-authenticating..." in caplog.text
 
-    second_result = ws.request_json(session, "GET", "https://example.test")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="inspire.platform.web.session"):
+        second_result = ws.request_json(session, "GET", "https://example.test")
     assert second_result == {"ok": True}
     assert refresh_calls["count"] == 1
     assert working.calls == 2
+    assert "Session expired" not in caplog.text
 
 
 def test_browser_request_context_posts_json_bytes():

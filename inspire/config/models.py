@@ -7,8 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
-
 # Config file paths
 CONFIG_FILENAME = "config.toml"
 PROJECT_CONFIG_DIR = ".inspire"  # ./.inspire/config.toml
@@ -18,11 +16,22 @@ class ConfigError(Exception):
     """Configuration error - missing or invalid settings."""
 
 
+class ConfigDeprecationWarning(UserWarning):
+    """Configuration deprecation warning."""
+
+
 # Source tracking for config values
 SOURCE_DEFAULT = "default"
 SOURCE_GLOBAL = "global"
 SOURCE_PROJECT = "project"
 SOURCE_ENV = "env"
+SOURCE_INFERRED = "inferred"
+
+
+def _default_rtunnel_download_url() -> str:
+    from inspire.config.rtunnel_defaults import DEFAULT_RTUNNEL_DOWNLOAD_URL
+
+    return DEFAULT_RTUNNEL_DOWNLOAD_URL
 
 
 @dataclass
@@ -57,6 +66,7 @@ class Config:
     gitea_server: str = "https://codeberg.org"
     gitea_log_workflow: str = "retrieve_job_log.yml"
     gitea_sync_workflow: str = "sync_code.yml"
+    gitea_bridge_workflow: str = "run_bridge_action.yml"
 
     # GitHub settings
     github_repo: Optional[str] = None
@@ -64,6 +74,7 @@ class Config:
     github_server: str = "https://github.com"
     github_log_workflow: str = "retrieve_job_log.yml"
     github_sync_workflow: str = "sync_code.yml"
+    github_bridge_workflow: str = "run_bridge_action.yml"
 
     log_cache_dir: str = "~/.inspire/logs"
     remote_timeout: int = 90
@@ -73,6 +84,7 @@ class Config:
 
     # Bridge exec settings
     bridge_action_timeout: int = 600
+    bridge_action_denylist: list[str] = field(default_factory=list)
 
     # API settings (additional)
     skip_ssl_verify: bool = False
@@ -85,10 +97,18 @@ class Config:
     docker_registry: Optional[str] = None
 
     # Job settings
-    job_priority: int = 6
+    job_resource: Optional[str] = None
+    job_priority: Optional[int] = None
     job_image: Optional[str] = None
     job_project_id: Optional[str] = None
     job_workspace_id: Optional[str] = None
+    job_shm_size: Optional[int] = None
+
+    # Shared command defaults ([defaults])
+    default_resource: Optional[str] = None
+    default_image: Optional[str] = None
+    default_priority: Optional[int] = None
+    default_workspace_id: Optional[str] = None
 
     # Workspace routing (optional)
     workspace_cpu_id: Optional[str] = None
@@ -96,7 +116,7 @@ class Config:
     workspace_internet_id: Optional[str] = None
     workspace_hpc_id: Optional[str] = None
 
-    # Full workspace map loaded from TOML [workspaces]
+    # Full workspace map loaded from account-scoped [accounts."<user>".workspaces]
     workspaces: dict[str, str] = field(default_factory=dict)
 
     # Project alias map for project_id resolution (alias -> project-...)
@@ -114,12 +134,16 @@ class Config:
     # Account-level train job workdir (if available)
     account_train_job_workdir: Optional[str] = None
 
-    # Project context account binding (from [context].account)
+    # Legacy project context account binding (from deprecated [context].account)
     context_account: Optional[str] = None
 
     # Notebook settings
-    notebook_resource: str = "1xH200"
+    notebook_resource: Optional[str] = None
     notebook_image: Optional[str] = None
+    notebook_project_id: Optional[str] = None
+    notebook_priority: Optional[int] = None
+    notebook_workspace_id: Optional[str] = None
+    notebook_shm_size: Optional[int] = None
     notebook_post_start: Optional[str] = None
 
     # HPC settings
@@ -135,8 +159,10 @@ class Config:
     sshd_deb_dir: Optional[str] = None
     dropbear_deb_dir: Optional[str] = None
     setup_script: Optional[str] = None
-    rtunnel_download_url: str = field(default_factory=default_rtunnel_download_url)
+    rtunnel_download_url: str = field(default_factory=_default_rtunnel_download_url)
     apt_mirror_url: Optional[str] = None
+    rtunnel_upload_policy: str = "auto"
+    ssh_port: int = 22222
 
     # Tunnel retry settings
     tunnel_retries: int = 3
@@ -150,6 +176,17 @@ class Config:
 
     # Compute groups (loaded from config.toml [[compute_groups]] sections)
     compute_groups: list[dict] = field(default_factory=list)
+
+    # Workspace resource specs registry (auto-discovered from browser API)
+    # Structure: {workspace_id: [spec_dict, ...]}
+    # Each spec_dict: {spec_id, gpu_type, gpu_count, cpu_cores, memory_gb, gpu_memory_gb, description}
+    # Discovered once per workspace and persisted. No TTL - specs are stable.
+    workspace_specs: dict[str, list[dict]] = field(default_factory=dict)
+
+    # Workspace names registry (auto-discovered from browser API)
+    # Structure: {workspace_id: "workspace_name"}
+    # Maps workspace IDs to their human-readable names.
+    workspace_names: dict[str, str] = field(default_factory=dict)
 
     # Remote environment variables (injected into bridge exec, jobs, run commands)
     remote_env: dict[str, str] = field(default_factory=dict)

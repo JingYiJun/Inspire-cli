@@ -8,7 +8,8 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -397,21 +398,28 @@ def _collect_cpu_workspace_summaries(
         for item in groups.values():
             total_cpus = int(item["total_cpus"])
             free_cpus = int(item["free_cpus"])
-            results.append(
-                browser_api_module.GPUAvailability(
-                    group_id=item["group_id"],
-                    group_name=item["group_name"],
-                    gpu_type="CPU",
-                    total_gpus=total_cpus,
-                    used_gpus=max(total_cpus - free_cpus, 0),
-                    available_gpus=free_cpus,
-                    low_priority_gpus=0,
-                    workspace_id=workspace_id,
-                    workspace_name=workspace_name,
-                )
+            entry = browser_api_module.GPUAvailability(
+                group_id=item["group_id"],
+                group_name=item["group_name"],
+                gpu_type="CPU",
+                total_gpus=total_cpus,
+                used_gpus=max(total_cpus - free_cpus, 0),
+                available_gpus=free_cpus,
+                low_priority_gpus=0,
             )
+            _annotate_workspace(entry, workspace_id=workspace_id, workspace_name=workspace_name)
+            results.append(entry)
 
     return results
+
+
+def _collect_cpu_resources(
+    *,
+    config: Optional[Config],
+    session,  # noqa: ANN001
+) -> list:
+    """Backward-compatible wrapper for CPU workspace summaries."""
+    return _collect_cpu_workspace_summaries(config=config, session=session)
 
 
 def _parse_schedule_quotas(schedule: dict | None) -> list[dict]:
@@ -683,7 +691,10 @@ def _render_accurate_fallback(
             if _workspace_column_enabled(availability):
                 workspace_prefix = f"[{getattr(item, 'workspace_name', '-')}] "
             specs_text = specs_by_key.get(
-                (str(getattr(item, "workspace_id", "") or ""), str(getattr(item, "group_id", "") or "")),
+                (
+                    str(getattr(item, "workspace_id", "") or ""),
+                    str(getattr(item, "group_id", "") or ""),
+                ),
                 "-",
             )
             click.echo(
@@ -828,11 +839,7 @@ def _format_availability_table(
     console.print()
     console.print(f"[bold cyan]{title}[/bold cyan]")
     if workspace_mode:
-        subtitle = (
-            "范围：已配置 workspace 聚合"
-            if show_workspace
-            else "范围：当前 workspace"
-        )
+        subtitle = "范围：已配置 workspace 聚合" if show_workspace else "范围：当前 workspace"
         console.print(f"[dim]{subtitle}[/dim]")
 
     table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold magenta")
@@ -923,9 +930,7 @@ def _format_accurate_availability_table(
     console.print("  • Available：当前空闲可用 GPU")
     console.print("  • Used：正在被任务占用的 GPU")
     console.print("  • Low Pri：低优先级占用，可被抢占")
-    console.print(
-        "  • Schedulable Specs：按单机剩余资源向下归到最大合法 spec；单机只计一次。"
-    )
+    console.print("  • Schedulable Specs：按单机剩余资源向下归到最大合法 spec；单机只计一次。")
     console.print("[bold]用法[/bold]")
     console.print('  • `inspire run "python train.py"` 自动选择资源')
     console.print('  • `inspire run "python train.py" --type H100` 优先 H100')
@@ -958,7 +963,7 @@ def _list_accurate_resources(ctx: Context, show_all: bool, all_workspaces: bool)
                 if not entry.group_name:
                     entry.group_name = known_groups.get(entry.group_id, entry.group_name)
 
-        cpu_summaries = _collect_cpu_workspace_summaries(config=config, session=session)
+        cpu_summaries = _collect_cpu_resources(config=config, session=session)
         if cpu_summaries:
             availability = [
                 item for item in availability if _resource_bucket(item, config) != "cpu"
@@ -1028,7 +1033,9 @@ def _list_workspace_resources(
         _emit_workspace_warnings(ctx, workspace_errors)
 
         if not availability:
-            click.echo(human_formatter.format_error("No GPU resources found in configured workspaces"))
+            click.echo(
+                human_formatter.format_error("No GPU resources found in configured workspaces")
+            )
             return
 
         if ctx.json_output:
@@ -1376,6 +1383,738 @@ def _watch_resources(
         api_logger.setLevel(original_level)
 
 
+_SECTION_TABLE_WIDTH = 108
+
+
+@dataclass
+class CPUResourceSummary:
+    group_id: str
+    group_name: str
+    cpu_per_node_min: int | None = None
+    cpu_per_node_max: int | None = None
+    spec_cpu_min: int | None = None
+    spec_cpu_max: int | None = None
+    spec_memory_gib_min: int | None = None
+    spec_memory_gib_max: int | None = None
+    total_nodes: int = 0
+    ready_nodes: int = 0
+    free_nodes: int = 0
+    has_cpu_specs: bool = False
+    workspace_ids: list[str] = field(default_factory=list)
+    workspace_aliases: list[str] = field(default_factory=list)
+
+
+def _dedupe_ordered(values: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        value = str(raw_value or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _workspace_aliases_by_id(config: Config | None) -> dict[str, list[str]]:
+    aliases_by_id: dict[str, list[str]] = {}
+    if config is None:
+        return aliases_by_id
+    for alias, raw_workspace_id in (getattr(config, "workspaces", None) or {}).items():
+        workspace_id = str(raw_workspace_id or "").strip()
+        if not workspace_id:
+            continue
+        aliases_by_id.setdefault(workspace_id, [])
+        if alias not in aliases_by_id[workspace_id]:
+            aliases_by_id[workspace_id].append(alias)
+    return aliases_by_id
+
+
+def _enumerate_accessible_workspace_ids(session) -> list[str]:  # noqa: ANN001
+    candidates = [str(getattr(session, "workspace_id", "") or "").strip()]
+    candidates.extend(
+        str(ws or "").strip() for ws in (getattr(session, "all_workspace_ids", []) or [])
+    )
+    try:
+        from inspire.platform.web.browser_api.workspaces import try_enumerate_workspaces
+
+        for workspace in try_enumerate_workspaces(session, workspace_id=session.workspace_id):
+            workspace_id = str(workspace.get("id") or "").strip()
+            if workspace_id:
+                candidates.append(workspace_id)
+    except Exception:
+        pass
+    return [
+        workspace_id
+        for workspace_id in _dedupe_ordered(candidates)
+        if workspace_id != _ZERO_WORKSPACE_ID
+    ]
+
+
+def _resolve_resources_workspace_scope(
+    *,
+    config: Config | None,
+    show_all: bool,
+    all_workspaces: bool = False,
+) -> tuple[list[str], dict[str, list[str]], str]:
+    aliases_by_id = _workspace_aliases_by_id(config)
+    session = get_web_session(require_workspace=True)
+    configured_workspace_ids = _dedupe_ordered(
+        list((getattr(config, "workspaces", None) or {}).values()) if config else []
+    )
+
+    workspace_ids = list(configured_workspace_ids)
+    if show_all:
+        has_explicit_defaults = any(
+            str(getattr(config, attr, "") or "").strip()
+            for attr in ("workspace_cpu_id", "workspace_gpu_id", "workspace_internet_id")
+        ) or bool(str(getattr(config, "job_workspace_id", "") or "").strip() if config else "")
+        if has_explicit_defaults:
+            workspace_ids = _dedupe_ordered(
+                workspace_ids
+                + [
+                    (
+                        str(getattr(config, "job_workspace_id", "") or "").strip()
+                        if config is not None
+                        else ""
+                    ),
+                    str(getattr(session, "workspace_id", "") or "").strip(),
+                ]
+            )
+        else:
+            workspace_ids = _enumerate_accessible_workspace_ids(session)
+    if all_workspaces:
+        workspace_ids = _dedupe_ordered(
+            workspace_ids + _enumerate_accessible_workspace_ids(session)
+        )
+
+    if workspace_ids:
+        scope_note = (
+            "Shows all accessible workspaces"
+            if all_workspaces
+            else "Shows configured account workspaces only"
+        )
+        if show_all and not all_workspaces:
+            scope_note = "Shows configured workspaces plus active/default session scope"
+        return workspace_ids, aliases_by_id, scope_note
+
+    fallback_workspace_id = str(getattr(session, "workspace_id", "") or "").strip()
+    if not fallback_workspace_id or fallback_workspace_id == _ZERO_WORKSPACE_ID:
+        return [], aliases_by_id, "No configured workspaces found"
+    return (
+        [fallback_workspace_id],
+        aliases_by_id,
+        "Shows current session workspace only (run 'inspire init --discover' to configure account workspaces)",
+    )
+
+
+def _apply_workspace_aliases(availability: list, aliases_by_id: dict[str, list[str]]) -> None:
+    for entry in availability:
+        entry.workspace_aliases = []
+        for workspace_id in getattr(entry, "workspace_ids", []) or []:
+            for alias in aliases_by_id.get(workspace_id, []):
+                if alias not in entry.workspace_aliases:
+                    entry.workspace_aliases.append(alias)
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def _truncate_display(value: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    if _display_width(value) <= max_width:
+        return value
+    ellipsis = "…"
+    ellipsis_width = _display_width(ellipsis)
+    trimmed = ""
+    for char in value:
+        char_width = _display_width(char)
+        if _display_width(trimmed) + char_width + ellipsis_width > max_width:
+            return trimmed + ellipsis
+        trimmed += char
+    return trimmed
+
+
+def _pad_display(value: str, width: int, align: str = "left") -> str:
+    actual_width = _display_width(value)
+    padding = max(width - actual_width, 0)
+    if align == "right":
+        return f"{' ' * padding}{value}"
+    return f"{value}{' ' * padding}"
+
+
+def _render_table(
+    columns: list[tuple[str, str]],
+    rows: list[dict[str, str]],
+    *,
+    min_width: int = 0,
+) -> list[str]:
+    widths: list[int] = []
+    for index, (header, _align) in enumerate(columns):
+        cell_width = _display_width(header)
+        for row in rows:
+            values = list(row.values())
+            if index < len(values):
+                cell_width = max(cell_width, _display_width(values[index]))
+        widths.append(cell_width)
+
+    rendered: list[str] = []
+    header_cells = []
+    for (header, align), width in zip(columns, widths):
+        header_cells.append(_pad_display(header, width, "right" if align == "right" else "left"))
+    header_line = "  ".join(header_cells)
+    border_width = max(_display_width(header_line), min_width)
+    rendered.append("─" * border_width)
+    rendered.append(header_line)
+    rendered.append("─" * border_width)
+    for row in rows:
+        row_cells = []
+        values = list(row.values())
+        for (_header, align), width, value in zip(columns, widths, values):
+            row_cells.append(_pad_display(value, width, align))
+        rendered.append("  ".join(row_cells))
+    rendered.append("─" * border_width)
+    return rendered
+
+
+def _short_group_id(group_id: str) -> str:
+    return group_id.split("-")[-1][-8:]
+
+
+def _disambiguated_names(entries: list[object]) -> dict[str, str]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        name = str(getattr(entry, "group_name", "") or "")
+        counts[name] = counts.get(name, 0) + 1
+
+    display_names: dict[str, str] = {}
+    for entry in entries:
+        group_id = str(getattr(entry, "group_id", "") or "")
+        name = str(getattr(entry, "group_name", "") or "")
+        if counts.get(name, 0) > 1 and group_id:
+            display_names[group_id] = f"{name} [{_short_group_id(group_id)}]"
+        else:
+            display_names[group_id] = name
+    return display_names
+
+
+def _format_range(min_value: int | None, max_value: int | None, *, none_value: str = "none") -> str:
+    if min_value is None or max_value is None:
+        return none_value
+    if min_value == max_value:
+        return str(min_value)
+    return f"{min_value}-{max_value}"
+
+
+def _update_range(
+    current_min: int | None,
+    current_max: int | None,
+    candidate: int | None,
+) -> tuple[int | None, int | None]:
+    if candidate is None:
+        return current_min, current_max
+    if current_min is None or candidate < current_min:
+        current_min = candidate
+    if current_max is None or candidate > current_max:
+        current_max = candidate
+    return current_min, current_max
+
+
+def _group_base_url(config: Config | None) -> str:
+    base_url = getattr(config, "base_url", None) if config is not None else None
+    return base_url or os.environ.get("INSPIRE_BASE_URL", "https://api.example.com").strip()
+
+
+def _is_node_free(node: dict) -> bool:
+    return (
+        not (node.get("task_list") or [])
+        and not str(node.get("cordon_type") or "").strip()
+        and not node.get("is_maint", False)
+        and str(node.get("resource_pool") or "").lower() != "fault"
+    )
+
+
+def _collect_cpu_node_summaries(
+    *,
+    config: Config | None,
+    workspace_ids: list[str],
+    aliases_by_id: dict[str, list[str]],
+) -> dict[str, CPUResourceSummary]:
+    session = get_web_session(require_workspace=True)
+    base_url = _group_base_url(config)
+    summaries: dict[str, CPUResourceSummary] = {}
+
+    for workspace_id in workspace_ids:
+        try:
+            nodes = fetch_workspace_availability(
+                session,
+                base_url=base_url,
+                workspace_id=workspace_id,
+            )
+        except Exception:
+            continue
+        for node in nodes:
+            if int(node.get("gpu_count", 0) or 0) != 0:
+                continue
+
+            group_id = str(node.get("logic_compute_group_id") or "").strip()
+            group_name = str(node.get("logic_compute_group_name") or "").strip()
+            if not group_id or not group_name:
+                continue
+
+            summary = summaries.setdefault(
+                group_id,
+                CPUResourceSummary(group_id=group_id, group_name=group_name),
+            )
+            if workspace_id not in summary.workspace_ids:
+                summary.workspace_ids.append(workspace_id)
+            for alias in aliases_by_id.get(workspace_id, []):
+                if alias not in summary.workspace_aliases:
+                    summary.workspace_aliases.append(alias)
+
+            cpu_count = node.get("cpu_count")
+            cpu_value = int(cpu_count or 0) if cpu_count is not None else None
+            summary.cpu_per_node_min, summary.cpu_per_node_max = _update_range(
+                summary.cpu_per_node_min,
+                summary.cpu_per_node_max,
+                cpu_value,
+            )
+            summary.total_nodes += 1
+
+            if str(node.get("status") or "").upper() == "READY":
+                summary.ready_nodes += 1
+                if _is_node_free(node):
+                    summary.free_nodes += 1
+
+    return summaries
+
+
+def _collect_cpu_spec_summaries(
+    *,
+    workspace_ids: list[str],
+    aliases_by_id: dict[str, list[str]],
+) -> dict[str, CPUResourceSummary]:
+    summaries: dict[str, CPUResourceSummary] = {}
+    seen_workspace_group_pairs: set[tuple[str, str]] = set()
+
+    for workspace_id in workspace_ids:
+        try:
+            groups = browser_api_module.list_notebook_compute_groups(workspace_id=workspace_id)
+        except Exception:
+            continue
+        for group in groups:
+            group_id = str(group.get("logic_compute_group_id") or group.get("id") or "").strip()
+            group_name = str(group.get("name") or "").strip()
+            if not group_id or not group_name:
+                continue
+            if (workspace_id, group_id) in seen_workspace_group_pairs:
+                continue
+            seen_workspace_group_pairs.add((workspace_id, group_id))
+
+            try:
+                prices = browser_api_module.get_resource_prices(
+                    workspace_id=workspace_id,
+                    logic_compute_group_id=group_id,
+                )
+            except Exception:
+                continue
+            cpu_rows = [row for row in prices if int(row.get("gpu_count", 0) or 0) == 0]
+            if not cpu_rows:
+                continue
+
+            summary = summaries.setdefault(
+                group_id,
+                CPUResourceSummary(group_id=group_id, group_name=group_name),
+            )
+            if workspace_id not in summary.workspace_ids:
+                summary.workspace_ids.append(workspace_id)
+            for alias in aliases_by_id.get(workspace_id, []):
+                if alias not in summary.workspace_aliases:
+                    summary.workspace_aliases.append(alias)
+
+            summary.has_cpu_specs = True
+            for row in cpu_rows:
+                cpu_count = row.get("cpu_count")
+                cpu_value = int(cpu_count or 0) if cpu_count is not None else None
+                memory_gib = row.get("memory_size_gib")
+                memory_value = int(memory_gib or 0) if memory_gib is not None else None
+                summary.spec_cpu_min, summary.spec_cpu_max = _update_range(
+                    summary.spec_cpu_min,
+                    summary.spec_cpu_max,
+                    cpu_value,
+                )
+                summary.spec_memory_gib_min, summary.spec_memory_gib_max = _update_range(
+                    summary.spec_memory_gib_min,
+                    summary.spec_memory_gib_max,
+                    memory_value,
+                )
+
+    return summaries
+
+
+def _merge_cpu_resources(
+    live_cpu: dict[str, CPUResourceSummary],
+    spec_cpu: dict[str, CPUResourceSummary],
+) -> list[CPUResourceSummary]:
+    merged: dict[str, CPUResourceSummary] = {}
+    for source in (live_cpu, spec_cpu):
+        for group_id, entry in source.items():
+            target = merged.setdefault(
+                group_id,
+                CPUResourceSummary(group_id=entry.group_id, group_name=entry.group_name),
+            )
+            if entry.group_name and not target.group_name:
+                target.group_name = entry.group_name
+            target.cpu_per_node_min, target.cpu_per_node_max = _update_range(
+                target.cpu_per_node_min,
+                target.cpu_per_node_max,
+                entry.cpu_per_node_min,
+            )
+            target.cpu_per_node_min, target.cpu_per_node_max = _update_range(
+                target.cpu_per_node_min,
+                target.cpu_per_node_max,
+                entry.cpu_per_node_max,
+            )
+            target.spec_cpu_min, target.spec_cpu_max = _update_range(
+                target.spec_cpu_min,
+                target.spec_cpu_max,
+                entry.spec_cpu_min,
+            )
+            target.spec_cpu_min, target.spec_cpu_max = _update_range(
+                target.spec_cpu_min,
+                target.spec_cpu_max,
+                entry.spec_cpu_max,
+            )
+            target.spec_memory_gib_min, target.spec_memory_gib_max = _update_range(
+                target.spec_memory_gib_min,
+                target.spec_memory_gib_max,
+                entry.spec_memory_gib_min,
+            )
+            target.spec_memory_gib_min, target.spec_memory_gib_max = _update_range(
+                target.spec_memory_gib_min,
+                target.spec_memory_gib_max,
+                entry.spec_memory_gib_max,
+            )
+            target.total_nodes += entry.total_nodes
+            target.ready_nodes += entry.ready_nodes
+            target.free_nodes += entry.free_nodes
+            target.has_cpu_specs = target.has_cpu_specs or entry.has_cpu_specs
+            for workspace_id in entry.workspace_ids:
+                if workspace_id not in target.workspace_ids:
+                    target.workspace_ids.append(workspace_id)
+            for alias in entry.workspace_aliases:
+                if alias not in target.workspace_aliases:
+                    target.workspace_aliases.append(alias)
+
+    return sorted(
+        merged.values(),
+        key=lambda item: (item.free_nodes, item.ready_nodes, item.total_nodes, item.group_name),
+        reverse=True,
+    )
+
+
+def _collect_cpu_resources(
+    *,
+    config: Config | None,
+    workspace_ids: list[str],
+    aliases_by_id: dict[str, list[str]],
+) -> list[CPUResourceSummary]:
+    live_cpu = _collect_cpu_node_summaries(
+        config=config,
+        workspace_ids=workspace_ids,
+        aliases_by_id=aliases_by_id,
+    )
+    spec_cpu = _collect_cpu_spec_summaries(
+        workspace_ids=workspace_ids,
+        aliases_by_id=aliases_by_id,
+    )
+    return _merge_cpu_resources(live_cpu, spec_cpu)
+
+
+def _cpu_resources_to_json(cpu_resources: list[CPUResourceSummary]) -> list[dict]:
+    return [
+        {
+            "group_id": item.group_id,
+            "group_name": item.group_name,
+            "workspace_ids": item.workspace_ids,
+            "workspace_aliases": item.workspace_aliases,
+            "cpu_per_node_min": item.cpu_per_node_min,
+            "cpu_per_node_max": item.cpu_per_node_max,
+            "spec_cpu_min": item.spec_cpu_min,
+            "spec_cpu_max": item.spec_cpu_max,
+            "spec_memory_gib_min": item.spec_memory_gib_min,
+            "spec_memory_gib_max": item.spec_memory_gib_max,
+            "total_nodes": item.total_nodes,
+            "ready_nodes": item.ready_nodes,
+            "free_nodes": item.free_nodes,
+            "has_cpu_specs": item.has_cpu_specs,
+        }
+        for item in cpu_resources
+    ]
+
+
+def _render_gpu_summary_section(availability: list) -> list[str]:
+    display_names = _disambiguated_names(availability)
+    rows: list[dict[str, str]] = []
+    total_available = 0
+    total_used = 0
+    total_low_pri = 0
+    total_gpus = 0
+
+    for item in sorted(availability, key=lambda value: value.available_gpus, reverse=True):
+        total_available += item.available_gpus
+        total_used += item.used_gpus
+        total_low_pri += item.low_priority_gpus
+        total_gpus += item.total_gpus
+        rows.append(
+            {
+                "GPU Type": _truncate_display(str(item.gpu_type), 22),
+                "Compute Group": _truncate_display(display_names[item.group_id], 28),
+                "Available": str(item.available_gpus),
+                "Used": str(item.used_gpus),
+                "Low Pri": str(item.low_priority_gpus),
+                "Total": str(item.total_gpus),
+            }
+        )
+
+    lines = ["GPU Availability"]
+    lines.extend(
+        _render_table(
+            [
+                ("GPU Type", "left"),
+                ("Compute Group", "left"),
+                ("Available", "right"),
+                ("Used", "right"),
+                ("Low Pri", "right"),
+                ("Total", "right"),
+            ],
+            rows,
+            min_width=_SECTION_TABLE_WIDTH,
+        )
+    )
+    lines.append(
+        _pad_display("TOTAL", _display_width("GPU Type"), "left")
+        + "  "
+        + _pad_display("", max(_display_width("Compute Group"), 28), "left")
+        + "  "
+        + _pad_display(str(total_available), max(_display_width("Available"), 9), "right")
+        + "  "
+        + _pad_display(str(total_used), max(_display_width("Used"), 4), "right")
+        + "  "
+        + _pad_display(str(total_low_pri), max(_display_width("Low Pri"), 7), "right")
+        + "  "
+        + _pad_display(str(total_gpus), max(_display_width("Total"), 5), "right")
+    )
+    lines.append("")
+    lines.append("Legend: Available = ready to use; Low Pri = preemptible usage")
+    return lines
+
+
+def _collect_accurate_availability_compat(
+    *,
+    config: Config | None,
+    session,
+    workspace_ids: list[str],
+    aliases_by_id: dict[str, list[str]],
+) -> list:
+    try:
+        availability = browser_api_module.get_accurate_gpu_availability(
+            workspace_ids=workspace_ids,
+        )
+        _apply_workspace_aliases(availability, aliases_by_id)
+        for item in availability:
+            workspace_list = list(getattr(item, "workspace_ids", []) or [])
+            workspace_id = workspace_list[0] if workspace_list else ""
+            setattr(item, "workspace_id", workspace_id)
+            setattr(item, "workspace_name", _workspace_label(config, session, workspace_id))
+        return availability
+    except TypeError:
+        availability: list = []
+        for workspace_id in workspace_ids:
+            scoped = browser_api_module.get_accurate_gpu_availability(
+                workspace_id=workspace_id,
+                session=session,
+            )
+            workspace_name = _workspace_label(config, session, workspace_id)
+            for item in scoped:
+                setattr(item, "workspace_id", workspace_id)
+                setattr(item, "workspace_name", workspace_name)
+                setattr(item, "workspace_ids", [workspace_id])
+                workspace_aliases = list(getattr(item, "workspace_aliases", []) or [])
+                for alias in aliases_by_id.get(workspace_id, []):
+                    if alias not in workspace_aliases:
+                        workspace_aliases.append(alias)
+                setattr(item, "workspace_aliases", workspace_aliases)
+                availability.append(item)
+        return availability
+
+
+def _cpu_resources_as_availability(
+    cpu_resources: list[CPUResourceSummary],
+    *,
+    config: Config | None,
+    session,
+) -> list:
+    converted: list = []
+    for item in cpu_resources:
+        workspace_id = item.workspace_ids[0] if item.workspace_ids else ""
+        workspace_name = _workspace_label(config, session, workspace_id) if workspace_id else ""
+        total = item.cpu_per_node_max or item.spec_cpu_max or 0
+        free = item.cpu_per_node_min or item.spec_cpu_min or 0
+        entry = browser_api_module.GPUAvailability(
+            group_id=item.group_id,
+            group_name=item.group_name,
+            gpu_type="CPU",
+            total_gpus=total,
+            used_gpus=max(total - free, 0),
+            available_gpus=free,
+            low_priority_gpus=0,
+            workspace_ids=list(item.workspace_ids),
+        )
+        setattr(entry, "workspace_id", workspace_id)
+        setattr(entry, "workspace_name", workspace_name)
+        setattr(entry, "workspace_aliases", list(item.workspace_aliases))
+        converted.append(entry)
+    return converted
+
+
+def _list_accurate_resources(ctx: Context, show_all: bool) -> None:
+    try:
+        config = _load_optional_config()
+        session = get_web_session()
+        workspace_ids, aliases_by_id, scope_note = _resolve_resources_workspace_scope(
+            config=config,
+            show_all=show_all,
+            all_workspaces=False,
+        )
+        raw_availability = _collect_accurate_availability_compat(
+            config=config,
+            session=session,
+            workspace_ids=workspace_ids,
+            aliases_by_id=aliases_by_id,
+        )
+        availability = [item for item in raw_availability if getattr(item, "total_gpus", 0) > 0]
+        cpu_resources = _collect_cpu_resources(
+            config=config,
+            workspace_ids=workspace_ids,
+            aliases_by_id=aliases_by_id,
+        )
+
+        if ctx.json_output:
+            output = [
+                {
+                    "group_id": a.group_id,
+                    "group_name": a.group_name,
+                    "gpu_type": a.gpu_type,
+                    "total_gpus": a.total_gpus,
+                    "used_gpus": a.used_gpus,
+                    "available_gpus": a.available_gpus,
+                    "low_priority_gpus": a.low_priority_gpus,
+                    "workspace_id": getattr(a, "workspace_id", ""),
+                    "workspace_name": getattr(a, "workspace_name", ""),
+                    "workspace_ids": getattr(a, "workspace_ids", []),
+                    "workspace_aliases": getattr(a, "workspace_aliases", []),
+                }
+                for a in availability
+            ]
+            click.echo(
+                json_formatter.format_json(
+                    {
+                        "availability": output,
+                        "cpu_resources": _cpu_resources_to_json(cpu_resources),
+                    }
+                )
+            )
+            return
+
+        render_availability = list(raw_availability)
+        if not any(
+            str(getattr(item, "gpu_type", "") or "").upper() == "CPU" for item in raw_availability
+        ):
+            render_availability.extend(
+                _cpu_resources_as_availability(
+                    cpu_resources,
+                    config=config,
+                    session=session,
+                )
+            )
+        has_browser_auth = bool(getattr(session, "cookies", None)) or bool(
+            (getattr(session, "storage_state", None) or {}).get("cookies")
+        )
+        if has_browser_auth:
+            _format_accurate_availability_table(render_availability, config=config, session=session)
+        else:
+            _format_accurate_availability_table(render_availability, config=config, session=None)
+    except (SessionExpiredError, ValueError) as e:
+        _handle_error(ctx, "AuthenticationError", str(e), EXIT_AUTH_ERROR)
+    except Exception as e:
+        _handle_error(ctx, "APIError", str(e), EXIT_API_ERROR)
+
+
+def _list_workspace_resources(ctx: Context, show_all: bool, no_cache: bool) -> None:
+    try:
+        if no_cache:
+            clear_availability_cache()
+
+        config = _load_optional_config()
+        workspace_ids, aliases_by_id, _scope_note = _resolve_resources_workspace_scope(
+            config=config,
+            show_all=show_all,
+            all_workspaces=False,
+        )
+        availability = fetch_resource_availability(
+            config=config,
+            known_only=False,
+            workspace_ids=workspace_ids,
+            workspace_aliases_by_id=aliases_by_id,
+        )
+        cpu_resources = _collect_cpu_resources(
+            config=config,
+            workspace_ids=workspace_ids,
+            aliases_by_id=aliases_by_id,
+        )
+
+        if ctx.json_output:
+            output = [
+                {
+                    "group_id": a.group_id,
+                    "group_name": a.group_name,
+                    "gpu_type": a.gpu_type,
+                    "gpus_per_node": a.gpu_per_node,
+                    "total_nodes": a.total_nodes,
+                    "ready_nodes": a.ready_nodes,
+                    "free_nodes": a.free_nodes,
+                    "free_gpus": a.free_gpus,
+                    "workspace_id": (getattr(a, "workspace_ids", []) or [""])[0],
+                    "workspace_ids": getattr(a, "workspace_ids", []),
+                    "workspace_aliases": getattr(a, "workspace_aliases", []),
+                }
+                for a in availability
+            ]
+            click.echo(
+                json_formatter.format_json(
+                    {
+                        "availability": output,
+                        "cpu_resources": _cpu_resources_to_json(cpu_resources),
+                    }
+                )
+            )
+            return
+
+        _format_availability_table(availability, workspace_mode=True, config=config)
+    except (SessionExpiredError, ValueError) as e:
+        _handle_error(ctx, "AuthenticationError", str(e), EXIT_AUTH_ERROR)
+    except Exception as e:
+        _handle_error(ctx, "APIError", str(e), EXIT_API_ERROR)
+
+
 def run_resources_list(
     ctx: Context,
     *,
@@ -1384,9 +2123,14 @@ def run_resources_list(
     all_workspaces: bool,
     watch: bool,
     interval: int,
-    workspace: bool,
+    view: str,
     use_global: bool,
 ) -> None:
+    if use_global:
+        click.echo("Note: --global is deprecated; use --view nodes instead.", err=True)
+        if view == "summary":
+            view = "nodes"
+
     if watch:
         if ctx.json_output:
             click.echo(
@@ -1399,19 +2143,89 @@ def run_resources_list(
             )
             sys.exit(EXIT_CONFIG_ERROR)
 
-        _watch_resources(ctx, show_all, all_workspaces, interval, workspace, use_global)
+        _watch_resources(
+            ctx,
+            show_all or all_workspaces,
+            show_all or all_workspaces,
+            interval,
+            view == "nodes",
+            use_global,
+        )
         return
 
-    if workspace or use_global:
-        if use_global and not workspace:
-            click.echo(
-                "Note: --global is deprecated; showing workspace node availability instead.",
-                err=True,
+    if view == "nodes":
+        if all_workspaces:
+            _list_workspace_resources(ctx, True, no_cache)
+        else:
+            _list_workspace_resources(ctx, show_all, no_cache)
+        return
+
+    if all_workspaces:
+        config = _load_optional_config()
+        session = get_web_session()
+        workspace_ids, aliases_by_id, _scope_note = _resolve_resources_workspace_scope(
+            config=config,
+            show_all=show_all,
+            all_workspaces=True,
+        )
+        try:
+            availability = _collect_accurate_availability_compat(
+                config=config,
+                session=session,
+                workspace_ids=workspace_ids,
+                aliases_by_id=aliases_by_id,
             )
-        _list_workspace_resources(ctx, show_all, no_cache, all_workspaces)
-        return
+            availability = [item for item in availability if getattr(item, "total_gpus", 0) > 0]
+            cpu_resources = _collect_cpu_resources(
+                config=config,
+                workspace_ids=workspace_ids,
+                aliases_by_id=aliases_by_id,
+            )
+            if ctx.json_output:
+                output = [
+                    {
+                        "group_id": a.group_id,
+                        "group_name": a.group_name,
+                        "gpu_type": a.gpu_type,
+                        "total_gpus": a.total_gpus,
+                        "used_gpus": a.used_gpus,
+                        "available_gpus": a.available_gpus,
+                        "low_priority_gpus": a.low_priority_gpus,
+                        "workspace_id": getattr(a, "workspace_id", ""),
+                        "workspace_name": getattr(a, "workspace_name", ""),
+                        "workspace_ids": getattr(a, "workspace_ids", []),
+                        "workspace_aliases": getattr(a, "workspace_aliases", []),
+                    }
+                    for a in availability
+                ]
+                click.echo(
+                    json_formatter.format_json(
+                        {
+                            "availability": output,
+                            "cpu_resources": _cpu_resources_to_json(cpu_resources),
+                        }
+                    )
+                )
+                return
+            render_availability = availability + _cpu_resources_as_availability(
+                cpu_resources,
+                config=config,
+                session=session,
+            )
+            _format_accurate_availability_table(
+                render_availability,
+                config=config,
+                session=session,
+            )
+            return
+        except (SessionExpiredError, ValueError) as e:
+            _handle_error(ctx, "AuthenticationError", str(e), EXIT_AUTH_ERROR)
+            return
+        except Exception as e:
+            _handle_error(ctx, "APIError", str(e), EXIT_API_ERROR)
+            return
 
-    _list_accurate_resources(ctx, show_all, all_workspaces)
+    _list_accurate_resources(ctx, show_all)
 
 
 @click.command("list")
@@ -1424,12 +2238,12 @@ def run_resources_list(
     "--all",
     "show_all",
     is_flag=True,
-    help="Thorough check: show all accessible compute groups",
+    help="Expand scope to all accessible workspaces (default: configured account workspaces)",
 )
 @click.option(
     "--all-workspaces",
     is_flag=True,
-    help="Query all discovered workspaces instead of only configured defaults",
+    help="Include discovered session workspaces in addition to configured/default scope",
 )
 @click.option(
     "--watch",
@@ -1445,16 +2259,17 @@ def run_resources_list(
     help="Watch refresh interval in seconds (default: 30)",
 )
 @click.option(
-    "--workspace",
-    "-ws",
-    is_flag=True,
-    help="Show per-node availability (workspace-scoped, browser API)",
+    "--view",
+    type=click.Choice(["summary", "nodes"]),
+    default="summary",
+    show_default=True,
+    help="Display summary or node-level availability",
 )
 @click.option(
     "--global",
     "use_global",
     is_flag=True,
-    help="Deprecated: alias for --workspace (OpenAPI view removed)",
+    help="Deprecated: alias for --view nodes",
 )
 @pass_context
 def list_resources(
@@ -1464,22 +2279,10 @@ def list_resources(
     all_workspaces: bool,
     watch: bool,
     interval: int,
-    workspace: bool = False,
+    view: str,
     use_global: bool = False,
 ) -> None:
-    """List GPU availability across compute groups.
-
-    By default, shows accurate real-time GPU usage across configured workspaces.
-    Use --workspace for per-node availability (free/ready nodes).
-
-    \b
-    Examples:
-        inspire resources list              # Accurate GPU usage (default)
-        inspire resources list --all-workspaces  # Query all discovered workspaces
-        inspire resources list --workspace  # Node-level availability
-        inspire resources list --all        # Include all compute groups
-        inspire resources list --watch      # Watch mode
-    """
+    """List GPU availability across compute groups."""
     run_resources_list(
         ctx,
         no_cache=no_cache,
@@ -1487,6 +2290,6 @@ def list_resources(
         all_workspaces=all_workspaces,
         watch=watch,
         interval=interval,
-        workspace=workspace,
+        view=view,
         use_global=use_global,
     )

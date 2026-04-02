@@ -16,11 +16,15 @@ from inspire.bridge.tunnel import (
     BridgeProfile,
     TunnelConfig,
     generate_ssh_config,
+    get_ssh_command_args,
+    has_installed_ssh_config,
+    install_all_ssh_configs,
     load_tunnel_config,
     save_tunnel_config,
     _get_proxy_command,
     has_internet_for_gpu_type,
 )
+from inspire.bridge.tunnel.ssh import _strip_inspire_generated_entries
 
 # ===========================================================================
 # JobCache tests
@@ -456,6 +460,7 @@ class TestBridgeProfile:
             proxy_url="https://proxy.example.com",
             ssh_user="admin",
             ssh_port=22222,
+            identity_file="/tmp/test-id",
             rtunnel_port=31337,
         )
 
@@ -465,6 +470,7 @@ class TestBridgeProfile:
         assert d["proxy_url"] == "https://proxy.example.com"
         assert d["ssh_user"] == "admin"
         assert d["ssh_port"] == 22222
+        assert d["identity_file"] == "/tmp/test-id"
         assert d["rtunnel_port"] == 31337
 
     def test_from_dict(self) -> None:
@@ -474,6 +480,7 @@ class TestBridgeProfile:
             "proxy_url": "https://proxy.example.com",
             "ssh_user": "admin",
             "ssh_port": 22222,
+            "identity_file": "/tmp/test-id",
             "rtunnel_port": 31337,
         }
 
@@ -483,6 +490,7 @@ class TestBridgeProfile:
         assert profile.proxy_url == "https://proxy.example.com"
         assert profile.ssh_user == "admin"
         assert profile.ssh_port == 22222
+        assert profile.identity_file == "/tmp/test-id"
         assert profile.rtunnel_port == 31337
 
     def test_from_dict_with_defaults(self) -> None:
@@ -574,22 +582,6 @@ class TestTunnelConfig:
 
         assert retrieved is not None
         assert retrieved.name == "test-bridge"
-
-    def test_get_bridge_matches_alias_and_notebook_id(self) -> None:
-        """Test bridge lookup accepts aliases and notebook ids."""
-        config = TunnelConfig()
-        profile = BridgeProfile(
-            name="gpu-main",
-            proxy_url="https://proxy.example.com",
-            aliases=["train", "default"],
-            notebook_id="notebook-12345678",
-            notebook_name="GPU Main",
-        )
-        config.add_bridge(profile)
-
-        assert config.get_bridge("train") is profile
-        assert config.get_bridge("notebook-12345678") is profile
-        assert config.get_bridge("GPU Main") is profile
 
     def test_get_default_bridge(self) -> None:
         """Test getting default bridge."""
@@ -893,13 +885,157 @@ class TestProxyCommand:
         bridge = BridgeProfile(
             name="test",
             proxy_url="https://proxy.example.com/tunnel?token=a*b",
-            aliases=["train"],
-            notebook_id="notebook-12345678",
         )
         rtunnel_bin = tmp_path / "rtunnel with space"
 
         ssh_config = generate_ssh_config(bridge, rtunnel_bin, host_alias="mybridge")
-        expected_proxy = _get_proxy_command(bridge, rtunnel_bin, quiet=False)
+        assert "Host mybridge" in ssh_config
+        assert "ProxyCommand" in ssh_config
+        assert "stdio://%h:%p" in ssh_config
+        assert "bash -lc" not in ssh_config
 
-        assert "Host mybridge test train notebook-12345678" in ssh_config
-        assert f"ProxyCommand {expected_proxy}" in ssh_config
+    def test_install_all_ssh_configs_replaces_legacy_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        ssh_config_path = ssh_dir / "config"
+        ssh_config_path.write_text(
+            "Host personal\n"
+            "    HostName 1.2.3.4\n\n"
+            "# Inspire Bridges (auto-generated)\n"
+            "Host cpu\n"
+            "    HostName localhost\n"
+            "    User root\n"
+            "    Port 22222\n"
+            "    ProxyCommand /tmp/rtunnel wss://old.example/ws/cpu/proxy/31337/ localhost:%p\n"
+            "    StrictHostKeyChecking no\n"
+            "    UserKnownHostsFile /dev/null\n"
+            "    LogLevel ERROR\n"
+        )
+
+        config = TunnelConfig(config_dir=tmp_path)
+        config.add_bridge(
+            BridgeProfile(name="cpu", proxy_url="https://new.example/ws/cpu/proxy/31337/")
+        )
+        config.add_bridge(
+            BridgeProfile(name="gpu", proxy_url="https://new.example/ws/gpu/proxy/31337/")
+        )
+        monkeypatch.setattr(
+            "inspire.bridge.tunnel.ssh._ensure_rtunnel_binary", lambda _: tmp_path / "rtunnel"
+        )
+
+        result = install_all_ssh_configs(config)
+
+        assert result["success"] is True
+        content = ssh_config_path.read_text()
+        assert "Host personal" in content
+        assert content.count("# >>> Inspire Bridges (auto-generated) >>>") == 1
+        assert "old.example" not in content
+        assert "new.example/ws/cpu" in content
+        assert "new.example/ws/gpu" in content
+        assert "stdio://%h:%p" in content
+
+    def test_strip_inspire_generated_entries_keeps_user_hosts_after_legacy_header(self) -> None:
+        legacy_content = (
+            "Host before\n"
+            "    HostName 1.2.3.4\n\n"
+            "# Inspire Bridges (auto-generated)\n"
+            "Host cpu\n"
+            "    HostName localhost\n"
+            "    User root\n"
+            "    Port 22222\n"
+            "    ProxyCommand /tmp/rtunnel wss://old.example/ws/cpu/proxy/31337/ localhost:%p\n"
+            "    StrictHostKeyChecking no\n"
+            "    UserKnownHostsFile /dev/null\n"
+            "    LogLevel ERROR\n\n"
+            "Host custom-after-legacy\n"
+            "    HostName 5.6.7.8\n"
+            "    User alice\n"
+        )
+
+        cleaned = _strip_inspire_generated_entries(legacy_content)
+
+        assert "Host before" in cleaned
+        assert "Host cpu" not in cleaned
+        assert "Host custom-after-legacy" in cleaned
+        assert "HostName 5.6.7.8" in cleaned
+
+    def test_install_all_ssh_configs_preserves_unmanaged_local_rtunnel_host(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Managed install should not delete user-defined localhost/rtunnel hosts."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        ssh_config_path = ssh_dir / "config"
+        ssh_config_path.write_text(
+            "Host personal-bridge\n"
+            "    HostName localhost\n"
+            "    User root\n"
+            "    Port 2200\n"
+            "    ProxyCommand /opt/custom/rtunnel wss://keep.example/ localhost:%p\n"
+            "    StrictHostKeyChecking no\n"
+            "    UserKnownHostsFile /dev/null\n"
+            "    LogLevel ERROR\n\n"
+            "# Inspire Bridges (auto-generated)\n"
+            "Host cpu\n"
+            "    HostName localhost\n"
+            "    User root\n"
+            "    Port 22222\n"
+            "    ProxyCommand /tmp/rtunnel wss://old.example/ws/cpu/proxy/31337/ localhost:%p\n"
+            "    StrictHostKeyChecking no\n"
+            "    UserKnownHostsFile /dev/null\n"
+            "    LogLevel ERROR\n"
+        )
+
+        config = TunnelConfig(config_dir=tmp_path)
+        config.add_bridge(
+            BridgeProfile(name="cpu", proxy_url="https://new.example/ws/cpu/proxy/31337/")
+        )
+        monkeypatch.setattr(
+            "inspire.bridge.tunnel.ssh._ensure_rtunnel_binary", lambda _: tmp_path / "rtunnel"
+        )
+
+        result = install_all_ssh_configs(config)
+
+        assert result["success"] is True
+        content = ssh_config_path.read_text()
+        assert "keep.example" in content
+        assert "personal-bridge" in content
+        assert "old.example" not in content
+        assert "new.example" in content
+
+    def test_has_installed_ssh_config_detects_managed_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        ssh_config_path = ssh_dir / "config"
+        ssh_config_path.write_text(
+            "# >>> Inspire Bridges (auto-generated) >>>\n"
+            "Host cpu\n"
+            "    HostName localhost\n"
+            "# <<< Inspire Bridges (auto-generated) <<<\n"
+        )
+
+        assert has_installed_ssh_config(ssh_config_path) is True
+
+    def test_get_ssh_command_args_uses_stdio_proxycommand(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = TunnelConfig(config_dir=tmp_path)
+        config.add_bridge(BridgeProfile(name="cpu", proxy_url="https://proxy.example.com/path"))
+        monkeypatch.setattr(
+            "inspire.bridge.tunnel.ssh_exec._ensure_rtunnel_binary", lambda _: tmp_path / "rtunnel"
+        )
+
+        args = get_ssh_command_args(bridge_name="cpu", config=config, remote_command="echo ok")
+
+        assert args[0] == "ssh"
+        joined = " ".join(args)
+        assert "ProxyCommand=" in joined
+        assert "stdio://" in joined
+        assert "grep -qi rtunnel" not in joined

@@ -21,8 +21,10 @@ from inspire.bridge.tunnel import (
     load_tunnel_config,
 )
 from inspire.bridge.tunnel.scp import run_scp_transfer
-from inspire.cli.formatters import json_formatter
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.notebook_cli import resolve_json_output
 from inspire.cli.utils.errors import exit_with_error as _handle_error
+from inspire.cli.utils.output import emit_info, emit_success
 
 
 def _scp_failure_details(result: object) -> str | None:
@@ -44,6 +46,7 @@ def _scp_failure_details(result: object) -> str | None:
 @click.option("--recursive", "-r", is_flag=True, help="Copy directories recursively")
 @click.option("--bridge", "-b", help="Bridge profile to use")
 @click.option("--timeout", "-t", type=int, default=None, help="Timeout in seconds")
+@json_option
 @pass_context
 def bridge_scp(
     ctx: Context,
@@ -53,7 +56,9 @@ def bridge_scp(
     recursive: bool,
     bridge: Optional[str],
     timeout: Optional[int],
+    json_output: bool = False,
 ) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Transfer files to/from Bridge via SCP.
 
     By default, uploads SOURCE (local) to DESTINATION (remote).
@@ -100,11 +105,11 @@ def bridge_scp(
     direction = "download" if download else "upload"
 
     if not ctx.json_output and ctx.debug:
-        click.echo(f"SCP {direction}: {source} -> {destination}")
+        emit_info(ctx, f"SCP {direction}: {source} -> {destination}")
         if bridge:
-            click.echo(f"Bridge: {bridge}")
+            emit_info(ctx, f"Bridge: {bridge}")
         if recursive:
-            click.echo("Mode: recursive")
+            emit_info(ctx, "Mode: recursive")
 
     try:
         result = run_scp_transfer(
@@ -129,20 +134,17 @@ def bridge_scp(
                 EXIT_GENERAL_ERROR,
             )
 
-        if ctx.json_output:
-            click.echo(
-                json_formatter.format_json(
-                    {
-                        "status": "success",
-                        "direction": direction,
-                        "source": source,
-                        "destination": destination,
-                        "recursive": recursive,
-                    }
-                )
-            )
-        else:
-            click.echo("OK")
+        emit_success(
+            ctx,
+            payload={
+                "status": "success",
+                "direction": direction,
+                "source": source,
+                "destination": destination,
+                "recursive": recursive,
+            },
+            text=f"SCP {direction} completed",
+        )
 
     except BridgeNotFoundError as e:
         _handle_error(ctx, "BridgeNotFound", str(e), EXIT_GENERAL_ERROR)

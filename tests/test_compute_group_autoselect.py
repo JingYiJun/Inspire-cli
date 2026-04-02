@@ -62,6 +62,52 @@ def test_fetch_resource_availability_known_only_uses_resolved_config(monkeypatch
     assert availability[0].free_gpus == 8
 
 
+def test_fetch_resource_availability_supports_workspace_id_aware_fetcher(monkeypatch) -> None:
+    cfg = Config(
+        username="user",
+        password="pass",
+        base_url="https://example.com",
+        compute_groups=[
+            {"id": "lcg-known", "name": "H200-known", "gpu_type": "H200"},
+        ],
+    )
+
+    monkeypatch.setattr(
+        resources_mod.Config,
+        "from_files_and_env",
+        lambda *args, **kwargs: (cfg, {}),
+    )
+    monkeypatch.setattr(
+        resources_mod,
+        "get_web_session",
+        lambda require_workspace=True: SimpleNamespace(workspace_id="ws-test"),
+    )
+
+    called_with_workspace_ids: list[str] = []
+
+    def fake_nodes(session, base_url=None, workspace_id=None):
+        called_with_workspace_ids.append(workspace_id)
+        return [
+            {
+                "gpu_count": 8,
+                "logic_compute_group_id": "lcg-known",
+                "logic_compute_group_name": "H200-known",
+                "gpu_info": {"gpu_type_display": "NVIDIA H200 (141GB)"},
+                "resource_pool": "online",
+                "status": "READY",
+                "task_list": [],
+            }
+        ]
+
+    monkeypatch.setattr(resources_mod, "fetch_workspace_availability", fake_nodes)
+
+    resources_mod.clear_availability_cache()
+    availability = resources_mod.fetch_resource_availability(known_only=True)
+
+    assert [group.group_id for group in availability] == ["lcg-known"]
+    assert called_with_workspace_ids == ["ws-test"]
+
+
 def test_find_best_compute_group_uses_node_availability_without_explicit_config(
     monkeypatch,
 ) -> None:

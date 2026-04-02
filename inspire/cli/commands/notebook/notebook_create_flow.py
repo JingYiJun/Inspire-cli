@@ -22,6 +22,7 @@ from inspire.cli.utils.notebook_post_start import (
 from inspire.config import Config, ConfigError
 from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import browser_api as browser_api_module
+from inspire.platform.web import session as web_session_module
 from inspire.platform.web.browser_api import NotebookFailedError
 from inspire.platform.web.session import WebSession
 
@@ -110,6 +111,8 @@ def resolve_notebook_workspace_id(
             cpu_only=(gpu_count == 0),
             explicit_workspace_id=workspace_id,
             explicit_workspace_name=workspace,
+            legacy_workspace_id=getattr(config, "notebook_workspace_id", None)
+            or getattr(config, "default_workspace_id", None),
         )
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -123,9 +126,11 @@ def resolve_notebook_workspace_id(
 
     if not auto_workspace_id:
         hint = (
-            "Use --workspace-id, set [workspaces].cpu in config.toml, or set INSPIRE_WORKSPACE_ID."
+            "Use --workspace-id, pass --workspace cpu, or set "
+            '[accounts."<username>".workspaces].cpu in config.toml.'
             if gpu_count == 0
-            else "Use --workspace-id, set [workspaces].gpu in config.toml, or set INSPIRE_WORKSPACE_ID."
+            else "Use --workspace-id, pass --workspace gpu, or set "
+            '[accounts."<username>".workspaces].gpu in config.toml.'
         )
         _handle_error(
             ctx, "ConfigError", "No workspace_id configured.", EXIT_CONFIG_ERROR, hint=hint
@@ -138,7 +143,7 @@ def resolve_notebook_workspace_id(
 def _auto_select_compute_group(
     ctx: Context,
     *,
-    workspace_id: str,
+    workspace_id: Optional[str] = None,
     gpu_count: int,
     gpu_pattern: str,
     auto: bool,
@@ -150,11 +155,11 @@ def _auto_select_compute_group(
     filter_gpu_type = None if gpu_pattern == "GPU" else gpu_pattern
     try:
         best = browser_api_module.find_best_compute_group_accurate(
+            workspace_id=workspace_id,
             gpu_type=filter_gpu_type,
             min_gpus=gpu_count,
             include_preemptible=True,
             prefer_full_nodes=True,
-            workspace_id=workspace_id,
         )
     except Exception as e:
         if not json_output:
@@ -212,7 +217,88 @@ def _match_compute_group_by_gpu_type(
             gpu_type_display = gpu_info.get("gpu_type_display", "")
             if match_gpu_type(gpu_pattern, gpu_type_display):
                 return group, gpu_info.get("gpu_type", "")
+    for group in compute_groups:
+        if not group.get("gpu_type_stats"):
+            for field in ("name", "compute_group_name"):
+                group_name = group.get(field, "")
+                if group_name and match_gpu_type(gpu_pattern, group_name):
+                    return group, ""
     return None, ""
+
+
+def _match_compute_group_by_name_or_id(
+    *,
+    compute_groups: list[dict],
+    name_or_id: str,
+) -> dict | None:
+    name_lower = name_or_id.lower()
+    for group in compute_groups:
+        if group.get("logic_compute_group_id") == name_or_id:
+            return group
+    for group in compute_groups:
+        for field in ("name", "compute_group_name"):
+            group_name = group.get(field, "")
+            if group_name and name_lower in group_name.lower():
+                return group
+    return None
+
+
+def _group_is_bound_to_workspace(group: dict, workspace_id: str) -> bool:
+    workspace_ids = group.get("workspace_ids", [])
+    if isinstance(workspace_ids, str):
+        workspace_ids = [workspace_ids] if workspace_ids else []
+    elif not isinstance(workspace_ids, list):
+        workspace_ids = []
+    return workspace_id in workspace_ids
+
+
+def _filter_workspace_bound_groups(*, compute_groups: list[dict], workspace_id: str) -> list[dict]:
+    return [group for group in compute_groups if _group_is_bound_to_workspace(group, workspace_id)]
+
+
+def _resolve_group_gpu_type(
+    *,
+    group: dict,
+    workspace_id: str,
+    session: WebSession,
+    gpu_count: int,
+    gpu_pattern: str,
+) -> str:
+    def _matches_pattern(candidate: str) -> bool:
+        return bool(candidate) and (gpu_pattern == "GPU" or match_gpu_type(gpu_pattern, candidate))
+
+    gpu_type_stats = group.get("gpu_type_stats", [])
+    for gpu_stats in gpu_type_stats:
+        gpu_info = gpu_stats.get("gpu_info", {})
+        gpu_type = gpu_info.get("gpu_type", "") or ""
+        gpu_type_display = gpu_info.get("gpu_type_display", "") or ""
+        if _matches_pattern(gpu_type):
+            return gpu_type
+        if _matches_pattern(gpu_type_display):
+            return gpu_type or gpu_type_display
+
+    logic_compute_group_id = group.get("logic_compute_group_id", "")
+    if not logic_compute_group_id:
+        return ""
+
+    try:
+        resource_prices = browser_api_module.get_resource_prices(
+            workspace_id=workspace_id,
+            logic_compute_group_id=logic_compute_group_id,
+            session=session,
+        )
+    except Exception:
+        return ""
+
+    for price_entry in resource_prices:
+        if price_entry.get("gpu_count", 0) != gpu_count:
+            continue
+        gpu_info = price_entry.get("gpu_info", {})
+        gpu_type = gpu_info.get("gpu_type", "") or ""
+        if _matches_pattern(gpu_type):
+            return gpu_type
+
+    return ""
 
 
 def _match_cpu_only_compute_group(
@@ -220,54 +306,106 @@ def _match_cpu_only_compute_group(
     *,
     workspace_id: str = "",
     session: Optional[WebSession] = None,
+    requested_cpu_count: Optional[int] = None,
 ) -> tuple[dict | None, str]:
-    """Select the best CPU-only compute group.
+    candidates = (
+        _filter_workspace_bound_groups(compute_groups=compute_groups, workspace_id=workspace_id)
+        if workspace_id
+        else list(compute_groups)
+    )
 
-    Two-pass selection:
-    1. Prefer groups with "CPU" in name that have actual resource specs.
-    2. Fall back to any non-GPU group with resource specs.
-    3. Last resort: first non-GPU group (even if empty).
-    """
-    candidates: list[dict] = []
-    for group in compute_groups:
-        if group.get("gpu_type_stats"):
-            continue
-        candidates.append(group)
-
-    if not candidates:
+    if not candidates or not workspace_id or session is None:
         return None, ""
 
-    # Probe resource prices to find groups that actually have CPU resources.
-    if workspace_id and session:
-        groups_with_resources: list[dict] = []
-        for group in candidates:
-            gid = group.get("logic_compute_group_id", "")
-            if not gid:
-                continue
-            try:
-                prices = browser_api_module.get_resource_prices(
-                    workspace_id=workspace_id,
-                    logic_compute_group_id=gid,
-                    session=session,
-                )
-                cpu_prices = [p for p in prices if p.get("gpu_count", 0) == 0]
-                if cpu_prices:
-                    groups_with_resources.append(group)
-            except Exception:
-                continue
+    def _cpu_name_score(group: dict) -> int:
+        for field in ("name", "compute_group_name"):
+            value = (group.get(field) or "").strip().upper()
+            if value.startswith("CPU"):
+                return 1
+        return 0
 
-        if groups_with_resources:
-            # Prefer CPU-named groups among those with resources.
-            for group in groups_with_resources:
-                if "CPU" in (group.get("name") or "").upper():
-                    return group, ""
-            return groups_with_resources[0], ""
+    def _is_free_cpu_node(node: dict) -> bool:
+        return (
+            not (node.get("task_list") or [])
+            and not str(node.get("cordon_type") or "").strip()
+            and not node.get("is_maint", False)
+            and str(node.get("resource_pool") or "").lower() != "fault"
+        )
 
-    # No session or all probes failed — fall back to name-based heuristic.
+    live_counts: dict[str, dict[str, int]] = {}
+    try:
+        nodes = web_session_module.fetch_workspace_availability(
+            session,
+            base_url=getattr(session, "base_url", "") or "https://api.example.com",
+            workspace_id=workspace_id,
+        )
+        for node in nodes:
+            if int(node.get("gpu_count", 0) or 0) != 0:
+                continue
+            group_id = str(node.get("logic_compute_group_id") or "").strip()
+            if not group_id:
+                continue
+            counts = live_counts.setdefault(
+                group_id,
+                {"ready_nodes": 0, "free_nodes": 0, "total_nodes": 0},
+            )
+            counts["total_nodes"] += 1
+            if str(node.get("status") or "").upper() == "READY":
+                counts["ready_nodes"] += 1
+                if _is_free_cpu_node(node):
+                    counts["free_nodes"] += 1
+    except Exception:
+        live_counts = {}
+
+    groups_with_resources: list[dict] = []
     for group in candidates:
-        if "CPU" in (group.get("name") or "").upper():
-            return group, ""
-    return candidates[0], ""
+        gid = group.get("logic_compute_group_id", "")
+        if not gid:
+            continue
+        try:
+            prices = browser_api_module.get_resource_prices(
+                workspace_id=workspace_id,
+                logic_compute_group_id=gid,
+                session=session,
+            )
+        except Exception:
+            continue
+
+        cpu_prices = [p for p in prices if p.get("gpu_count", 0) == 0]
+        if cpu_prices:
+            groups_with_resources.append(
+                {
+                    "group": group,
+                    "requested_match": requested_cpu_count is None
+                    or any(
+                        int(price.get("cpu_count", 0) or 0) == requested_cpu_count
+                        for price in cpu_prices
+                    ),
+                    "free_nodes": live_counts.get(gid, {}).get("free_nodes", 0),
+                    "ready_nodes": live_counts.get(gid, {}).get("ready_nodes", 0),
+                    "total_nodes": live_counts.get(gid, {}).get("total_nodes", 0),
+                    "cpu_name_score": _cpu_name_score(group),
+                }
+            )
+
+    if requested_cpu_count is not None:
+        groups_with_resources = [
+            entry for entry in groups_with_resources if entry["requested_match"]
+        ]
+
+    if not groups_with_resources:
+        return None, ""
+
+    groups_with_resources.sort(
+        key=lambda entry: (
+            entry["free_nodes"],
+            entry["ready_nodes"],
+            entry["total_nodes"],
+            entry["cpu_name_score"],
+        ),
+        reverse=True,
+    )
+    return groups_with_resources[0]["group"], ""
 
 
 def _build_compute_group_hint(*, compute_groups: list[dict], gpu_count: int) -> str | None:
@@ -295,18 +433,31 @@ def resolve_notebook_compute_group(
     requested_cpu_count: Optional[int],
     auto: bool,
     json_output: bool,
-) -> tuple[str, str, str, str] | None:
-    auto_selected = _auto_select_compute_group(
-        ctx,
-        workspace_id=workspace_id,
-        gpu_count=gpu_count,
-        gpu_pattern=gpu_pattern,
-        auto=auto,
-        json_output=json_output,
-    )
-    if auto_selected is None:
+    compute_group_name: Optional[str] = None,
+) -> tuple[str, str, str, str, str] | None:
+    auto_selected_group, auto_selected_gpu_type = None, ""
+    if compute_group_name and gpu_count > 0 and gpu_pattern == "GPU":
+        _handle_error(
+            ctx,
+            "ValidationError",
+            "Explicit --compute-group requires a typed GPU resource",
+            EXIT_CONFIG_ERROR,
+            hint="Use a typed GPU resource such as '1xH200' or '1x4090' with --compute-group.",
+        )
         return None
-    auto_selected_group, auto_selected_gpu_type, gpu_pattern = auto_selected
+
+    if not compute_group_name:
+        auto_selected = _auto_select_compute_group(
+            ctx,
+            workspace_id=workspace_id,
+            gpu_count=gpu_count,
+            gpu_pattern=gpu_pattern,
+            auto=auto,
+            json_output=json_output,
+        )
+        if auto_selected is None:
+            return None
+        auto_selected_group, auto_selected_gpu_type, gpu_pattern = auto_selected
 
     resource_display = format_resource_display(gpu_count, gpu_pattern, requested_cpu_count)
 
@@ -324,7 +475,110 @@ def resolve_notebook_compute_group(
 
     selected_group = None
     selected_gpu_type = ""
-    if auto_selected_group:
+    if compute_group_name:
+        selected_group = _match_compute_group_by_name_or_id(
+            compute_groups=compute_groups,
+            name_or_id=compute_group_name,
+        )
+        if not selected_group:
+            hint = "Available groups:\n" + "\n".join(
+                f"  - {g.get('name', g.get('compute_group_name', '?'))}" for g in compute_groups
+            )
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"Compute group '{compute_group_name}' not found",
+                EXIT_CONFIG_ERROR,
+                hint=hint,
+            )
+            return None
+        if not selected_group.get("workspace_ids"):
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"Compute group '{compute_group_name}' is missing workspace binding metadata",
+                EXIT_CONFIG_ERROR,
+                hint=(
+                    "Run discovery again to populate compute-group workspace_ids, "
+                    "or configure this group's workspace_ids explicitly."
+                ),
+            )
+            return None
+        if not _group_is_bound_to_workspace(selected_group, workspace_id):
+            bound_ids = ", ".join(selected_group.get("workspace_ids") or [])
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"Compute group '{compute_group_name}' is not bound to workspace '{workspace_id}'",
+                EXIT_CONFIG_ERROR,
+                hint=(
+                    f"Choose a compute group bound to {workspace_id}. "
+                    f"Current bindings: {bound_ids or '(none)'}"
+                ),
+            )
+            return None
+        if gpu_count == 0:
+            logic_compute_group_id = selected_group.get("logic_compute_group_id", "")
+            try:
+                resource_prices = browser_api_module.get_resource_prices(
+                    workspace_id=workspace_id,
+                    logic_compute_group_id=logic_compute_group_id,
+                    session=session,
+                )
+            except Exception as e:
+                _handle_error(
+                    ctx,
+                    "APIError",
+                    f"Failed to probe CPU notebook specs for compute group '{compute_group_name}': {e}",
+                    EXIT_API_ERROR,
+                )
+                return None
+
+            cpu_prices = [p for p in resource_prices if p.get("gpu_count", 0) == 0]
+            if requested_cpu_count is not None:
+                cpu_prices = [
+                    p for p in cpu_prices if int(p.get("cpu_count", 0) or 0) == requested_cpu_count
+                ]
+            if not cpu_prices:
+                requested_label = (
+                    f"{requested_cpu_count}xCPU" if requested_cpu_count is not None else "CPU"
+                )
+                _handle_error(
+                    ctx,
+                    "ValidationError",
+                    (
+                        f"Compute group '{compute_group_name}' does not expose notebook CPU specs "
+                        f"for '{requested_label}'"
+                    ),
+                    EXIT_CONFIG_ERROR,
+                    hint=(
+                        "Run 'inspire resources list --all' and choose a CPU group with "
+                        "Specs=yes. Groups shown as Specs=no cannot be used for CPU notebook creation."
+                    ),
+                )
+                return None
+        if gpu_count > 0:
+            selected_gpu_type = _resolve_group_gpu_type(
+                group=selected_group,
+                workspace_id=workspace_id,
+                session=session,
+                gpu_count=gpu_count,
+                gpu_pattern=gpu_pattern,
+            )
+            if not selected_gpu_type:
+                _handle_error(
+                    ctx,
+                    "ValidationError",
+                    (
+                        f"Compute group '{compute_group_name}' does not match requested "
+                        f"GPU resource '{resource_display}'"
+                    ),
+                    EXIT_CONFIG_ERROR,
+                    hint="Use a typed GPU resource that matches the selected compute group, or choose a compute group with explicit matching GPU metadata.",
+                )
+                return None
+
+    if not selected_group and auto_selected_group:
         selected_group, selected_gpu_type = _match_compute_group_by_id(
             compute_groups=compute_groups,
             group_id=auto_selected_group.group_id,
@@ -336,9 +590,12 @@ def resolve_notebook_compute_group(
                 gpu_pattern=auto_selected_group.gpu_type,
             )
 
-    if not selected_group:
+    if not selected_group and gpu_count > 0:
         selected_group, selected_gpu_type = _match_compute_group_by_gpu_type(
-            compute_groups=compute_groups,
+            compute_groups=_filter_workspace_bound_groups(
+                compute_groups=compute_groups,
+                workspace_id=workspace_id,
+            ),
             gpu_pattern=gpu_pattern,
         )
     if not selected_group and gpu_count == 0:
@@ -357,7 +614,10 @@ def resolve_notebook_compute_group(
         except Exception:
             pass
         selected_group, selected_gpu_type = _match_cpu_only_compute_group(
-            compute_groups, workspace_id=workspace_id, session=session
+            compute_groups,
+            workspace_id=workspace_id,
+            session=session,
+            requested_cpu_count=requested_cpu_count,
         )
 
     if not selected_group:
@@ -381,7 +641,18 @@ def resolve_notebook_compute_group(
         )
         return None
 
-    return logic_compute_group_id, selected_gpu_type, gpu_pattern, resource_display
+    selected_group_name = (
+        selected_group.get("name")
+        or selected_group.get("compute_group_name")
+        or logic_compute_group_id
+    )
+    return (
+        logic_compute_group_id,
+        selected_gpu_type,
+        gpu_pattern,
+        resource_display,
+        str(selected_group_name),
+    )
 
 
 def resolve_notebook_quota(
@@ -401,6 +672,21 @@ def resolve_notebook_quota(
     cpu_quotas: list[dict] = []
     if gpu_count == 0:
         cpu_quotas = [q for q in quota_list if q.get("gpu_count", 0) == 0]
+        if not cpu_quotas:
+            requested_label = (
+                f"{requested_cpu_count}xCPU" if requested_cpu_count is not None else "CPU"
+            )
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"No CPU quota data returned for {requested_label}",
+                EXIT_CONFIG_ERROR,
+                hint=(
+                    "The notebook schedule API did not return any CPU quota rows. "
+                    "Run 'inspire resources list --all' and choose a CPU group with Specs=yes."
+                ),
+            )
+            return None
         if requested_cpu_count is None:
             for quota in cpu_quotas:
                 quota_cpu = quota.get("cpu_count")
@@ -427,14 +713,6 @@ def resolve_notebook_quota(
                 break
 
     if not selected_quota:
-        # When the schedule API is unavailable, quota_list will be empty.
-        # Use reasonable defaults so notebook creation can proceed.
-        if not quota_list:
-            cpu_count = requested_cpu_count or (20 if gpu_count > 0 else 4)
-            memory_size = 200 if gpu_count > 0 else 32
-            resource_display = format_resource_display(gpu_count, gpu_pattern, cpu_count)
-            return "", cpu_count, memory_size, selected_gpu_type, resource_display
-
         if gpu_count == 0:
             requested_label = (
                 f"{requested_cpu_count}xCPU" if requested_cpu_count is not None else "CPU"
@@ -617,6 +895,7 @@ def resolve_notebook_image(
 
 
 def resolve_notebook_resource_spec_price(
+    ctx: Context,
     *,
     resource_prices: list[dict],
     gpu_count: int,
@@ -639,6 +918,7 @@ def resolve_notebook_resource_spec_price(
             "quota_id": quota_id,
         }
 
+        matched = False
         for price_entry in resource_prices:
             if price_entry.get("gpu_count", 0) != 0:
                 continue
@@ -651,6 +931,7 @@ def resolve_notebook_resource_spec_price(
             if requested_cpu_count is not None and entry_cpu_count != requested_cpu_count:
                 continue
 
+            matched = True
             entry_cpu_info = price_entry.get("cpu_info", {})
             cpu_type = entry_cpu_info.get("cpu_type", "")
             if cpu_type:
@@ -659,6 +940,22 @@ def resolve_notebook_resource_spec_price(
                 quota_id = entry_quota_id
                 cpu_spec["quota_id"] = entry_quota_id
             break
+
+        if not matched:
+            requested_label = (
+                f"{requested_cpu_count}xCPU" if requested_cpu_count is not None else "CPU"
+            )
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"No notebook CPU resource spec found for {requested_label}",
+                EXIT_CONFIG_ERROR,
+                hint=(
+                    "The selected compute group did not return a matching CPU notebook spec. "
+                    "Run 'inspire resources list --all' and choose a CPU group with Specs=yes."
+                ),
+            )
+            return None
 
         return cpu_spec, quota_id, cpu_count, memory_size
 
@@ -716,6 +1013,7 @@ def create_notebook_and_report(
     selected_project,
     selected_image,
     logic_compute_group_id: str,
+    compute_group_name: str,
     quota_id: str,
     selected_gpu_type: str,
     gpu_count: int,
@@ -761,6 +1059,8 @@ def create_notebook_and_report(
                         "resource": resource_display,
                         "project": selected_project.name,
                         "image": selected_image.name,
+                        "logic_compute_group_id": logic_compute_group_id,
+                        "compute_group_name": compute_group_name,
                     }
                 )
             )
@@ -878,13 +1178,17 @@ def _resolve_create_inputs(
     shm_size: int | None,
 ) -> tuple[str, str | None, str | None, int]:
     if not resource:
-        resource = config.notebook_resource
-    if not project and not config.project_order:
-        project = config.job_project_id
+        resource = config.notebook_resource or getattr(config, "default_resource", None) or "1xH200"
+    if not project:
+        project = getattr(config, "notebook_project_id", None)
     if not image:
-        image = config.notebook_image or config.job_image
+        image = config.notebook_image or getattr(config, "default_image", None)
     if shm_size is None:
-        shm_size = config.shm_size if config.shm_size is not None else 32
+        notebook_shm_size = getattr(config, "notebook_shm_size", None)
+        if notebook_shm_size is not None:
+            shm_size = notebook_shm_size
+        else:
+            shm_size = config.shm_size if config.shm_size is not None else 32
     if shm_size < 1:
         raise ValueError("Shared memory size must be >= 1.")
     return resource, project, image, shm_size
@@ -928,7 +1232,13 @@ def _fetch_resource_prices(
 def _resolve_task_priority(priority: Optional[int], config: Config) -> Optional[int]:
     if priority is not None:
         return priority
-    return config.job_priority if hasattr(config, "job_priority") else None
+    notebook_priority = getattr(config, "notebook_priority", None)
+    if notebook_priority is not None:
+        return notebook_priority
+    default_priority = getattr(config, "default_priority", None)
+    if default_priority is not None:
+        return default_priority
+    return 6
 
 
 def _fetch_workspace_projects(
@@ -989,15 +1299,27 @@ def _fetch_notebook_images(
         _handle_error(ctx, "APIError", f"Failed to fetch images: {e}", EXIT_API_ERROR)
         return None
 
-    if image and not _find_image_match(images, image):
+    if not image or (image and not _find_image_match(images, image)):
         try:
             public_images = browser_api_module.list_images(
                 workspace_id=workspace_id, source="SOURCE_PUBLIC", session=session
             )
             if public_images:
-                if not json_output:
+                if image and not json_output:
                     click.echo("Searching public images...")
                 images = images + public_images
+        except Exception:
+            pass
+
+    if not image or (image and not _find_image_match(images, image)):
+        try:
+            personal_images = browser_api_module.list_images_by_source(
+                source="personal-visible", workspace_id=workspace_id, session=session
+            )
+            if personal_images:
+                if image and not json_output:
+                    click.echo("Searching personal images...")
+                images = images + personal_images
         except Exception:
             pass
 
@@ -1036,6 +1358,7 @@ def run_notebook_create(
     priority: Optional[int] = None,
     project_explicit: bool = False,
     keepalive: bool | None = None,
+    compute_group_name: Optional[str] = None,
 ) -> None:
     del project_explicit  # Reserved for future behavior; currently inferred from value presence.
     json_output = resolve_json_output(ctx, json_output)
@@ -1102,11 +1425,18 @@ def run_notebook_create(
         requested_cpu_count=requested_cpu_count,
         auto=auto,
         json_output=json_output,
+        compute_group_name=compute_group_name,
     )
     if not compute_group:
         return
 
-    logic_compute_group_id, selected_gpu_type, gpu_pattern, resource_display = compute_group
+    (
+        logic_compute_group_id,
+        selected_gpu_type,
+        gpu_pattern,
+        resource_display,
+        selected_group_name,
+    ) = compute_group
 
     schedule = _fetch_notebook_schedule(ctx, workspace_id=workspace_id, session=session)
     if schedule is None:
@@ -1130,7 +1460,8 @@ def run_notebook_create(
         session=session,
         json_output=json_output,
     )
-    resource_spec_price, quota_id, cpu_count, memory_size = resolve_notebook_resource_spec_price(
+    resource_spec = resolve_notebook_resource_spec_price(
+        ctx,
         resource_prices=resource_prices,
         gpu_count=gpu_count,
         selected_gpu_type=selected_gpu_type,
@@ -1141,6 +1472,9 @@ def run_notebook_create(
         memory_size=memory_size,
         requested_cpu_count=requested_cpu_count,
     )
+    if not resource_spec:
+        return
+    resource_spec_price, quota_id, cpu_count, memory_size = resource_spec
 
     task_priority = _resolve_task_priority(priority, config)
     projects = _fetch_workspace_projects(ctx, workspace_id=workspace_id, session=session)
@@ -1198,6 +1532,7 @@ def run_notebook_create(
         selected_project=selected_project,
         selected_image=selected_image,
         logic_compute_group_id=logic_compute_group_id,
+        compute_group_name=selected_group_name,
         quota_id=quota_id,
         selected_gpu_type=selected_gpu_type,
         gpu_count=gpu_count,

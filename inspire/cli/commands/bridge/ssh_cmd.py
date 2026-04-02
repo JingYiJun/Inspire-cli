@@ -16,7 +16,9 @@ from inspire.bridge.tunnel import (
     load_tunnel_config,
 )
 from inspire.cli.context import Context, EXIT_CONFIG_ERROR, EXIT_GENERAL_ERROR, pass_context
+from inspire.cli.utils.common import json_option
 from inspire.cli.utils.errors import exit_with_error as _handle_error
+from inspire.cli.utils.notebook_cli import resolve_json_output
 from inspire.cli.utils.notebook_cli import require_web_session
 from inspire.cli.utils.tunnel_reconnect import (
     load_ssh_public_key_material,
@@ -26,21 +28,25 @@ from inspire.cli.utils.tunnel_reconnect import (
 )
 from inspire.config import Config, ConfigError, build_env_exports
 from inspire.config.ssh_runtime import resolve_ssh_runtime_config
+from inspire.platform.web import browser_api as browser_api_module
 
 logger = logging.getLogger(__name__)
+_RUNNING_NOTEBOOK_STATUS = "RUNNING"
 
 
 @click.command("ssh")
 @click.option("--bridge", "-b", help="Bridge profile to connect")
+@json_option
 @pass_context
-def bridge_ssh(ctx: Context, bridge: Optional[str]) -> None:
+def bridge_ssh(ctx: Context, bridge: Optional[str], json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Open an interactive SSH shell to Bridge.
 
     Requires a configured bridge profile with a reachable SSH tunnel.
 
     \b
     Example:
-        inspire notebook ssh <notebook-id> --alias mybridge
+        inspire notebook ssh <notebook-id> --save-as mybridge
         inspire bridge ssh --bridge mybridge
     """
     try:
@@ -62,14 +68,17 @@ def bridge_ssh(ctx: Context, bridge: Optional[str]) -> None:
             ctx,
             "TunnelError",
             "No bridge configured.",
-            hint="Run 'inspire notebook ssh <notebook-id> --alias <name>' first.",
+            hint="Run 'inspire notebook ssh <notebook-id> --save-as <name>' first.",
         )
 
     bridge_name = selected_bridge.name
     logger.debug("bridge_ssh start bridge=%s", bridge_name)
 
     # Build interactive SSH command with env exports and cd to target dir
-    env_exports = build_env_exports(config.remote_env)
+    try:
+        env_exports = build_env_exports(config.remote_env)
+    except ConfigError as e:
+        _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
     remote_command = f'{env_exports}cd "{config.target_dir}" && exec $SHELL -l'
     reconnect_limit = max(0, int(getattr(config, "tunnel_retries", 0)))
     reconnect_pause = float(getattr(config, "tunnel_retry_pause", 0.0) or 0.0)
@@ -106,7 +115,7 @@ def bridge_ssh(ctx: Context, bridge: Optional[str]) -> None:
                     "SSH tunnel not available",
                     hint=(
                         "Auto-rebuild retries exhausted. Run 'inspire tunnel status' and "
-                        "retry 'inspire notebook ssh <notebook-id> --alias <name>'."
+                        "retry 'inspire notebook ssh <notebook-id> --save-as <name>'."
                     ),
                 )
 
@@ -119,8 +128,46 @@ def bridge_ssh(ctx: Context, bridge: Optional[str]) -> None:
                     hint=(
                         "This bridge has no notebook_id metadata, so it cannot be rebuilt "
                         "automatically. Re-create it via "
-                        "'inspire notebook ssh <notebook-id> --alias <name>'."
+                        "'inspire notebook ssh <notebook-id> --save-as <name>'."
                     ),
+                )
+
+            try:
+                if web_session is None:
+                    web_session = require_web_session(
+                        ctx,
+                        hint=(
+                            "Automatic tunnel rebuild needs web authentication. "
+                            "Set [auth].username and configure password via INSPIRE_PASSWORD "
+                            'or [accounts."<username>"].password.'
+                        ),
+                    )
+                notebook_detail = browser_api_module.get_notebook_detail(
+                    notebook_id=notebook_id,
+                    session=web_session,
+                )
+                notebook_status = str((notebook_detail or {}).get("status") or "").strip().upper()
+                if notebook_status != _RUNNING_NOTEBOOK_STATUS:
+                    rendered_status = notebook_status or "UNKNOWN"
+                    _handle_error(
+                        ctx,
+                        "TunnelError",
+                        (
+                            "SSH tunnel not available. "
+                            f"Bridge '{bridge_name}' notebook '{notebook_id}' "
+                            f"is {rendered_status}."
+                        ),
+                        hint=(
+                            "Wait until it reports RUNNING via "
+                            f"'inspire notebook status {notebook_id}', then retry."
+                        ),
+                    )
+            except Exception as status_error:  # noqa: BLE001
+                logger.debug(
+                    "Skipping notebook status preflight bridge=%s notebook_id=%s error=%s",
+                    bridge_name,
+                    notebook_id,
+                    status_error,
                 )
 
             reconnect_attempt += 1

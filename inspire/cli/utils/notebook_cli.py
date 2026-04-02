@@ -19,7 +19,7 @@ def get_base_url() -> str:
         config, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
         return config.base_url
     except Exception:
-        return os.environ.get("INSPIRE_BASE_URL", "https://api.example.com")
+        return os.environ.get("INSPIRE_BASE_URL", "https://api.example.com").strip()
 
 
 def resolve_json_output(ctx: Context, json_output: bool) -> bool:

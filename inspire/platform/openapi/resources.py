@@ -1,60 +1,24 @@
-"""Resource parsing, matching, and display for the Inspire OpenAPI client."""
+"""Resource parsing, matching, and display for the Inspire OpenAPI client.
+
+Specs are workspace-scoped. ResourceManager lazy-loads specs from config cache
+or browser API, and caches them in memory for the current CLI invocation.
+"""
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional
 
-from inspire.platform.openapi.models import ComputeGroup, GPUType, ResourceSpec
 from inspire.compute_groups import load_compute_groups_from_config
+from inspire.platform.openapi.models import ComputeGroup, GPUType, ResourceSpec
+from inspire.platform.openapi.workspace_specs import (
+    fetch_workspace_specs,
+    load_specs_from_config,
+    save_specs_to_config,
+)
 
-# ---------------------------------------------------------------------------
-# Specs
-# ---------------------------------------------------------------------------
-
-
-def build_default_resource_specs() -> list[ResourceSpec]:
-    # These spec_ids are quota_ids shared across all compute groups (H100/H200).
-    # Fetched from: POST /api/v1/resource_prices/logic_compute_groups/
-    #   with schedule_config_type=SCHEDULE_CONFIG_TYPE_TRAIN
-    return [
-        ResourceSpec(
-            gpu_type=GPUType.H200,
-            gpu_count=1,
-            cpu_cores=15,
-            memory_gb=200,
-            gpu_memory_gb=141,
-            spec_id="4dd0e854-e2a4-4253-95e6-64c13f0b5117",
-            description="1 × NVIDIA H200 (141GB) + 15 CPU cores + 200GB RAM",
-        ),
-        ResourceSpec(
-            gpu_type=GPUType.H200,
-            gpu_count=2,
-            cpu_cores=30,
-            memory_gb=400,
-            gpu_memory_gb=141,
-            spec_id="7166bd2e-6cbe-4bd9-be38-762d11003e7f",
-            description="2 × NVIDIA H200 (141GB) + 30 CPU cores + 400GB RAM",
-        ),
-        ResourceSpec(
-            gpu_type=GPUType.H200,
-            gpu_count=4,
-            cpu_cores=60,
-            memory_gb=800,
-            gpu_memory_gb=141,
-            spec_id="45ab2351-fc8a-4d50-a30b-b39a5306c906",
-            description="4 × NVIDIA H200 (141GB) + 60 CPU cores + 800GB RAM",
-        ),
-        ResourceSpec(
-            gpu_type=GPUType.H200,
-            gpu_count=8,
-            cpu_cores=120,
-            memory_gb=1600,
-            gpu_memory_gb=141,
-            spec_id="f23c8d53-395f-473c-81e0-dbd132711861",
-            description="8 × NVIDIA H200 (141GB) + 120 CPU cores + 1600GB RAM",
-        ),
-    ]
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -241,25 +205,25 @@ def display_available_resources(
     compute_groups: list[ComputeGroup],
 ) -> None:
     """Print all available resource configurations."""
-    print("\n📊 Available Resource Configurations:")
-    print("=" * 60)
+    logger.info("\n📊 Available Resource Configurations:")
+    logger.info("=" * 60)
 
-    print("\n🖥️  GPU Spec Configurations:")
+    logger.info("\n🖥️  GPU Spec Configurations:")
     for spec in resource_specs:
-        print(f"  • {spec.description}")
-        print(f"    Spec ID: {spec.spec_id}")
+        logger.info("  • %s", spec.description)
+        logger.info("    Spec ID: %s", spec.spec_id)
 
-    print("\n🏢 Compute Groups:")
+    logger.info("\n🏢 Compute Groups:")
     for group in compute_groups:
-        print(f"  • {group.name} ({group.location})")
-        print(f"    Compute Group ID: {group.compute_group_id}")
+        logger.info("  • %s (%s)", group.name, group.location)
+        logger.info("    Compute Group ID: %s", group.compute_group_id)
 
-    print("\n💡 Usage Examples:")
-    print("  • --resource 'H200'     -> 1x H200 GPU")
-    print("  • --resource '4xH200'   -> 4x H200 GPU")
-    print("  • --resource '8 H200'   -> 8x H200 GPU")
-    print("  • --resource 'H100'     -> 1x H100 GPU")
-    print("=" * 60)
+    logger.info("\n💡 Usage Examples:")
+    logger.info("  • --resource 'H200'     -> 1x H200 GPU")
+    logger.info("  • --resource '4xH200'   -> 4x H200 GPU")
+    logger.info("  • --resource '8 H200'   -> 8x H200 GPU")
+    logger.info("  • --resource 'H100'     -> 1x H100 GPU")
+    logger.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +232,23 @@ def display_available_resources(
 
 
 class ResourceManager:
-    """Resource manager - handles resource spec and compute group matching."""
+    """Resource manager - handles resource spec and compute group matching.
 
-    def __init__(self, compute_groups_raw: Optional[list[dict]] = None):
-        self.resource_specs = build_default_resource_specs()
+    Specs are lazy-loaded from config cache or browser API and cached in memory.
+    """
+
+    def __init__(
+        self,
+        config,
+        compute_groups_raw: Optional[list[dict]] = None,
+        *,
+        skip_live_probe: bool = False,
+    ):
+        self.config = config
+        # In-memory cache per workspace: {workspace_id: [ResourceSpec, ...]}
+        self._specs_cache: dict[str, list[ResourceSpec]] = {}
+        self._current_workspace_id: Optional[str] = None
+        self._skip_live_probe = skip_live_probe
 
         compute_groups_tuples = load_compute_groups_from_config(compute_groups_raw or [])
         self.compute_groups = []
@@ -286,7 +263,6 @@ class ResourceManager:
             try:
                 gpu_type = GPUType(gpu_type_raw)
             except ValueError:
-                # Ignore non-OpenAPI-only groups (e.g. CPU or unsupported GPU families).
                 continue
 
             self.compute_groups.append(
@@ -297,6 +273,64 @@ class ResourceManager:
                     location=group.location,
                 )
             )
+
+    def ensure_specs_for_workspace(self, workspace_id: str) -> None:
+        """Ensure specs are loaded for workspace (from cache or API).
+
+        Args:
+            workspace_id: Target workspace ID
+
+        Raises:
+            RuntimeError: If probe fails and no cache available
+        """
+        if workspace_id in self._specs_cache:
+            self._current_workspace_id = workspace_id
+            return
+
+        if self._skip_live_probe:
+            raise RuntimeError("Live resource spec probing is disabled.")
+
+        # Try config cache first
+        specs = load_specs_from_config(self.config, workspace_id)
+
+        if specs is None:
+            # Fetch from API and save to config
+            specs = fetch_workspace_specs(workspace_id)
+            save_specs_to_config(self.config, workspace_id, specs)
+            logger.info("Discovered and cached %d specs for workspace %s", len(specs), workspace_id)
+
+        self._specs_cache[workspace_id] = specs
+        self._current_workspace_id = workspace_id
+
+    def refresh_workspace_specs(self, workspace_id: str) -> list[ResourceSpec]:
+        """Refresh specs for workspace (force re-fetch from API).
+
+        Args:
+            workspace_id: Workspace to refresh
+
+        Returns:
+            Updated list of ResourceSpec
+        """
+        if self._skip_live_probe:
+            raise RuntimeError("Live resource spec probing is disabled.")
+
+        specs = fetch_workspace_specs(workspace_id)
+        save_specs_to_config(self.config, workspace_id, specs)
+        self._specs_cache[workspace_id] = specs
+        logger.info("Refreshed %d specs for workspace %s", len(specs), workspace_id)
+        return specs
+
+    def _set_test_specs(self, workspace_id: str, specs: list[ResourceSpec]) -> None:
+        """Set test specs (testing only)."""
+        self._specs_cache[workspace_id] = specs
+        self._current_workspace_id = workspace_id
+
+    @property
+    def resource_specs(self) -> list[ResourceSpec]:
+        """Get specs for current workspace."""
+        if self._current_workspace_id is None:
+            raise RuntimeError("No workspace loaded. Call ensure_specs_for_workspace() first.")
+        return self._specs_cache.get(self._current_workspace_id, [])
 
     def parse_resource_request(self, resource_str: str) -> tuple[GPUType, int]:
         return parse_resource_request(resource_str)
@@ -338,4 +372,4 @@ class ResourceManager:
         )
 
 
-__all__ = ["ResourceManager"]
+__all__ = ["ResourceManager", "parse_resource_request", "normalize_gpu_type"]

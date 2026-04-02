@@ -6,6 +6,7 @@ import click
 
 from .resources_list import list_resources
 from .resources_nodes import list_nodes
+from .resources_specs import show_specs
 
 
 @click.group()
@@ -16,3 +17,4 @@ def resources() -> None:
 
 resources.add_command(list_resources)
 resources.add_command(list_nodes)
+resources.add_command(show_specs)

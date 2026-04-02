@@ -282,7 +282,7 @@ def list_notebook_compute_groups(
             raise
 
     if groups:
-        return groups
+        return _bind_groups_to_workspace(groups, workspace_id)
 
     # API endpoint missing or returned an empty list — fall back to local config.
     fallback = _config_compute_groups_fallback(workspace_id=workspace_id)
@@ -299,11 +299,35 @@ def list_notebook_compute_groups(
 
         data = _list_groups(workspace_id=workspace_id, session=session)
         if isinstance(data, list):
-            return data
+            return _bind_groups_to_workspace(data, workspace_id)
     except Exception:
         return []
 
     return []
+
+
+def _bind_groups_to_workspace(groups: list[dict], workspace_id: str | None) -> list[dict]:
+    """Attach the queried workspace as explicit binding metadata."""
+    if not workspace_id:
+        return groups
+
+    bound_groups: list[dict] = []
+    for item in groups:
+        if not isinstance(item, dict):
+            continue
+        bound = dict(item)
+        raw_ws = bound.get("workspace_ids", [])
+        if isinstance(raw_ws, str):
+            workspace_ids = [raw_ws] if raw_ws else []
+        elif isinstance(raw_ws, list):
+            workspace_ids = [str(ws) for ws in raw_ws if str(ws).strip()]
+        else:
+            workspace_ids = []
+        if workspace_id not in workspace_ids:
+            workspace_ids.append(workspace_id)
+        bound["workspace_ids"] = workspace_ids
+        bound_groups.append(bound)
+    return bound_groups
 
 
 def _config_compute_groups_fallback(workspace_id: str | None = None) -> list[dict]:
@@ -317,7 +341,9 @@ def _config_compute_groups_fallback(workspace_id: str | None = None) -> list[dic
     result = []
     for g in groups:
         group_ws_ids = g.get("workspace_ids") or []
-        if workspace_id and group_ws_ids and workspace_id not in group_ws_ids:
+        if workspace_id and not group_ws_ids:
+            continue
+        if workspace_id and workspace_id not in group_ws_ids:
             continue
         gpu_type = g.get("gpu_type", "")
         is_real_gpu = gpu_type and gpu_type.upper() != "CPU"
@@ -325,6 +351,7 @@ def _config_compute_groups_fallback(workspace_id: str | None = None) -> list[dic
             {
                 "logic_compute_group_id": g.get("id", ""),
                 "name": g.get("name", ""),
+                "workspace_ids": list(group_ws_ids),
                 "gpu_type_stats": (
                     [
                         {

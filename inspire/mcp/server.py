@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 from .errors import McpToolError
@@ -10,6 +13,50 @@ from .runtime import exec_remote_command
 from .sync import sync_paths
 
 TOOL_NAMES = ("exec", "read_file", "write_file", "edit_file", "sync", "list_dir", "stat")
+
+
+def _run_in_fresh_thread(func, *args, **kwargs):  # type: ignore[no-untyped-def]
+    result = {}
+    error = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = func(*args, **kwargs)
+        except BaseException as exc:  # pragma: no cover - re-raised in caller thread
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "exc" in error:
+        raise error["exc"]
+    return result.get("value")
+
+
+if not getattr(anyio, "_inspire_mcp_run_patched", False):
+    _original_anyio_run = anyio.run
+
+    def _anyio_run_compat(func, *args, backend="asyncio", backend_options=None):  # type: ignore[no-untyped-def]
+        try:
+            return _original_anyio_run(
+                func,
+                *args,
+                backend=backend,
+                backend_options=backend_options,
+            )
+        except RuntimeError as exc:
+            if "Already running" not in str(exc):
+                raise
+            return _run_in_fresh_thread(
+                _original_anyio_run,
+                func,
+                *args,
+                backend=backend,
+                backend_options=backend_options,
+            )
+
+    anyio.run = _anyio_run_compat
+    anyio._inspire_mcp_run_patched = True  # type: ignore[attr-defined]
 
 
 def build_server() -> FastMCP:

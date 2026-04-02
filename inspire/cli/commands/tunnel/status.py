@@ -6,14 +6,19 @@ import click
 
 from inspire.bridge.tunnel import get_tunnel_status
 from inspire.cli.context import Context, pass_context
-from inspire.cli.formatters import human_formatter, json_formatter
+from inspire.cli.formatters import json_formatter
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.notebook_cli import resolve_json_output
+from inspire.cli.utils.output import emit_error, emit_info, emit_success, emit_warning
 from inspire.platform.web.browser_api.rtunnel import redact_proxy_url
 
 
 @click.command("status")
 @click.option("--bridge", "-b", help="Check specific bridge (shows all if not specified)")
+@json_option
 @pass_context
-def tunnel_status(ctx: Context, bridge: str) -> None:
+def tunnel_status(ctx: Context, bridge: str, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Check tunnel configuration and SSH connectivity.
 
     \b
@@ -47,23 +52,27 @@ def tunnel_status(ctx: Context, bridge: str) -> None:
 
         if status["configured"]:
             if status["ssh_works"]:
-                click.echo(human_formatter.format_success("SSH: Connected"))
+                emit_success(
+                    ctx,
+                    payload={"bridge": bridge_name, "status": "connected"},
+                    text="SSH: Connected",
+                )
             else:
-                click.echo(human_formatter.format_warning("SSH: Not responding"))
-                click.echo("")
-                click.echo("Troubleshooting:")
-                click.echo("  1. Ensure VS Code is open on the Bridge notebook")
-                click.echo("  2. Ensure rtunnel server is running on Bridge:")
-                click.echo("     ~/.local/bin/rtunnel localhost:22222 0.0.0.0:31337")
-                click.echo("  3. Check that port 31337 is forwarded in VS Code Ports tab")
+                emit_warning(ctx, "SSH: Not responding")
+                emit_info(ctx, "")
+                emit_info(ctx, "Troubleshooting:")
+                emit_info(ctx, "  1. Ensure VS Code is open on the Bridge notebook")
+                emit_info(ctx, "  2. Ensure rtunnel server is running on Bridge:")
+                emit_info(ctx, "     ~/.local/bin/rtunnel localhost:22222 0.0.0.0:31337")
+                emit_info(ctx, "  3. Check that port 31337 is forwarded in VS Code Ports tab")
         else:
-            click.echo("Status: Not found")
-            click.echo("")
-            click.echo("To add a bridge:")
-            click.echo("  inspire tunnel add <name> <PROXY_URL>")
+            emit_error(ctx, error_type="NotFound", message="Bridge not found", exit_code=1)
+            emit_info(ctx, "")
+            emit_info(ctx, "To add a bridge:")
+            emit_info(ctx, "  inspire tunnel add <name> <PROXY_URL>")
 
         if status["error"] and status["configured"]:
-            click.echo(f"\nError: {status['error']}")
+            emit_error(ctx, error_type="TunnelError", message=status["error"], exit_code=1)
         return
 
     if not status["bridges"]:
@@ -79,12 +88,10 @@ def tunnel_status(ctx: Context, bridge: str) -> None:
     if status["default_bridge"]:
         default_status = get_tunnel_status(bridge_name=status["default_bridge"])
         if default_status["ssh_works"]:
-            click.echo(
-                f"Default bridge ({status['default_bridge']}): "
-                + human_formatter.format_success("Connected")
+            emit_success(
+                ctx,
+                payload={"bridge": status["default_bridge"], "status": "connected"},
+                text=f"Default bridge ({status['default_bridge']}): Connected",
             )
         else:
-            click.echo(
-                f"Default bridge ({status['default_bridge']}): "
-                + human_formatter.format_warning("Not responding")
-            )
+            emit_warning(ctx, f"Default bridge ({status['default_bridge']}): Not responding")

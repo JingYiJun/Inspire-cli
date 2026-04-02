@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from inspire.config.models import SOURCE_GLOBAL, SOURCE_PROJECT
@@ -17,6 +16,14 @@ from .load_common import (
     _parse_alias_map,
     _resolve_alias,
 )
+from inspire.config.schema import get_option_by_field
+from inspire.config.toml import _validate_toml_value
+
+
+def _validated_override(field_name: str, value: Any) -> Any:
+    """Validate a TOML account override value against its schema option."""
+    opt = get_option_by_field(field_name)
+    return _validate_toml_value(opt, value) if opt else value
 
 
 def _parse_global_accounts(raw_accounts: Any) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
@@ -51,7 +58,7 @@ def _parse_global_accounts(raw_accounts: Any) -> tuple[dict[str, str], dict[str,
             value = raw_value.get(field_name)
             if value is None or value == "":
                 continue
-            account_data["overrides"][field_name] = value
+            account_data["overrides"][field_name] = _validated_override(field_name, value)
 
         for section_name, key_map in _ACCOUNT_SECTION_KEY_MAP.items():
             section = raw_value.get(section_name)
@@ -61,7 +68,7 @@ def _parse_global_accounts(raw_accounts: Any) -> tuple[dict[str, str], dict[str,
                 value = section.get(key)
                 if value is None or value == "":
                     continue
-                account_data["overrides"][field_name] = value
+                account_data["overrides"][field_name] = _validated_override(field_name, value)
 
         catalogs[username] = account_data
 
@@ -142,11 +149,7 @@ def _apply_account_catalog_layer(
     global_account_catalogs: dict[str, dict[str, Any]],
     project_account_catalogs: dict[str, dict[str, Any]],
 ) -> None:
-    selected_account = (
-        context_account
-        or str(config_dict.get("username") or "").strip()
-        or str(os.getenv("INSPIRE_USERNAME") or "").strip()
-    )
+    selected_account = str(config_dict.get("username") or "").strip() or context_account
     merged_account_catalogs = _merge_account_catalogs(
         global_account_catalogs, project_account_catalogs
     )
@@ -179,12 +182,11 @@ def _apply_account_catalog_layer(
             sources[field_name] = account_catalog_source
 
     if account_workspaces:
-        merged_workspaces = dict(account_workspaces)
-        merged_workspaces.update(config_dict.get("workspaces", {}))
-        config_dict["workspaces"] = merged_workspaces
+        config_dict["workspaces"] = dict(account_workspaces)
         if sources.get("workspaces") not in {SOURCE_PROJECT, SOURCE_GLOBAL}:
             sources["workspaces"] = account_catalog_source
 
+        merged_workspaces = config_dict["workspaces"]
         if not config_dict.get("workspace_cpu_id") and merged_workspaces.get("cpu"):
             config_dict["workspace_cpu_id"] = merged_workspaces["cpu"]
             sources["workspace_cpu_id"] = account_catalog_source
@@ -194,6 +196,9 @@ def _apply_account_catalog_layer(
         if not config_dict.get("workspace_internet_id") and merged_workspaces.get("internet"):
             config_dict["workspace_internet_id"] = merged_workspaces["internet"]
             sources["workspace_internet_id"] = account_catalog_source
+        if not config_dict.get("workspace_hpc_id") and merged_workspaces.get("hpc"):
+            config_dict["workspace_hpc_id"] = merged_workspaces["hpc"]
+            sources["workspace_hpc_id"] = account_catalog_source
 
     merged_projects = dict(account_projects)
     merged_projects.update(project_projects)
@@ -255,7 +260,7 @@ def _apply_project_context_and_defaults(
         config_dict.get("projects", {}),
         id_prefix="project-",
     )
-    if project_ref:
+    if project_ref and not config_dict.get("job_project_id"):
         config_dict["job_project_id"] = project_ref
         sources["job_project_id"] = SOURCE_PROJECT
 

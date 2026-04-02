@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 from typing import Callable, Optional
 
 from inspire.platform.web.session.browser_client import _BrowserRequestClient  # noqa: F401
@@ -30,6 +31,8 @@ from inspire.platform.web.session.workspace import (
     fetch_node_specs as _fetch_node_specs,
     fetch_workspace_availability as _fetch_workspace_availability,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_WORKSPACE_ID",
@@ -139,10 +142,7 @@ def request_json(
         _close_browser_client()
         # Auto-retry once with fresh session
         if _retry_count < 1:
-            import sys
-
-            sys.stderr.write("Session expired, re-authenticating...\n")
-            sys.stderr.flush()
+            logger.warning("Session expired, re-authenticating...")
             clear_session_cache()
             new_session = get_web_session(force_refresh=True)
             _refresh_session_in_place(session, new_session)
@@ -196,15 +196,15 @@ def fetch_node_specs(
 def fetch_workspace_availability(
     session: WebSession,
     base_url: str = "https://api.example.com",
+    workspace_id: str | None = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-    workspace_id: Optional[str] = None,
 ) -> list[dict]:
     return _fetch_workspace_availability(
         session,
         request_json_fn=request_json,
         base_url=base_url,
-        progress_callback=progress_callback,
         workspace_id=workspace_id,
+        progress_callback=progress_callback,
     )
 
 

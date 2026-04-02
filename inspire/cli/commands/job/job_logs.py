@@ -44,8 +44,10 @@ from inspire.cli.context import (
 )
 from inspire.cli.formatters import json_formatter
 from inspire.cli.utils.auth import AuthManager
+from inspire.cli.utils.common import json_option
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.cli.utils.job_cli import resolve_job_id
+from inspire.cli.utils.notebook_cli import resolve_json_output
 from inspire.config import Config, ConfigError
 
 
@@ -116,6 +118,7 @@ def _format_remote_log_error_message(
         f"{str(err)}\n\n"
         f"Hints:\n"
         f"- Check that the training job created a log file at: {remote_log_path}\n"
+        f"- Prefer SSH tunnel/bridge log access when available; workflow retrieval is fallback-only\n"
         f"- Verify the Bridge workflow exists and can access the shared filesystem\n"
         f"- View Gitea Actions at: {config.gitea_server}/{config.gitea_repo}/actions"
     )
@@ -429,7 +432,10 @@ def _emit_tunnel_fallback_hint(ctx: Context, *, bridge_name: Optional[str]) -> N
         return
 
     target_label = f"bridge '{bridge_name}'" if bridge_name else "default bridge"
-    click.echo(f"Tunnel {target_label} not available, using Gitea workflow...", err=True)
+    click.echo(
+        f"Tunnel {target_label} not available, falling back to Gitea workflow...",
+        err=True,
+    )
 
     connected = _find_connected_tunnel_bridges(exclude=bridge_name)
     if connected:
@@ -584,7 +590,7 @@ def _try_get_ssh_exit_code(
     except IOError as e:
         if not ctx.json_output:
             click.echo(f"SSH log fetch failed: {e}", err=True)
-            click.echo("Falling back to Gitea workflow...", err=True)
+            click.echo("Falling back to Gitea workflow (SSH is preferred)...", err=True)
 
     return None
 
@@ -769,7 +775,7 @@ def _bulk_update_logs(
     refresh: bool,
 ) -> None:
     try:
-        config = Config.from_env(require_target_dir=False)
+        config, _ = Config.from_files_and_env(require_target_dir=False)
         cache = job_deps.JobCache(config.get_expanded_cache_path())
 
         alias_map = {
@@ -898,7 +904,7 @@ def _run_job_logs_single_job(
     bridge: Optional[str] = None,
 ) -> None:
     try:
-        config = Config.from_env(require_target_dir=False)
+        config, _ = Config.from_files_and_env(require_target_dir=False)
         cache = job_deps.JobCache(config.get_expanded_cache_path())
 
         cached = cache.get_job(job_id)
@@ -1085,6 +1091,7 @@ def _run_job_logs_single_job(
     "-b",
     help="Bridge profile to use for SSH tunnel fast path",
 )
+@json_option
 @pass_context
 def logs(
     ctx: Context,
@@ -1098,7 +1105,9 @@ def logs(
     status: tuple,
     limit: int,
     bridge: Optional[str],
+    json_output: bool = False,
 ) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """View logs for a training job.
 
     Fetches logs via Gitea workflow and caches them locally.

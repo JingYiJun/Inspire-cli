@@ -7,7 +7,7 @@ from typing import Optional
 
 
 def get_playwright_proxy() -> Optional[dict]:
-    proxy = os.environ.get("https_proxy") or os.environ.get("http_proxy")
+    proxy = (os.environ.get("https_proxy") or os.environ.get("http_proxy") or "").strip()
     if proxy:
         return {"server": proxy}
     return None

@@ -10,6 +10,8 @@ from inspire.cli.context import (
     Context,
     pass_context,
 )
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.notebook_cli import resolve_json_output
 from inspire.config import (
     get_categories,
     get_options_by_category,
@@ -35,18 +37,12 @@ from inspire.config import (
     type=click.Path(),
     help="Write to file instead of stdout",
 )
+@json_option
 @pass_context
-def generate_env(ctx: Context, template: str, output_file: str | None) -> None:
-    """Generate .env template file.
-
-    Creates a template with all configuration options as environment variables.
-
-    \b
-    Examples:
-        inspire config env
-        inspire config env --template full
-        inspire config env --output .env.example
-    """
+def generate_env(
+    ctx: Context, template: str, output_file: str | None, json_output: bool = False
+) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     _ = ctx  # unused (but consistent signature with other commands)
 
     lines: list[str] = []

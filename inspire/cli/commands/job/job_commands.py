@@ -26,7 +26,51 @@ from inspire.cli.formatters import human_formatter, json_formatter
 from inspire.cli.utils.auth import AuthManager, AuthenticationError
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.cli.utils.job_cli import resolve_job_id
+from inspire.cli.utils.common import json_option
+from inspire.cli.utils.notebook_cli import resolve_json_output
+from inspire.cli.utils.output import emit_success
 from inspire.config import Config, ConfigError
+
+
+_RECOVERABLE_API_ERROR_MARKERS = (
+    "authentication",
+    "not authenticated",
+    "unauthorized",
+    "401",
+    "connection error after",
+    "connection aborted",
+    "remote disconnected",
+    "max retries exceeded",
+)
+
+
+def _should_refresh_api(exc: Exception) -> bool:
+    if isinstance(exc, AuthenticationError):
+        return True
+    return any(marker in str(exc).lower() for marker in _RECOVERABLE_API_ERROR_MARKERS)
+
+
+def _get_job_detail_with_reauth(
+    *,
+    config: Config,
+    job_id: str,
+    api=None,  # noqa: ANN001
+):
+    current_api = api or AuthManager.get_api(config)
+    try:
+        return current_api.get_job_detail(job_id), current_api
+    except Exception as exc:
+        if not _should_refresh_api(exc):
+            raise
+
+        logging.getLogger(__name__).warning(
+            "Refreshing API client after job detail request failed for %s: %s",
+            job_id,
+            exc,
+        )
+        AuthManager.clear_cache()
+        refreshed_api = AuthManager.get_api(config)
+        return refreshed_api.get_job_detail(job_id), refreshed_api
 
 
 def _watch_jobs(
@@ -133,7 +177,11 @@ def _watch_jobs(
                 if job_id:
                     original_status = job_item.get("status", "")
                     try:
-                        result = api.get_job_detail(job_id)
+                        result, api = _get_job_detail_with_reauth(
+                            config=config,
+                            job_id=job_id,
+                            api=api,
+                        )
                         data = result.get("data", {})
                         new_status = data.get("status")
                         if new_status:
@@ -186,6 +234,7 @@ def _watch_jobs(
     default=10,
     help="Refresh interval in seconds for --watch (default: 10)",
 )
+@json_option
 @pass_context
 def list_jobs(
     ctx: Context,
@@ -194,7 +243,9 @@ def list_jobs(
     active: bool,
     watch: bool,
     interval: int,
+    json_output: bool = False,
 ) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """List recent jobs from local cache.
 
     Note: This lists jobs from the local cache, not from the API
@@ -209,7 +260,7 @@ def list_jobs(
         inspire job list --watch --interval 5
     """
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
 
         if watch:
             _watch_jobs(
@@ -249,8 +300,10 @@ def list_jobs(
 
 @click.command("status")
 @click.argument("job_id")
+@json_option
 @pass_context
-def status(ctx: Context, job_id: str) -> None:
+def status(ctx: Context, job_id: str, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Check the status of a training job.
 
     \b
@@ -260,10 +313,10 @@ def status(ctx: Context, job_id: str) -> None:
     job_id = resolve_job_id(ctx, job_id)
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
 
-        result = api.get_job_detail(job_id)
+        result, _ = _get_job_detail_with_reauth(config=config, job_id=job_id, api=api)
         job_data = result.get("data", {})
 
         if job_data.get("status"):
@@ -289,8 +342,10 @@ def status(ctx: Context, job_id: str) -> None:
 
 @click.command("stop")
 @click.argument("job_id")
+@json_option
 @pass_context
-def stop(ctx: Context, job_id: str) -> None:
+def stop(ctx: Context, job_id: str, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Stop a running training job.
 
     \b
@@ -300,7 +355,7 @@ def stop(ctx: Context, job_id: str) -> None:
     job_id = resolve_job_id(ctx, job_id)
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
 
         api.stop_training_job(job_id)
@@ -308,10 +363,11 @@ def stop(ctx: Context, job_id: str) -> None:
         cache = job_deps.JobCache(config.get_expanded_cache_path())
         cache.update_status(job_id, "CANCELLED")
 
-        if ctx.json_output:
-            click.echo(json_formatter.format_json({"job_id": job_id, "status": "stopped"}))
-        else:
-            click.echo(human_formatter.format_success(f"Job stopped: {job_id}"))
+        emit_success(
+            ctx,
+            payload={"job_id": job_id, "status": "stopped"},
+            text=f"Job stopped: {job_id}",
+        )
 
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -329,8 +385,10 @@ def stop(ctx: Context, job_id: str) -> None:
 @click.argument("job_id")
 @click.option("--timeout", type=int, default=14400, help="Timeout in seconds (default: 4 hours)")
 @click.option("--interval", type=int, default=30, help="Poll interval in seconds (default: 30)")
+@json_option
 @pass_context
-def wait(ctx: Context, job_id: str, timeout: int, interval: int) -> None:
+def wait(ctx: Context, job_id: str, timeout: int, interval: int, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Wait for a job to complete.
 
     Polls the job status until it reaches a terminal state
@@ -343,7 +401,7 @@ def wait(ctx: Context, job_id: str, timeout: int, interval: int) -> None:
     job_id = resolve_job_id(ctx, job_id)
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
         cache = job_deps.JobCache(config.get_expanded_cache_path())
 
@@ -369,7 +427,11 @@ def wait(ctx: Context, job_id: str, timeout: int, interval: int) -> None:
                 return
 
             try:
-                result = api.get_job_detail(job_id)
+                result, api = _get_job_detail_with_reauth(
+                    config=config,
+                    job_id=job_id,
+                    api=api,
+                )
                 job_data = result.get("data", {})
                 current_status = job_data.get("status", "UNKNOWN")
 
@@ -446,8 +508,12 @@ def wait(ctx: Context, job_id: str, timeout: int, interval: int) -> None:
     default=0.6,
     help="Delay between API requests in seconds to avoid rate limits (default: 0.6)",
 )
+@json_option
 @pass_context
-def update_jobs(ctx: Context, status: tuple, limit: int, delay: float) -> None:
+def update_jobs(
+    ctx: Context, status: tuple, limit: int, delay: float, json_output: bool = False
+) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Update cached jobs by polling the API.
 
     Refreshes statuses for cached jobs matching the status filter
@@ -470,7 +536,7 @@ def update_jobs(ctx: Context, status: tuple, limit: int, delay: float) -> None:
         statuses_set.update(alias_map.get(key, {s}))
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
         cache = job_deps.JobCache(config.get_expanded_cache_path())
 
@@ -486,7 +552,11 @@ def update_jobs(ctx: Context, status: tuple, limit: int, delay: float) -> None:
                 continue
             old_status = job.get("status", "UNKNOWN")
             try:
-                result = api.get_job_detail(job_id)
+                result, api = _get_job_detail_with_reauth(
+                    config=config,
+                    job_id=job_id,
+                    api=api,
+                )
                 data = result.get("data", {}) if isinstance(result, dict) else {}
                 new_status = data.get("status") or data.get("job_status") or old_status
                 if new_status:
@@ -533,8 +603,10 @@ def update_jobs(ctx: Context, status: tuple, limit: int, delay: float) -> None:
 
 @click.command("command")
 @click.argument("job_id")
+@json_option
 @pass_context
-def show_command(ctx: Context, job_id: str) -> None:
+def show_command(ctx: Context, job_id: str, json_output: bool = False) -> None:
+    json_output = resolve_json_output(ctx, json_output)
     """Show the training command used for a job."""
     job_id = resolve_job_id(ctx, job_id)
 
@@ -548,7 +620,7 @@ def show_command(ctx: Context, job_id: str) -> None:
     source = None
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
 
         result = api.get_job_detail(job_id)

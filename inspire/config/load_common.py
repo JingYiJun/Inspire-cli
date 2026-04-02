@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from inspire.config.models import SOURCE_DEFAULT
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
 
 _ACCOUNT_OVERRIDE_FIELDS = {
     "base_url",
@@ -25,6 +24,8 @@ _ACCOUNT_OVERRIDE_FIELDS = {
     "dropbear_deb_dir",
     "setup_script",
     "rtunnel_download_url",
+    "apt_mirror_url",
+    "rtunnel_upload_policy",
 }
 
 _ACCOUNT_SECTION_KEY_MAP = {
@@ -46,28 +47,35 @@ _ACCOUNT_SECTION_KEY_MAP = {
         "dropbear_deb_dir": "dropbear_deb_dir",
         "setup_script": "setup_script",
         "rtunnel_download_url": "rtunnel_download_url",
+        "apt_mirror_url": "apt_mirror_url",
+        "rtunnel_upload_policy": "rtunnel_upload_policy",
     },
 }
 
 _DEFAULTS_FIELD_MAP = {
-    "image": "job_image",
+    "resource": "default_resource",
+    "image": "default_image",
+    "workspace_id": "default_workspace_id",
+    "priority": "default_priority",
     "notebook_image": "notebook_image",
     "notebook_resource": "notebook_resource",
     "notebook_post_start": "notebook_post_start",
-    "priority": "job_priority",
     "shm_size": "shm_size",
     "target_dir": "target_dir",
     "sync_source_dir": "sync_source_dir",
     "log_pattern": "log_pattern",
     "project_order": "project_order",
 }
-
 _HPC_FIELD_MAP = {
     "image": "hpc_image",
     "image_type": "hpc_image_type",
     "priority": "hpc_priority",
     "ttl_after_finish_seconds": "hpc_ttl_after_finish_seconds",
     "default_preset": "hpc_default_preset",
+}
+
+_LEGACY_FIELD_MAP = {
+    ("paths", "target_dir"): ("defaults", "target_dir"),
 }
 
 _CONTEXT_WORKSPACE_FIELD_MAP = {
@@ -90,6 +98,8 @@ class _ProjectLayerState:
 
 
 def _default_config_values() -> dict[str, Any]:
+    from inspire.config.rtunnel_defaults import DEFAULT_RTUNNEL_DOWNLOAD_URL
+
     return {
         "username": "",
         "password": "",
@@ -108,25 +118,34 @@ def _default_config_values() -> dict[str, Any]:
         "gitea_server": "https://codeberg.org",
         "gitea_log_workflow": "retrieve_job_log.yml",
         "gitea_sync_workflow": "sync_code.yml",
+        "gitea_bridge_workflow": "run_bridge_action.yml",
         "github_repo": None,
         "github_token": None,
         "github_server": "https://github.com",
         "github_log_workflow": "retrieve_job_log.yml",
         "github_sync_workflow": "sync_code.yml",
+        "github_bridge_workflow": "run_bridge_action.yml",
         "log_cache_dir": "~/.inspire/logs",
         "remote_timeout": 90,
         "default_remote": "origin",
         "bridge_action_timeout": 600,
+        "bridge_action_denylist": [],
         "skip_ssl_verify": False,
         "force_proxy": False,
         "openapi_prefix": None,
         "browser_api_prefix": None,
         "auth_endpoint": None,
         "docker_registry": None,
-        "job_priority": 6,
+        "job_resource": None,
+        "job_priority": None,
         "job_image": None,
         "job_project_id": None,
         "job_workspace_id": None,
+        "job_shm_size": None,
+        "default_resource": None,
+        "default_image": None,
+        "default_priority": None,
+        "default_workspace_id": None,
         "workspace_cpu_id": None,
         "workspace_gpu_id": None,
         "workspace_internet_id": None,
@@ -139,8 +158,12 @@ def _default_config_values() -> dict[str, Any]:
         "account_shared_path_group": None,
         "account_train_job_workdir": None,
         "context_account": None,
-        "notebook_resource": "1xH200",
+        "notebook_resource": None,
         "notebook_image": None,
+        "notebook_project_id": None,
+        "notebook_priority": None,
+        "notebook_workspace_id": None,
+        "notebook_shm_size": None,
         "notebook_post_start": None,
         "hpc_image": None,
         "hpc_image_type": "SOURCE_PUBLIC",
@@ -152,8 +175,9 @@ def _default_config_values() -> dict[str, Any]:
         "sshd_deb_dir": None,
         "dropbear_deb_dir": None,
         "setup_script": None,
-        "rtunnel_download_url": default_rtunnel_download_url(),
+        "rtunnel_download_url": DEFAULT_RTUNNEL_DOWNLOAD_URL,
         "apt_mirror_url": None,
+        "rtunnel_upload_policy": "auto",
         "tunnel_retries": 3,
         "tunnel_retry_pause": 2.0,
         "shm_size": None,
@@ -269,7 +293,7 @@ def _normalize_project_catalog(raw_value: Any) -> dict[str, dict[str, Any]]:
             continue
 
         entry: dict[str, Any] = {}
-        for key in ("shared_path_group", "workdir"):
+        for key in ("name", "shared_path_group", "workdir"):
             value = raw_entry.get(key)
             if isinstance(value, str):
                 value = value.strip()
@@ -295,9 +319,12 @@ def _resolve_alias(value: Any, mapping: dict[str, str], *, id_prefix: str) -> st
 
 
 def _coerce_project_default(field_name: str, raw_value: Any) -> Any:
-    if field_name in {"job_priority", "shm_size"}:
+    if field_name in {"job_priority", "default_priority", "job_shm_size", "shm_size"}:
         return int(raw_value)
     if field_name in {
+        "default_resource",
+        "default_image",
+        "default_workspace_id",
         "target_dir",
         "job_image",
         "notebook_image",

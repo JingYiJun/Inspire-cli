@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -15,6 +16,8 @@ from inspire.config.ssh_runtime import (
 from .config import load_tunnel_config
 from .models import TunnelConfig, TunnelError
 
+logger = logging.getLogger(__name__)
+
 # nightly release includes stdio:// mode for SSH ProxyCommand support
 DEFAULT_RTUNNEL_DOWNLOAD_URL = CONFIG_DEFAULT_RTUNNEL_DOWNLOAD_URL
 
@@ -27,8 +30,8 @@ def _get_rtunnel_download_url() -> str:
     """
     try:
         return resolve_ssh_runtime_config().rtunnel_download_url
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to resolve rtunnel download URL from config: %s", e)
 
     # Use default
     return DEFAULT_RTUNNEL_DOWNLOAD_URL
@@ -48,7 +51,8 @@ def _is_rtunnel_binary_usable(path: Path) -> bool:
             timeout=5,
         )
         return result.returncode == 0
-    except Exception:
+    except Exception as e:
+        logger.debug("rtunnel binary test failed for %s: %s", path, e)
         return False
 
 

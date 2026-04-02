@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import click
 
 from inspire.cli.formatters import json_formatter
-from .notebook_lookup import _extract_notebook_resource_fields
+from .notebook_lookup import _extract_notebook_resource_fields, _format_notebook_resource
 
 try:
     from rich import box
@@ -18,6 +18,24 @@ except ImportError:  # pragma: no cover - optional dependency fallback
     box = None
     Console = None
     Table = None
+
+
+COLUMN_SPECS = {
+    "name": ("Name", 25),
+    "status": ("Status", 12),
+    "resource": ("Resource", 20),
+    "id": ("ID", 38),
+    "created": ("Created", 20),
+    "gpu": ("GPU", 10),
+    "cpu": ("CPU", 10),
+    "memory": ("Memory", 10),
+    "image": ("Image", 25),
+    "project": ("Project", 20),
+    "workspace": ("Workspace", 15),
+    "node": ("Node", 15),
+    "uptime": ("Uptime", 10),
+    "tunnel": ("Tunnel", 15),
+}
 
 
 def _make_console() -> Console | None:
@@ -31,6 +49,24 @@ def _format_notebook_resource_summary(notebook: dict) -> str:
     cpu_display, gpu_display, memory_display = _extract_notebook_resource_fields(notebook)
     parts = [value.strip() for value in (cpu_display, gpu_display, memory_display) if value.strip()]
     return " · ".join(parts) if parts else "N/A"
+
+
+def _normalize_notebook_id(notebook_id: str) -> str:
+    if notebook_id.startswith("notebook-"):
+        return notebook_id[len("notebook-") :]
+    return notebook_id
+
+
+def _get_tunnel_name(notebook: dict, tunnel_config) -> str:
+    if not tunnel_config:
+        return "-"
+    notebook_id = str(notebook.get("notebook_id") or notebook.get("id") or "")
+    normalized_id = _normalize_notebook_id(notebook_id)
+    for bridge in tunnel_config.list_bridges():
+        bridge_id = str(getattr(bridge, "notebook_id", "") or "")
+        if bridge_id and _normalize_notebook_id(bridge_id) == normalized_id:
+            return str(getattr(bridge, "name", "-") or "-")
+    return "-"
 
 
 def _format_notebook_uptime(live_seconds: object) -> str | None:
@@ -96,6 +132,45 @@ def _format_notebook_created_at(created_at: object) -> str | None:
     local_dt = timestamp.astimezone(timezone(timedelta(hours=8)))
     human = local_dt.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     return f"{human} ({raw})"
+
+
+def _format_column(item: dict, col: str, tunnel_config=None) -> str:
+    image = item.get("image") or {}
+    workspace = item.get("workspace") or {}
+    extra = item.get("extra_info") or {}
+    cpu_display, gpu_display, memory_display = _extract_notebook_resource_fields(item)
+
+    if col == "name":
+        return str(item.get("name", "N/A"))
+    if col == "status":
+        return str(item.get("status", "Unknown"))
+    if col == "resource":
+        return _format_notebook_resource(item)
+    if col == "id":
+        return str(item.get("notebook_id") or item.get("id", "N/A"))
+    if col == "created":
+        return _format_notebook_created_at(item.get("created_at")) or "N/A"
+    if col == "gpu":
+        return gpu_display
+    if col == "cpu":
+        return cpu_display
+    if col == "memory":
+        return memory_display
+    if col == "image":
+        name = image.get("name", "")
+        version = image.get("version", "")
+        return f"{name}:{version}" if name and version else str(name or "N/A")
+    if col == "project":
+        return str(item.get("project", {}).get("name") or item.get("project_name") or "N/A")
+    if col == "workspace":
+        return str(workspace.get("name") or "N/A")
+    if col == "node":
+        return str(extra.get("NodeName") or "N/A")
+    if col == "uptime":
+        return _format_notebook_uptime(item.get("live_time")) or "N/A"
+    if col == "tunnel":
+        return _get_tunnel_name(item, tunnel_config)
+    return "N/A"
 
 
 def _print_notebook_detail(notebook: dict) -> None:
@@ -175,7 +250,12 @@ def _print_notebook_detail(notebook: dict) -> None:
     click.echo(f"{'='*60}\n")
 
 
-def _print_notebook_list(items: list, json_output: bool) -> None:
+def _print_notebook_list(
+    items: list,
+    json_output: bool,
+    columns: str = "name,status,resource,id",
+    tunnel_config=None,
+) -> None:
     """Print notebook list in appropriate format."""
     if json_output:
         click.echo(json_formatter.format_json({"items": items, "total": len(items)}))
@@ -185,24 +265,37 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
         click.echo("No notebook instances found.")
         return
 
-    resource_fields = [_extract_notebook_resource_fields(item) for item in items]
+    column_list = [col.strip().lower() for col in columns.split(",") if col.strip()]
+    if not column_list:
+        column_list = ["name", "status", "resource", "id"]
+
+    valid_columns = [col for col in column_list if col in COLUMN_SPECS]
+    if not valid_columns:
+        valid_columns = ["name", "status", "resource", "id"]
+
+    if valid_columns in (
+        ["name", "status", "resource"],
+        ["name", "status", "resource", "id"],
+    ):
+        valid_columns = ["name", "status", "cpu", "gpu", "memory", "id"]
+
     console = _make_console()
     if console is None or Table is None or box is None:
-        cpu_width = max(len("CPU"), max(len(cpu) for cpu, _, _ in resource_fields))
-        gpu_width = max(len("GPU"), max(len(gpu) for _, gpu, _ in resource_fields))
-        memory_width = max(len("Memory"), max(len(memory) for _, _, memory in resource_fields))
-        lines = [
-            f"{'Name':<25} {'Status':<12} {'CPU':>{cpu_width}} {'GPU':>{gpu_width}} "
-            f"{'Memory':>{memory_width}} {'ID':<38}",
-            "-" * (25 + 1 + 12 + 1 + cpu_width + 1 + gpu_width + 1 + memory_width + 1 + 38),
-        ]
-        for item, (cpu_display, gpu_display, memory_display) in zip(items, resource_fields):
-            name = item.get("name", "N/A")[:25]
-            status = item.get("status", "Unknown")[:12]
-            notebook_id = item.get("notebook_id", item.get("id", "N/A"))
+        widths = {
+            col: max(
+                COLUMN_SPECS[col][1],
+                max(len(_format_column(item, col, tunnel_config)) for item in items),
+            )
+            for col in valid_columns
+        }
+        header = " ".join(f"{COLUMN_SPECS[col][0]:<{widths[col]}}" for col in valid_columns)
+        lines = [header, "-" * len(header)]
+        for item in items:
             lines.append(
-                f"{name:<25} {status:<12} {cpu_display:>{cpu_width}} {gpu_display:>{gpu_width}} "
-                f"{memory_display:>{memory_width}} {notebook_id:<38}"
+                " ".join(
+                    f"{_format_column(item, col, tunnel_config)[:widths[col]]:<{widths[col]}}"
+                    for col in valid_columns
+                )
             )
         lines.append(f"\nShowing {len(items)} notebook(s)")
         click.echo("\n".join(lines))
@@ -214,23 +307,15 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
         show_header=True,
         header_style="bold cyan",
     )
-    table.add_column("Name", style="cyan")
-    table.add_column("Status", style="green")
-    table.add_column("CPU", justify="right")
-    table.add_column("GPU", justify="right")
-    table.add_column("Memory", justify="right")
-    table.add_column("ID", style="white", no_wrap=True)
-    for item, (cpu_display, gpu_display, memory_display) in zip(items, resource_fields):
-        table.add_row(
-            str(item.get("name", "N/A")),
-            str(item.get("status", "Unknown")),
-            cpu_display,
-            gpu_display,
-            memory_display,
-            str(item.get("notebook_id", item.get("id", "N/A"))),
-        )
+    for col in valid_columns:
+        header, _width = COLUMN_SPECS[col]
+        justify = "right" if col in {"cpu", "gpu", "memory"} else "left"
+        style = "green" if col == "status" else ("cyan" if col == "name" else "white")
+        table.add_column(header, style=style, justify=justify, no_wrap=(col == "id"))
+    for item in items:
+        table.add_row(*[_format_column(item, col, tunnel_config) for col in valid_columns])
     console.print(table)
     console.print(f"Showing {len(items)} notebook(s)")
 
 
-__all__ = ["_print_notebook_detail", "_print_notebook_list"]
+__all__ = ["_print_notebook_detail", "_print_notebook_list", "COLUMN_SPECS"]

@@ -21,6 +21,7 @@ from inspire.config import (
     SOURCE_DEFAULT,
     SOURCE_ENV,
     SOURCE_GLOBAL,
+    SOURCE_INFERRED,
     SOURCE_PROJECT,
     get_categories,
     get_options_by_category,
@@ -35,6 +36,7 @@ SOURCE_LABELS: dict[str, tuple[str, str]] = {
     SOURCE_GLOBAL: ("global", "cyan"),
     SOURCE_PROJECT: ("project", "green"),
     SOURCE_ENV: ("env", "yellow"),
+    SOURCE_INFERRED: ("inferred", "magenta"),
 }
 
 # ---------------------------------------------------------------------------

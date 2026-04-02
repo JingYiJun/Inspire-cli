@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import warnings
+import os
 from pathlib import Path
 
-from inspire.config.models import SOURCE_PROJECT, Config
+from inspire.config.models import (
+    Config,
+    ConfigDeprecationWarning,
+    SOURCE_ENV,
+    SOURCE_GLOBAL,
+    SOURCE_INFERRED,
+    SOURCE_PROJECT,
+)
 from inspire.config.toml import _find_project_config
 
 from .load_accounts import (
@@ -18,6 +27,87 @@ from .load_runtime import (
     _apply_password_and_token_fallbacks,
     _validate_required_config,
 )
+
+
+def _warn_legacy_project_context_keys(
+    *,
+    project_context: dict[str, object],
+    project_config_path: Path | None,
+) -> None:
+    legacy_keys: list[str] = []
+    if str(project_context.get("account") or "").strip():
+        legacy_keys.append("[context].account")
+    if str(project_context.get("project") or "").strip():
+        legacy_keys.append("[context].project")
+    for key in ("workspace", "workspace_cpu", "workspace_gpu", "workspace_internet"):
+        if str(project_context.get(key) or "").strip():
+            legacy_keys.append(f"[context].{key}")
+    if not legacy_keys:
+        return
+
+    path_label = str(project_config_path) if project_config_path else "project config"
+    replacements: list[str] = []
+    if "[context].account" in legacy_keys:
+        replacements.append("[auth].username")
+    if "[context].project" in legacy_keys:
+        replacements.append("[job].project_id or [defaults].project_order")
+    if any(key.startswith("[context].workspace") for key in legacy_keys):
+        replacements.append('[accounts."<user>".workspaces] aliases plus --workspace')
+    replacements_label = " and ".join(replacements)
+
+    warnings.warn(
+        (
+            f"{path_label} uses deprecated legacy keys {', '.join(legacy_keys)}. "
+            f"Use {replacements_label} instead. Legacy keys still work for now, "
+            "but will be removed in a future release."
+        ),
+        ConfigDeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_legacy_workspace_id_keys(
+    *,
+    config_dict: dict[str, object],
+    sources: dict[str, str],
+    global_config_path: Path | None,
+    project_config_path: Path | None,
+) -> None:
+    key_specs = (
+        ("default_workspace_id", "[defaults].workspace_id", "INSPIRE_DEFAULT_WORKSPACE_ID"),
+        ("job_workspace_id", "[job].workspace_id", "INSPIRE_WORKSPACE_ID"),
+        (
+            "notebook_workspace_id",
+            "[notebook].workspace_id",
+            "INSPIRE_NOTEBOOK_WORKSPACE_ID",
+        ),
+    )
+    for field_name, toml_key, env_var in key_specs:
+        value = str(config_dict.get(field_name) or "").strip()
+        source = sources.get(field_name)
+        if not value or source not in {SOURCE_GLOBAL, SOURCE_PROJECT, SOURCE_ENV}:
+            continue
+
+        if source == SOURCE_PROJECT:
+            location = str(project_config_path) if project_config_path else "project config"
+            subject = toml_key
+        elif source == SOURCE_GLOBAL:
+            location = str(global_config_path) if global_config_path else "global config"
+            subject = toml_key
+        else:
+            location = "environment"
+            subject = env_var
+
+        warnings.warn(
+            (
+                f"{location} uses deprecated workspace pin {subject}. "
+                'Prefer [accounts."<user>".workspaces] aliases plus --workspace, and reserve '
+                "--workspace-id for one-off explicit overrides. Legacy workspace_id "
+                "pins still work for now, but will be removed in a future release."
+            ),
+            ConfigDeprecationWarning,
+            stacklevel=3,
+        )
 
 
 def config_from_files_and_env(
@@ -42,10 +132,42 @@ def config_from_files_and_env(
     project_accounts = project_layer_state.project_accounts
     prefer_source = project_layer_state.prefer_source
 
+    _warn_legacy_project_context_keys(
+        project_context=project_context,
+        project_config_path=project_config_path,
+    )
+
     context_account = str(project_context.get("account") or "").strip()
     if context_account:
         config_dict["context_account"] = context_account
         sources["context_account"] = SOURCE_PROJECT
+
+    env_username = str(os.getenv("INSPIRE_USERNAME") or "").strip()
+    username_source = sources.get("username")
+    if env_username and not (
+        prefer_source == "toml" and (username_source == SOURCE_PROJECT or bool(context_account))
+    ):
+        config_dict["username"] = env_username
+        sources["username"] = SOURCE_ENV
+
+    current_username = str(config_dict.get("username") or "").strip()
+    if not current_username and not context_account:
+        candidate_accounts = set(global_account_catalogs.keys()) | set(
+            project_account_catalogs.keys()
+        )
+        if len(candidate_accounts) == 1:
+            inferred_username = next(iter(candidate_accounts))
+            config_dict["username"] = inferred_username
+            sources["username"] = SOURCE_INFERRED
+            warnings.warn(
+                (
+                    "No explicit account was configured; inferred username "
+                    f"'{inferred_username}' from a single [accounts] entry. "
+                    "Set [auth].username or INSPIRE_USERNAME to avoid ambiguity."
+                ),
+                ConfigDeprecationWarning,
+                stacklevel=3,
+            )
 
     _apply_account_catalog_layer(
         config_dict=config_dict,
@@ -73,6 +195,12 @@ def config_from_files_and_env(
         sources=sources,
         project_accounts=project_accounts,
         env_password=env_password,
+    )
+    _warn_legacy_workspace_id_keys(
+        config_dict=config_dict,
+        sources=sources,
+        global_config_path=global_config_path,
+        project_config_path=project_config_path,
     )
     _validate_required_config(
         config_dict=config_dict,

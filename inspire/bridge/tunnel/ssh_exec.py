@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import select
+import shlex
 import subprocess
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .config import load_tunnel_config
 from .models import (
@@ -17,9 +18,14 @@ from .models import (
     TunnelNotAvailableError,
 )
 from .rtunnel import _ensure_rtunnel_binary
-from .ssh import _get_proxy_command
+from .ssh import _get_proxy_command, _identity_args
 
 logger = logging.getLogger(__name__)
+
+
+# Constants for remote shell execution
+REMOTE_LOCALE_EXPORT = "export LC_ALL=C LANG=C;"
+QUIET_SHELL_ARGS = ["bash", "--noprofile", "--norc"]
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _build_ssh_process_env() -> dict[str, str]:
+def build_ssh_process_env() -> dict[str, str]:
     """Build environment for SSH subprocesses with a universally available locale.
 
     This prevents remote login shells from inheriting unsupported locale values
@@ -61,13 +67,35 @@ def _resolve_bridge_and_proxy(
 
 
 def _build_stdin_script(command: str) -> str:
-    """Build a short shell script to pipe into ``bash -l`` via stdin.
+    """Build a short shell script to pipe into a non-login bash via stdin.
 
     This avoids embedding *command* in the SSH process's command-line
     arguments, which would otherwise make ``pkill -f <pattern>`` match
     the parent bash process and tear down the SSH session.
     """
-    return f"export LC_ALL=C LANG=C; {command}\n"
+    return f"{REMOTE_LOCALE_EXPORT} {command}\n"
+
+
+def _ssh_locale_args() -> list[str]:
+    """Return SSH options that suppress unsupported locale forwarding."""
+    return [
+        "-F",
+        "/dev/null",
+        "-o",
+        "SetEnv=LC_ALL=C",
+        "-o",
+        "SetEnv=LANG=C",
+    ]
+
+
+def _quiet_remote_shell_args() -> list[str]:
+    """Return a non-login shell argv for command execution."""
+    return QUIET_SHELL_ARGS[:]
+
+
+def _wrap_remote_command(command: str) -> str:
+    """Wrap a remote command in a quiet bash shell to avoid login banners."""
+    return f"{' '.join(QUIET_SHELL_ARGS)} -lc {shlex.quote(command)}"
 
 
 def _build_ssh_base_args(
@@ -78,6 +106,8 @@ def _build_ssh_base_args(
 ) -> list[str]:
     args = [
         "ssh",
+        *([] if not bridge.identity_file else ["-i", bridge.identity_file]),
+        *_ssh_locale_args(),
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -109,29 +139,39 @@ def run_ssh_command(
     check: bool = False,
     *,
     quiet_proxy: bool = True,
+    pass_stdin: bool = False,
 ) -> subprocess.CompletedProcess:
     """Execute a command on Bridge via SSH ProxyCommand."""
     _config, bridge, proxy_cmd = _resolve_bridge_and_proxy(bridge_name, config, quiet=quiet_proxy)
     ssh_cmd = _build_ssh_base_args(bridge=bridge, proxy_cmd=proxy_cmd)
-    ssh_cmd.append("bash -l")
+    input_payload: Optional[str] = None
+    if pass_stdin:
+        ssh_cmd.append(_wrap_remote_command(command))
+    else:
+        ssh_cmd.extend(_quiet_remote_shell_args())
+        input_payload = _build_stdin_script(command)
 
     logger.debug(
-        "run_ssh_command bridge=%s timeout=%s capture_output=%s quiet_proxy=%s command=%s",
+        (
+            "run_ssh_command bridge=%s timeout=%s capture_output=%s "
+            "quiet_proxy=%s pass_stdin=%s command=%s"
+        ),
         bridge.name,
         timeout,
         capture_output,
         quiet_proxy,
+        pass_stdin,
         command,
     )
 
     result = subprocess.run(
         ssh_cmd,
-        input=_build_stdin_script(command),
+        input=input_payload,
         capture_output=capture_output,
         text=True,
         timeout=timeout,
         check=check,
-        env=_build_ssh_process_env(),
+        env=build_ssh_process_env(),
     )
     logger.debug(
         "run_ssh_command completed bridge=%s returncode=%s",
@@ -164,11 +204,42 @@ def get_ssh_command_args(
     config: Optional[TunnelConfig] = None,
     remote_command: Optional[str] = None,
 ) -> list[str]:
-    """Build SSH command arguments with ProxyCommand."""
-    _config, bridge, proxy_cmd = _resolve_bridge_and_proxy(bridge_name, config)
-    args = _build_ssh_base_args(bridge=bridge, proxy_cmd=proxy_cmd, batch_mode=False)
+    """Build SSH command arguments using stdio:// ProxyCommand."""
+    if config is None:
+        config = load_tunnel_config()
+
+    bridge = config.get_bridge(bridge_name)
+    if not bridge:
+        if bridge_name:
+            raise BridgeNotFoundError(f"Bridge '{bridge_name}' not found")
+        raise TunnelNotAvailableError(
+            "No bridge configured. Run 'inspire tunnel add <name> <url>' first."
+        )
+
+    _ensure_rtunnel_binary(config)
+
+    proxy_cmd = _get_proxy_command(bridge, config.rtunnel_bin)
+
+    args = [
+        "ssh",
+        *_identity_args(bridge),
+        *_ssh_locale_args(),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ProxyCommand={proxy_cmd}",
+        "-o",
+        "LogLevel=ERROR",
+        "-p",
+        str(bridge.ssh_port),
+        f"{bridge.ssh_user}@localhost",
+    ]
     if remote_command:
-        args.append(remote_command)
+        args.append(_wrap_remote_command(remote_command))
     return args
 
 
@@ -183,18 +254,26 @@ def run_ssh_command_streaming(
     config: Optional[TunnelConfig] = None,
     timeout: Optional[int] = None,
     output_callback: Optional[Callable[[str], None]] = None,
+    *,
+    pass_stdin: bool = False,
 ) -> int:
     """Execute a command on Bridge via SSH with streaming output."""
     import click
 
     _config, bridge, proxy_cmd = _resolve_bridge_and_proxy(bridge_name, config)
     ssh_cmd = _build_ssh_base_args(bridge=bridge, proxy_cmd=proxy_cmd)
-    ssh_cmd.append("bash -l")
+    popen_stdin: Any = subprocess.PIPE
+    if pass_stdin:
+        ssh_cmd.append(_wrap_remote_command(command))
+        popen_stdin = None
+    else:
+        ssh_cmd.extend(_quiet_remote_shell_args())
 
     logger.debug(
-        "run_ssh_command_streaming bridge=%s timeout=%s command=%s",
+        "run_ssh_command_streaming bridge=%s timeout=%s pass_stdin=%s command=%s",
         bridge.name,
         timeout,
+        pass_stdin,
         command,
     )
 
@@ -208,18 +287,20 @@ def run_ssh_command_streaming(
 
     process = subprocess.Popen(
         ssh_cmd,
-        stdin=subprocess.PIPE,
+        stdin=popen_stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
         universal_newlines=True,
-        env=_build_ssh_process_env(),
+        env=build_ssh_process_env(),
     )
 
-    # Feed the command via stdin so it never appears in the process cmdline.
-    script = _build_stdin_script(command)
-    process.stdin.write(script)
-    process.stdin.close()
+    if not pass_stdin:
+        # Feed the command via stdin so it never appears in the process cmdline.
+        script = _build_stdin_script(command)
+        if process.stdin is not None:
+            process.stdin.write(script)
+            process.stdin.close()
 
     start_time = time.time()
 
@@ -275,10 +356,13 @@ def run_ssh_command_streaming(
 
 
 __all__ = [
-    "_build_ssh_process_env",
     "_build_ssh_base_args",
     "_build_stdin_script",
+    "_quiet_remote_shell_args",
     "_resolve_bridge_and_proxy",
+    "_ssh_locale_args",
+    "_wrap_remote_command",
+    "build_ssh_process_env",
     "get_ssh_command_args",
     "run_ssh_command",
     "run_ssh_command_streaming",

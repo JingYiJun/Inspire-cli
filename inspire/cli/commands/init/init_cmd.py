@@ -105,8 +105,7 @@ def _get_config_paths() -> tuple[Path, Path]:
     default=900,
     show_default=True,
     help=(
-        "Per-project probe timeout in seconds. "
-        "Only effective with --discover --probe-shared-path."
+        "Per-project probe timeout in seconds. Only effective with --discover --probe-shared-path."
     ),
 )
 @click.option(
@@ -132,6 +131,17 @@ def _get_config_paths() -> tuple[Path, Path]:
     default=None,
     help="Target directory on shared filesystem (skips prompt). Only used with --discover.",
 )
+@click.option(
+    "--wizard",
+    is_flag=True,
+    help="Run interactive setup wizard for new users",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="Auto-confirm prompts (useful for automation/scripting)",
+)
 @pass_context
 def init(
     ctx: Context,
@@ -149,6 +159,8 @@ def init(
     username: str | None,
     base_url: str | None,
     target_dir: str | None,
+    wizard: bool,
+    yes: bool,
 ) -> None:
     """Initialize Inspire CLI configuration.
 
@@ -215,6 +227,23 @@ def init(
         if global_flag and project_flag:
             raise ValueError("Cannot specify both --global and --project")
 
+        # Handle wizard mode
+        if wizard:
+            if discover or template_flag or global_flag or project_flag:
+                raise ValueError(
+                    "--wizard cannot be combined with --discover, --template, --global, or --project"
+                )
+            if effective_json:
+                raise ValueError("--wizard is interactive and cannot be used with --json")
+
+            from .wizard import run_wizard
+
+            success = run_wizard(global_path, project_path, force=force, yes=yes)
+            if success:
+                # Run auto-validation after wizard completes
+                _run_auto_validation(ctx)
+            return
+
         if discover:
             if template_flag:
                 raise ValueError("Cannot combine --discover with --template")
@@ -261,6 +290,9 @@ def init(
                 },
                 effective_json=effective_json,
             )
+
+            # Run auto-validation after init completes
+            _run_auto_validation(ctx)
             return
 
         if probe_shared_path:
@@ -337,6 +369,9 @@ def init(
                 warnings=warnings,
                 effective_json=effective_json,
             )
+
+            # Run auto-validation after init completes
+            _run_auto_validation(ctx)
             return
 
         if effective_json:
@@ -357,12 +392,49 @@ def init(
             warnings=warnings,
             effective_json=effective_json,
         )
+
+        # Run auto-validation after init completes
+        _run_auto_validation(ctx)
     except ValueError as e:
         _handle_error(ctx, "ValidationError", str(e), EXIT_GENERAL_ERROR)
     except SystemExit:
         raise
     except Exception as e:
         _handle_error(ctx, "Error", str(e), EXIT_GENERAL_ERROR)
+
+
+def _run_auto_validation(ctx: Context) -> None:
+    """Run automatic config validation after init completes."""
+    if ctx.json_output:
+        return  # Skip in JSON mode
+
+    click.echo()
+    click.echo(click.style("Running automatic configuration validation...", fg="blue"))
+
+    try:
+        from inspire.cli.commands.config.check import _run_check_impl
+
+        _run_check_impl(ctx, json_output_local=False)
+    except SystemExit as e:
+        # check_config exits with non-zero on auth failure, which is expected
+        # if user hasn't set up credentials yet
+        if e.code != 0:
+            click.echo()
+            click.echo(
+                click.style(
+                    "Note: Validation could not complete (authentication may be required). "
+                    "Run 'inspire config check' manually after setting up credentials.",
+                    fg="yellow",
+                )
+            )
+    except Exception as e:
+        click.echo()
+        click.echo(
+            click.style(
+                f"Warning: Automatic validation failed: {e}",
+                fg="yellow",
+            )
+        )
 
 
 __all__ = ["init"]

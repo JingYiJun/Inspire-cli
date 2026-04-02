@@ -12,6 +12,7 @@ from inspire.cli.commands.init import init
 from inspire.cli.commands.image import image
 from inspire.cli.commands.project import project
 from inspire.cli.commands.hpc import hpc
+from inspire.cli.commands.mount import mount
 
 __all__ = [
     "job",
@@ -26,4 +27,5 @@ __all__ = [
     "image",
     "project",
     "hpc",
+    "mount",
 ]

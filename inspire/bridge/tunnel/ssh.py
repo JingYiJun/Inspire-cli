@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -11,6 +14,12 @@ from typing import Optional
 from .config import load_tunnel_config
 from .models import BridgeProfile, TunnelConfig, TunnelError
 from .rtunnel import _ensure_rtunnel_binary
+
+logger = logging.getLogger(__name__)
+
+INSPIRE_SSH_BLOCK_BEGIN = "# >>> Inspire Bridges (auto-generated) >>>"
+INSPIRE_SSH_BLOCK_END = "# <<< Inspire Bridges (auto-generated) <<<"
+INSPIRE_SSH_LEGACY_HEADER = "# Inspire Bridges (auto-generated)"
 
 # ---------------------------------------------------------------------------
 # ProxyCommand
@@ -28,25 +37,92 @@ def _get_proxy_command(bridge: BridgeProfile, rtunnel_bin: Path, quiet: bool = F
     Returns:
         ProxyCommand string for SSH -o option
     """
-    import shlex
-
     # Convert https:// URL to wss:// for websocket
-    proxy_url = bridge.proxy_url
-    if proxy_url.startswith("https://"):
-        ws_url = "wss://" + proxy_url[8:]
-    elif proxy_url.startswith("http://"):
-        ws_url = "ws://" + proxy_url[7:]
-    else:
-        ws_url = proxy_url
+    ws_url = _to_ws_url(bridge.proxy_url)
 
     # ProxyCommand is executed by a shell on the client; quote the URL because it
     # can contain characters like '?' (e.g. token query params) that some shells
     # treat as glob patterns.
     if quiet:
         # Wrap in sh -c to redirect stderr, suppressing rtunnel's verbose output
-        cmd = f"{rtunnel_bin} {shlex.quote(ws_url)} stdio://%h:%p 2>/dev/null"
+        cmd = f"{shlex.quote(str(rtunnel_bin))} {shlex.quote(ws_url)} stdio://%h:%p 2>/dev/null"
         return f"sh -c {shlex.quote(cmd)}"
     return f"{shlex.quote(str(rtunnel_bin))} {shlex.quote(ws_url)} {shlex.quote('stdio://%h:%p')}"
+
+
+def _to_ws_url(proxy_url: str) -> str:
+    """Convert an http(s) proxy URL to ws(s)."""
+    if proxy_url.startswith("https://"):
+        return "wss://" + proxy_url[8:]
+    if proxy_url.startswith("http://"):
+        return "ws://" + proxy_url[7:]
+    return proxy_url
+
+
+def _build_rtunnel_listener_shell(
+    *,
+    rtunnel_bin: Path | str,
+    proxy_url: str,
+    target_command: str,
+) -> str:
+    """Build a bash wrapper that starts a per-invocation local rtunnel listener."""
+    return (
+        "set -e; "
+        f"RTUNNEL_BIN={shlex.quote(str(rtunnel_bin))}; "
+        f"RTUNNEL_URL={shlex.quote(_to_ws_url(proxy_url))}; "
+        "pick_port(){ local candidate; "
+        "for _ in $(seq 1 40); do "
+        "candidate=$(( (RANDOM << 1 ^ RANDOM) % 16384 + 49152 )); "
+        'if ! nc -z 127.0.0.1 "$candidate" >/dev/null 2>&1; then '
+        'printf "%s" "$candidate"; return 0; '
+        "fi; "
+        "done; "
+        "return 1; "
+        "}; "
+        'cleanup(){ if [ -n "${RT_PID:-}" ]; then kill "$RT_PID" >/dev/null 2>&1 || true; '
+        'wait "$RT_PID" 2>/dev/null || true; RT_PID=; fi; }; '
+        "trap cleanup EXIT INT TERM; "
+        "for _attempt in $(seq 1 20); do "
+        "LOCAL_PORT=$(pick_port) || break; "
+        '"$RTUNNEL_BIN" "$RTUNNEL_URL" "127.0.0.1:$LOCAL_PORT" >/dev/null 2>&1 & '
+        "RT_PID=$!; "
+        "for _ in $(seq 1 50); do "
+        'if nc -z 127.0.0.1 "$LOCAL_PORT" >/dev/null 2>&1; then '
+        f"{target_command}; "
+        "exit $?; "
+        "fi; "
+        'if ! kill -0 "$RT_PID" >/dev/null 2>&1; then break; '
+        "fi; "
+        "sleep 0.1; "
+        "done; "
+        "cleanup; "
+        "done; "
+        'echo "Failed to start local rtunnel listener" >&2; exit 1'
+    )
+
+
+def _identity_args(bridge: BridgeProfile) -> list[str]:
+    identity_file = str(getattr(bridge, "identity_file", "") or "").strip()
+    if not identity_file:
+        return []
+    return ["-i", identity_file]
+
+
+def _ssh_locale_args() -> list[str]:
+    return [
+        "-F",
+        "/dev/null",
+        "-o",
+        "SetEnv=LC_ALL=C",
+        "-o",
+        "SetEnv=LANG=C",
+    ]
+
+
+def _ssh_process_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +135,7 @@ def _test_ssh_connection(
     config: TunnelConfig,
     timeout: int = 10,
 ) -> bool:
-    """Test if SSH connection works via ProxyCommand.
+    """Test if SSH connection works.
 
     Args:
         bridge: Bridge profile to test
@@ -67,7 +143,7 @@ def _test_ssh_connection(
         timeout: SSH connection timeout in seconds (default: 10)
 
     Returns:
-        True if SSH connection succeeds, False otherwise
+        True if SSH connection succeeds, False otherwise.
     """
     # Ensure rtunnel binary exists
     try:
@@ -81,6 +157,8 @@ def _test_ssh_connection(
         result = subprocess.run(
             [
                 "ssh",
+                *_identity_args(bridge),
+                *_ssh_locale_args(),
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -98,12 +176,40 @@ def _test_ssh_connection(
                 f"{bridge.ssh_user}@localhost",
                 "echo ok",
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout + 5,
+            env=_ssh_process_env(),
         )
-        return result.returncode == 0 and "ok" in result.stdout
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        if result.returncode == 0 and "ok" in result.stdout:
+            return True
+    except subprocess.TimeoutExpired as e:
+        logger.debug("SSH connection test timed out for bridge %s: %s", bridge.name, e)
+    except FileNotFoundError as e:
+        logger.debug("SSH binary not found for bridge %s: %s", bridge.name, e)
+
+    from .ssh_exec import get_ssh_command_args
+
+    try:
+        fallback_cmd = get_ssh_command_args(
+            bridge_name=bridge.name,
+            config=config,
+            remote_command="echo ok",
+        )
+        fallback = subprocess.run(
+            fallback_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 8,
+            env=_ssh_process_env(),
+        )
+        return fallback.returncode == 0 and "ok" in (fallback.stdout or "")
+    except subprocess.TimeoutExpired as e:
+        logger.debug("SSH fallback connection test timed out for bridge %s: %s", bridge.name, e)
+        return False
+    except FileNotFoundError as e:
+        logger.debug("SSH binary not found for fallback test on bridge %s: %s", bridge.name, e)
         return False
 
 
@@ -113,6 +219,7 @@ def is_tunnel_available(
     retries: int = 3,
     retry_pause: float = 2.0,
     progressive: bool = True,
+    probe_timeout: int = 10,
 ) -> bool:
     """Check if SSH via ProxyCommand is available and responsive.
 
@@ -122,6 +229,7 @@ def is_tunnel_available(
         retries: Number of retries if SSH test fails (default: 3)
         retry_pause: Base pause between retries in seconds (default: 2.0)
         progressive: If True, increase pause with each retry (default: True)
+        probe_timeout: Per-attempt SSH connect timeout in seconds (default: 10)
 
     Returns:
         True if SSH via ProxyCommand works, False otherwise
@@ -135,7 +243,7 @@ def is_tunnel_available(
 
     # Test SSH connection with retry
     for attempt in range(retries + 1):
-        if _test_ssh_connection(bridge, config):
+        if _test_ssh_connection(bridge, config, timeout=probe_timeout):
             return True
         if attempt < retries:
             # Progressive: 2s, 3s, 4s for attempts 0, 1, 2
@@ -173,9 +281,7 @@ def generate_ssh_config(
     if not host_aliases:
         host_aliases = [bridge.name]
 
-    # Keep ProxyCommand rendering consistent with runtime SSH command construction
-    # so URL/path quoting is always shell-safe in generated ~/.ssh/config entries.
-    proxy_cmd = _get_proxy_command(bridge, rtunnel_path, quiet=False)
+    proxy_cmd = _get_proxy_command(bridge, rtunnel_path)
 
     ssh_config = f"""Host {' '.join(host_aliases)}
     HostName localhost
@@ -185,6 +291,9 @@ def generate_ssh_config(
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR"""
+
+    if bridge.identity_file:
+        ssh_config += f"\n    IdentityFile {bridge.identity_file}"
 
     return ssh_config
 
@@ -203,7 +312,7 @@ def generate_all_ssh_configs(config: TunnelConfig) -> str:
 
     rtunnel_path = _ensure_rtunnel_binary(config)
     configs = []
-    for bridge in config.list_bridges():
+    for bridge in sorted(config.list_bridges(), key=lambda item: item.name):
         configs.append(generate_ssh_config(bridge, rtunnel_path))
 
     return "\n\n".join(configs)
@@ -229,27 +338,176 @@ def install_ssh_config(ssh_config: str, host_alias: str) -> dict:
     if ssh_config_path.exists():
         existing_content = ssh_config_path.read_text()
 
-    # Check if host alias already exists
-    # Match "Host <alias>" at start of line, possibly with other hosts on same line
-    host_pattern = rf"^Host\s+.*?\b{re.escape(host_alias)}\b.*$"
-    match = re.search(host_pattern, existing_content, re.MULTILINE)
+    blocks = _split_ssh_config_blocks(existing_content)
+    updated = False
+    rendered: list[str] = []
+    for kind, block in blocks:
+        if kind != "host":
+            rendered.append(block)
+            continue
+        if host_alias in _host_aliases_from_block(block):
+            if not updated:
+                rendered.append(ssh_config.rstrip() + "\n")
+                updated = True
+            continue
+        rendered.append(block)
 
-    if match:
-        # Find the full block to replace (from Host line to next Host line or end)
-        block_pattern = rf"(^Host\s+.*?\b{re.escape(host_alias)}\b.*$)((?:\n(?!Host\s).*)*)"
-        new_content = re.sub(block_pattern, ssh_config, existing_content, flags=re.MULTILINE)
-
-        ssh_config_path.write_text(new_content)
-        return {"success": True, "updated": True, "error": None}
-    else:
-        # Append new entry
-        if existing_content and not existing_content.endswith("\n"):
-            existing_content += "\n"
-        if existing_content:
-            existing_content += "\n"
-
-        ssh_config_path.write_text(existing_content + ssh_config + "\n")
+    if not updated:
+        content = "".join(rendered).rstrip()
+        if content:
+            content += "\n\n" + ssh_config.rstrip() + "\n"
+        else:
+            content = ssh_config.rstrip() + "\n"
+        ssh_config_path.write_text(content)
         return {"success": True, "updated": False, "error": None}
+
+    ssh_config_path.write_text("".join(rendered))
+    return {"success": True, "updated": True, "error": None}
+
+
+def _split_ssh_config_blocks(content: str) -> list[tuple[str, str]]:
+    """Split SSH config into ordered raw and Host blocks."""
+    if not content:
+        return []
+
+    lines = content.splitlines(keepends=True)
+    blocks: list[tuple[str, str]] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].startswith("Host "):
+            end = index + 1
+            while end < len(lines) and not lines[end].startswith("Host "):
+                end += 1
+            blocks.append(("host", "".join(lines[index:end])))
+            index = end
+            continue
+        end = index + 1
+        while end < len(lines) and not lines[end].startswith("Host "):
+            end += 1
+        blocks.append(("raw", "".join(lines[index:end])))
+        index = end
+    return blocks
+
+
+def _host_aliases_from_block(block: str) -> list[str]:
+    first_line = block.splitlines()[0] if block.splitlines() else ""
+    parts = first_line.strip().split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+def _is_generated_inspire_host_block(block: str) -> bool:
+    if not block.startswith("Host "):
+        return False
+    return (
+        re.search(r"^\s*HostName\s+localhost\s*$", block, flags=re.MULTILINE) is not None
+        and re.search(r"^\s*StrictHostKeyChecking\s+no\s*$", block, flags=re.MULTILINE) is not None
+        and re.search(r"^\s*UserKnownHostsFile\s+/dev/null\s*$", block, flags=re.MULTILINE)
+        is not None
+        and re.search(r"^\s*LogLevel\s+ERROR\s*$", block, flags=re.MULTILINE) is not None
+        and re.search(
+            r"^\s*ProxyCommand\s+.*(?:rtunnel|localhost:\$PORT|localhost:%p).*$",
+            block,
+            flags=re.MULTILINE,
+        )
+        is not None
+    )
+
+
+def _strip_inspire_generated_entries(
+    content: str,
+    *,
+    managed_aliases: Optional[set[str]] = None,
+) -> str:
+    """Remove managed and legacy Inspire-generated entries."""
+    if not content:
+        return ""
+
+    managed_pattern = (
+        rf"\n?{re.escape(INSPIRE_SSH_BLOCK_BEGIN)}\n.*?\n{re.escape(INSPIRE_SSH_BLOCK_END)}\n?"
+    )
+    content = re.sub(managed_pattern, "\n", content, flags=re.DOTALL)
+
+    if INSPIRE_SSH_LEGACY_HEADER in content:
+        prefix, suffix = content.split(INSPIRE_SSH_LEGACY_HEADER, 1)
+        kept_suffix: list[str] = []
+        dropping_legacy_hosts = True
+        for kind, block in _split_ssh_config_blocks(suffix):
+            if dropping_legacy_hosts and kind == "host":
+                if _is_generated_inspire_host_block(block):
+                    continue
+                dropping_legacy_hosts = False
+                kept_suffix.append(block)
+                continue
+            if dropping_legacy_hosts and kind == "raw":
+                if block.strip():
+                    dropping_legacy_hosts = False
+                    kept_suffix.append(block)
+                continue
+            kept_suffix.append(block)
+        content = prefix.rstrip()
+        suffix_content = "".join(kept_suffix).lstrip("\n")
+        if suffix_content:
+            content = (content + "\n" + suffix_content) if content else suffix_content
+
+    kept: list[str] = []
+    for kind, block in _split_ssh_config_blocks(content):
+        if kind == "raw":
+            kept.append(block)
+            continue
+        if (
+            managed_aliases
+            and _is_generated_inspire_host_block(block)
+            and managed_aliases.intersection(_host_aliases_from_block(block))
+        ):
+            continue
+        kept.append(block)
+
+    rendered = "".join(kept).rstrip()
+    return (rendered + "\n") if rendered else ""
+
+
+def has_installed_ssh_config(ssh_config_path: Optional[Path] = None) -> bool:
+    """Return True when ~/.ssh/config already contains inspire-managed entries."""
+    if ssh_config_path is None:
+        ssh_config_path = Path.home() / ".ssh" / "config"
+    if not ssh_config_path.exists():
+        return False
+
+    content = ssh_config_path.read_text()
+    if INSPIRE_SSH_BLOCK_BEGIN in content or INSPIRE_SSH_LEGACY_HEADER in content:
+        return True
+    return any(
+        kind == "host" and _is_generated_inspire_host_block(block)
+        for kind, block in _split_ssh_config_blocks(content)
+    )
+
+
+def install_all_ssh_configs(config: TunnelConfig) -> dict:
+    """Install all bridge SSH configs as one managed block in ~/.ssh/config."""
+    ssh_config_path = Path.home() / ".ssh" / "config"
+    ssh_config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    existing_content = ssh_config_path.read_text() if ssh_config_path.exists() else ""
+    had_installed_entries = has_installed_ssh_config(ssh_config_path)
+    cleaned_content = _strip_inspire_generated_entries(
+        existing_content,
+        managed_aliases=set(config.bridges.keys()),
+    )
+    all_configs = generate_all_ssh_configs(config) if config.bridges else ""
+
+    managed_block = ""
+    if all_configs:
+        managed_block = f"{INSPIRE_SSH_BLOCK_BEGIN}\n{all_configs}\n{INSPIRE_SSH_BLOCK_END}\n"
+
+    if cleaned_content and managed_block:
+        final_content = cleaned_content.rstrip() + "\n\n" + managed_block
+    elif cleaned_content:
+        final_content = cleaned_content
+    else:
+        final_content = managed_block
+
+    ssh_config_path.write_text(final_content)
+    return {"success": True, "updated": had_installed_entries, "error": None}
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from enum import Enum
 
@@ -39,8 +39,8 @@ class ComputeGroupAvailability:
     online_nodes: int = 0  # resource_pool == "online"
     backup_nodes: int = 0  # resource_pool == "backup"
     fault_nodes: int = 0  # resource_pool == "fault"
-    workspace_id: str = ""
-    workspace_name: str = ""
+    workspace_ids: list[str] = field(default_factory=list)
+    workspace_aliases: list[str] = field(default_factory=list)
 
 
 # Known compute groups for smart allocation
@@ -73,6 +73,8 @@ def _normalize_gpu_type(display_name: str) -> str:
 def fetch_resource_availability(
     config: Optional[Config] = None,
     known_only: bool = False,
+    workspace_ids: Optional[list[str]] = None,
+    workspace_aliases_by_id: Optional[dict[str, list[str]]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     workspace_id: Optional[str] = None,
 ) -> list[ComputeGroupAvailability]:
@@ -111,95 +113,117 @@ def fetch_resource_availability(
     # Update global for backward compatibility
     KNOWN_COMPUTE_GROUPS = known_groups_map
 
+    requested_workspace_ids = [
+        str(ws or "").strip() for ws in (workspace_ids or []) if str(ws or "").strip()
+    ]
+    if workspace_id:
+        requested_workspace_ids.insert(0, str(workspace_id).strip())
+    if not requested_workspace_ids:
+        requested_workspace_ids = [
+            str(get_web_session(require_workspace=True).workspace_id or "").strip()
+        ]
+    requested_workspace_ids = sorted(set(requested_workspace_ids))
+
+    cache_key = f"{'known' if known_only else 'all'}:{','.join(requested_workspace_ids)}"
+    if _availability_cache and (time.time() - _cache_time < _CACHE_TTL):
+        if cache_key in _availability_cache:
+            return _availability_cache[cache_key]
     base_url = None
     if resolved_config is not None:
         base_url = getattr(resolved_config, "base_url", None)
     if not base_url:
-        base_url = os.environ.get("INSPIRE_BASE_URL", "https://api.example.com")
-
-    session = get_web_session(require_workspace=True)
-    effective_workspace_id = workspace_id or getattr(session, "workspace_id", None)
-
-    # Check cache after resolving the effective workspace to avoid cross-workspace leakage.
-    cache_key = f"{effective_workspace_id or ''}|{'known' if known_only else 'all'}"
-    if _availability_cache and (time.time() - _cache_time < _CACHE_TTL):
-        if cache_key in _availability_cache:
-            return _availability_cache[cache_key]
-
-    nodes = fetch_workspace_availability(
-        session,
-        base_url=base_url,
-        workspace_id=effective_workspace_id,
-    )
+        base_url = os.environ.get("INSPIRE_BASE_URL", "https://api.example.com").strip()
 
     groups: dict[str, dict] = {}
-    total = len(nodes)
+    session = get_web_session(require_workspace=True)
+    workspace_aliases_by_id = workspace_aliases_by_id or {}
+    total_workspaces = len(requested_workspace_ids)
 
-    for idx, node in enumerate(nodes):
-        if progress_callback and total:
-            progress_callback(idx + 1, total)
+    for ws_index, workspace_id in enumerate(requested_workspace_ids, start=1):
+        # Intentionally require the workspace-aware signature here.
+        nodes = fetch_workspace_availability(
+            session,
+            base_url=base_url,
+            workspace_id=workspace_id,
+        )
+        if progress_callback and total_workspaces:
+            progress_callback(ws_index, total_workspaces)
 
-        # Only include GPU nodes
-        if node.get("gpu_count", 0) == 0:
-            continue
+        for node in nodes:
+            if node.get("gpu_count", 0) == 0:
+                continue
 
-        group_id = node.get("logic_compute_group_id", "")
-        if not group_id:
-            continue
+            group_id = node.get("logic_compute_group_id", "")
+            if not group_id:
+                continue
 
-        # Skip if known_only and group is not known
-        if known_only and group_id not in known_groups_map:
-            continue
+            if known_only and group_id not in known_groups_map:
+                continue
 
-        if group_id not in groups:
-            gpu_info = node.get("gpu_info", {})
-            gpu_display = gpu_info.get("gpu_type_display", "Unknown")
-            gpu_type = _normalize_gpu_type(gpu_display)
+            if group_id not in groups:
+                gpu_info = node.get("gpu_info", {})
+                gpu_display = gpu_info.get("gpu_type_display", "Unknown")
+                gpu_type = _normalize_gpu_type(gpu_display)
 
-            group_name = node.get("logic_compute_group_name", "")
-            if not group_name and group_id in known_groups_map:
-                group_name = known_groups_map[group_id]
-            if not group_name:
-                group_name = "Unknown"
+                group_name = node.get("logic_compute_group_name", "")
+                if not group_name and group_id in known_groups_map:
+                    group_name = known_groups_map[group_id]
+                if not group_name:
+                    group_name = "Unknown"
 
-            groups[group_id] = {
-                "group_id": group_id,
-                "group_name": group_name,
-                "gpu_type": gpu_type,
-                "gpu_per_node": node.get("gpu_count", 0),
-                "total_nodes": 0,
-                "ready_nodes": 0,
-                "free_nodes": 0,
-                "online_nodes": 0,
-                "backup_nodes": 0,
-                "fault_nodes": 0,
-            }
+                groups[group_id] = {
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "gpu_type": gpu_type,
+                    "gpu_per_node": node.get("gpu_count", 0),
+                    "total_nodes": 0,
+                    "ready_nodes": 0,
+                    "free_nodes": 0,
+                    "online_nodes": 0,
+                    "backup_nodes": 0,
+                    "fault_nodes": 0,
+                    "workspace_ids": [],
+                    "workspace_aliases": [],
+                    "_seen_nodes": set(),
+                }
 
-        groups[group_id]["total_nodes"] += 1
+            group_data = groups[group_id]
+            if workspace_id not in group_data["workspace_ids"]:
+                group_data["workspace_ids"].append(workspace_id)
+            for alias in workspace_aliases_by_id.get(workspace_id, []):
+                if alias not in group_data["workspace_aliases"]:
+                    group_data["workspace_aliases"].append(alias)
 
-        # Count by resource_pool status
-        resource_pool = str(node.get("resource_pool", "unknown")).lower()
-        if resource_pool == "online":
-            groups[group_id]["online_nodes"] += 1
-        elif resource_pool == "backup":
-            groups[group_id]["backup_nodes"] += 1
-        elif resource_pool == "fault":
-            groups[group_id]["fault_nodes"] += 1
+            node_id = str(node.get("node_id") or "").strip()
+            if node_id and node_id in group_data["_seen_nodes"]:
+                continue
+            if node_id:
+                group_data["_seen_nodes"].add(node_id)
 
-        if str(node.get("status", "")).upper() == "READY":
-            groups[group_id]["ready_nodes"] += 1
+            group_data["total_nodes"] += 1
 
-            task_list = node.get("task_list", [])
-            cordon_type = str(node.get("cordon_type", "")).strip()
-            is_maint = node.get("is_maint", False)
-            is_truly_free = (
-                (not task_list or len(task_list) == 0)
-                and not cordon_type  # no cordon (hardware-fault, software-fault, etc.)
-                and not is_maint  # not in maintenance
-                and resource_pool != "fault"  # not in fault pool
-            )
-            if is_truly_free:
-                groups[group_id]["free_nodes"] += 1
+            resource_pool = str(node.get("resource_pool", "unknown")).lower()
+            if resource_pool == "online":
+                group_data["online_nodes"] += 1
+            elif resource_pool == "backup":
+                group_data["backup_nodes"] += 1
+            elif resource_pool == "fault":
+                group_data["fault_nodes"] += 1
+
+            if str(node.get("status", "")).upper() == "READY":
+                group_data["ready_nodes"] += 1
+
+                task_list = node.get("task_list", [])
+                cordon_type = str(node.get("cordon_type", "")).strip()
+                is_maint = node.get("is_maint", False)
+                is_truly_free = (
+                    (not task_list or len(task_list) == 0)
+                    and not cordon_type
+                    and not is_maint
+                    and resource_pool != "fault"
+                )
+                if is_truly_free:
+                    group_data["free_nodes"] += 1
 
     # Convert to ComputeGroupAvailability objects
     availability_list = []
@@ -218,6 +242,8 @@ def fetch_resource_availability(
                 online_nodes=group_data["online_nodes"],
                 backup_nodes=group_data["backup_nodes"],
                 fault_nodes=group_data["fault_nodes"],
+                workspace_ids=list(group_data["workspace_ids"]),
+                workspace_aliases=list(group_data["workspace_aliases"]),
             )
         )
 
