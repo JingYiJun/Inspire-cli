@@ -353,70 +353,76 @@ def test_resources_list_human_output_uses_readable_table(
     )
 
     def fake_get_accurate_gpu_availability(
-        workspace_id=None, session=None, _retry=True
+        workspace_id=None, workspace_ids=None, session=None, _retry=True
     ):  # noqa: ARG001
-        ws_id = str(workspace_id)
-        if ws_id == "ws-gpu":
-            return [
+        entries_by_workspace = {
+            "ws-gpu": [
                 browser_api_module.GPUAvailability(
                     group_id="lcg-h200",
-                    group_name="H200-1号机房",
-                    gpu_type="NVIDIA H200 (141GB)",
+                    group_name="G1",
+                    gpu_type="GPU-A",
                     total_gpus=8,
                     used_gpus=10,
                     available_gpus=-2,
                     low_priority_gpus=1,
+                    workspace_ids=["ws-gpu"],
                 )
-            ]
-        if ws_id == "ws-net":
-            return [
+            ],
+            "ws-net": [
                 browser_api_module.GPUAvailability(
                     group_id="lcg-4090",
-                    group_name="4090",
-                    gpu_type="NVIDIA 4090 (48GB)",
+                    group_name="G2",
+                    gpu_type="GPU-B",
                     total_gpus=8,
                     used_gpus=2,
                     available_gpus=6,
                     low_priority_gpus=0,
+                    workspace_ids=["ws-net"],
                 )
-            ]
-        if ws_id == "ws-cpu":
-            return [
+            ],
+            "ws-cpu": [
                 browser_api_module.GPUAvailability(
                     group_id="lcg-cpu",
-                    group_name="CPU资源",
+                    group_name="C0",
                     gpu_type="CPU",
                     total_gpus=0,
                     used_gpus=0,
                     available_gpus=0,
                     low_priority_gpus=0,
+                    workspace_ids=["ws-cpu"],
                 )
-            ]
-        if ws_id == "ws-hpc":
-            return [
+            ],
+            "ws-hpc": [
                 browser_api_module.GPUAvailability(
                     group_id="lcg-hpc",
-                    group_name="高性能计算",
+                    group_name="H0",
                     gpu_type="CPU",
                     total_gpus=0,
                     used_gpus=0,
                     available_gpus=0,
                     low_priority_gpus=0,
+                    workspace_ids=["ws-hpc"],
                 )
-            ]
-        if ws_id == "ws-ascend":
-            return [
+            ],
+            "ws-ascend": [
                 browser_api_module.GPUAvailability(
                     group_id="lcg-ascend",
-                    group_name="推理池",
-                    gpu_type="ASCEND 910B (64GB)",
+                    group_name="N1",
+                    gpu_type="NPU-A",
                     total_gpus=64,
                     used_gpus=32,
                     available_gpus=32,
                     low_priority_gpus=0,
+                    workspace_ids=["ws-ascend"],
                 )
-            ]
-        return []
+            ],
+        }
+        if workspace_ids is not None:
+            merged = []
+            for ws_id in workspace_ids:
+                merged.extend(entries_by_workspace.get(str(ws_id), []))
+            return merged
+        return entries_by_workspace.get(str(workspace_id), [])
 
     monkeypatch.setattr(
         browser_api_module,
@@ -427,14 +433,17 @@ def test_resources_list_human_output_uses_readable_table(
     runner = CliRunner()
     result = runner.invoke(cli_main, ["resources", "list", "--all"])
     assert result.exit_code == 0
-    assert "GPU Resources" in result.output
-    assert "CPU Resources" in result.output
-    assert "ASCEND Resources" in result.output
     assert "Resource Type" in result.output
-    assert "H200-1号机房" in result.output
-    assert "高性能计算" in result.output
-    assert "推理池" in result.output
+    assert "G1" in result.output
+    assert "N1" in result.output
     assert "Available" in result.output
+    assert "GPU Resources" not in result.output
+    assert "CPU Resources" not in result.output
+    assert "ASCEND Resources" not in result.output
+    assert "TOTAL" not in result.output
+    assert "C0" not in result.output
+    assert "H0" not in result.output
+    assert "────────" in result.output
     assert "平台接口返回的统计异常或短暂超卖" in result.output
 
 
@@ -479,8 +488,9 @@ def test_resources_list_cpu_summary_uses_workspace_nodes(
             return [
                 {
                     "logic_compute_group_id": "lcg-cpu",
-                    "logic_compute_group_name": "CPU资源",
+                    "logic_compute_group_name": "C1",
                     "cpu_count": 64,
+                    "cpu": {"available": 40},
                     "task_list": [],
                     "cordon_type": "",
                     "is_maint": False,
@@ -488,8 +498,9 @@ def test_resources_list_cpu_summary_uses_workspace_nodes(
                 },
                 {
                     "logic_compute_group_id": "lcg-cpu",
-                    "logic_compute_group_name": "CPU资源",
+                    "logic_compute_group_name": "C1",
                     "cpu_count": 64,
+                    "cpu": {"available": 16},
                     "task_list": [{"job_id": "job-1"}],
                     "cordon_type": "",
                     "is_maint": False,
@@ -500,8 +511,9 @@ def test_resources_list_cpu_summary_uses_workspace_nodes(
             return [
                 {
                     "logic_compute_group_id": "lcg-hpc",
-                    "logic_compute_group_name": "高性能计算",
+                    "logic_compute_group_name": "C2",
                     "cpu_count": 56,
+                    "cpu": {"available": 28},
                     "task_list": [],
                     "cordon_type": "",
                     "is_maint": False,
@@ -519,11 +531,13 @@ def test_resources_list_cpu_summary_uses_workspace_nodes(
     runner = CliRunner()
     result = runner.invoke(cli_main, ["resources", "list", "--all"])
     assert result.exit_code == 0
-    assert "CPU Resources" in result.output
-    assert "CPU资源" in result.output
-    assert "高性能计算" in result.output
-    assert "64" in result.output
-    assert "56" in result.output
+    cpu_line = next(line for line in result.output.splitlines() if "C1" in line)
+    hpc_line = next(line for line in result.output.splitlines() if "C2" in line)
+    assert "56" in cpu_line
+    assert "72" in cpu_line
+    assert "128" in cpu_line
+    assert "28" in hpc_line
+    assert "56" in hpc_line
 
 
 def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
@@ -568,7 +582,7 @@ def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
             return [
                 browser_api_module.GPUAvailability(
                     group_id="lcg-unknown",
-                    group_name="4090-cuda12.4",
+                    group_name="UNK",
                     gpu_type="",
                     total_gpus=0,
                     used_gpus=0,
@@ -577,8 +591,8 @@ def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
                 ),
                 browser_api_module.GPUAvailability(
                     group_id="lcg-4090",
-                    group_name="4090",
-                    gpu_type="NVIDIA 4090 (48GB)",
+                    group_name="KN",
+                    gpu_type="GPU-X",
                     total_gpus=8,
                     used_gpus=8,
                     available_gpus=0,
@@ -596,7 +610,8 @@ def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
     runner = CliRunner()
     result = runner.invoke(cli_main, ["resources", "list", "--all"])
     assert result.exit_code == 0
-    assert result.output.index("4090") < result.output.index("4090-cuda12.4")
+    assert "KN" in result.output
+    assert "UNK" not in result.output
 
 
 def test_resources_list_queries_configured_workspaces_by_default(

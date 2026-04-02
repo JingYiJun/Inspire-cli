@@ -311,6 +311,32 @@ def _display_available(item) -> int:  # noqa: ANN001
     return max(int(getattr(item, "available_gpus", 0)), 0)
 
 
+def _has_positive_total(item) -> bool:  # noqa: ANN001
+    return int(getattr(item, "total_gpus", 0) or 0) > 0
+
+
+def _specs_text_for_item(
+    item, specs_by_key: dict[tuple[str, str], str] | None = None  # noqa: ANN001
+) -> str:
+    if specs_by_key is None:
+        return "-"
+    return specs_by_key.get(
+        (
+            str(getattr(item, "workspace_id", "") or ""),
+            str(getattr(item, "group_id", "") or ""),
+        ),
+        "-",
+    )
+
+
+def _should_render_accurate_item(
+    item, specs_by_key: dict[tuple[str, str], str] | None = None  # noqa: ANN001
+) -> bool:
+    if _has_positive_total(item):
+        return True
+    return _specs_text_for_item(item, specs_by_key) != "-"
+
+
 def _resource_type_sort_key(item) -> tuple[int, str]:  # noqa: ANN001
     resource_type = str(getattr(item, "gpu_type", "") or "").strip()
     normalized = resource_type.upper()
@@ -671,49 +697,80 @@ def _render_accurate_fallback(
     *,
     specs_by_key: dict[tuple[str, str], str] | None = None,
 ) -> None:
-    bucket_titles = {
-        "gpu": "GPU Resources",
-        "cpu": "CPU Resources",
-        "ascend": "ASCEND Resources",
-    }
-    bucketed = {key: [] for key in bucket_titles}
+    bucketed = {"gpu": [], "cpu": [], "ascend": []}
     for item in _sorted_accurate_availability(availability):
+        if not _should_render_accurate_item(item, specs_by_key):
+            continue
         bucketed[_resource_bucket(item, config)].append(item)
     specs_by_key = specs_by_key or {}
+    visible_items = [item for items in bucketed.values() for item in items]
+    show_workspace = _workspace_column_enabled(visible_items)
+    if not visible_items:
+        return
 
+    header_parts = []
+    if show_workspace:
+        header_parts.append("Workspace")
+    header_parts.extend(
+        [
+            "Resource Type",
+            "Compute Group",
+            "Available",
+            "Used",
+            "Low Pri",
+            "Total",
+            "Schedulable Specs",
+            "Status",
+        ]
+    )
+    click.echo("  ".join(header_parts))
+
+    first_bucket = True
     for bucket in ("gpu", "cpu", "ascend"):
         items = bucketed[bucket]
         if not items:
             continue
-        click.echo(f"\n{bucket_titles[bucket]}")
+        if not first_bucket:
+            click.echo("-" * 120)
+        first_bucket = False
         for item in items:
-            workspace_prefix = ""
-            if _workspace_column_enabled(availability):
-                workspace_prefix = f"[{getattr(item, 'workspace_name', '-')}] "
-            specs_text = specs_by_key.get(
-                (
-                    str(getattr(item, "workspace_id", "") or ""),
-                    str(getattr(item, "group_id", "") or ""),
-                ),
-                "-",
+            specs_text = _specs_text_for_item(item, specs_by_key)
+            columns: list[str] = []
+            if show_workspace:
+                columns.append(str(getattr(item, "workspace_name", "") or "-"))
+            columns.extend(
+                [
+                    str(item.gpu_type or "-"),
+                    str(item.group_name or "-"),
+                    str(max(item.available_gpus, 0)),
+                    str(item.used_gpus),
+                    str(item.low_priority_gpus),
+                    str(item.total_gpus),
+                    specs_text,
+                    str(_status_text(max(int(getattr(item, "available_gpus", 0) or 0), 0))),
+                ]
             )
-            click.echo(
-                f"{workspace_prefix}{item.group_name}: {item.gpu_type or '-'} | "
-                f"available={max(item.available_gpus, 0)} used={item.used_gpus} "
-                f"low_pri={item.low_priority_gpus} total={item.total_gpus} specs={specs_text}"
-            )
+            click.echo("  ".join(columns))
 
 
 def _render_accurate_rich_table(
     console: Console,
-    items: list,
+    availability: list,
     *,
-    title: str,
+    config: Optional[Config],
     show_workspace: bool,
     specs_by_key: dict[tuple[str, str], str] | None = None,
 ) -> None:
+    bucketed = {"gpu": [], "cpu": [], "ascend": []}
+    for item in _sorted_accurate_availability(availability):
+        if not _should_render_accurate_item(item, specs_by_key):
+            continue
+        bucketed[_resource_bucket(item, config)].append(item)
+
+    if not any(bucketed.values()):
+        return
+
     table = Table(
-        title=title,
         box=box.SIMPLE_HEAVY,
         show_header=True,
         header_style="bold magenta",
@@ -729,69 +786,50 @@ def _render_accurate_rich_table(
     table.add_column("Schedulable Specs", style="yellow")
     table.add_column("Status", justify="center", no_wrap=True)
 
-    total_available = 0
-    total_used = 0
-    total_low_pri = 0
-    total_gpus = 0
-
-    for item in items:
-        actual_available = int(getattr(item, "available_gpus", 0))
-        display_available = max(actual_available, 0)
-        row = []
-        if show_workspace:
-            row.append(str(getattr(item, "workspace_name", "") or "-"))
-        specs_text = "-"
-        if specs_by_key is not None:
-            specs_text = specs_by_key.get(
-                (
-                    str(getattr(item, "workspace_id", "") or ""),
-                    str(getattr(item, "group_id", "") or ""),
-                ),
-                "-",
-            )
-        row.extend(
-            [
-                str(item.gpu_type or "-"),
-                str(item.group_name or "-"),
-                str(display_available),
-                str(item.used_gpus),
-                str(item.low_priority_gpus),
-                str(item.total_gpus),
-                specs_text,
-                _status_text(display_available),
-            ]
-        )
-        table.add_row(*row)
-
-        total_available += display_available
-        total_used += item.used_gpus
-        total_low_pri += item.low_priority_gpus
-        total_gpus += item.total_gpus
-
-    table.add_section()
+    specs_by_key = specs_by_key or {}
+    separator_row = []
     if show_workspace:
-        table.add_row(
-            "TOTAL",
-            "",
-            "",
-            str(max(total_available, 0)),
-            str(total_used),
-            str(total_low_pri),
-            str(total_gpus),
-            "",
-            "",
-        )
-    else:
-        table.add_row(
-            "TOTAL",
-            "",
-            str(max(total_available, 0)),
-            str(total_used),
-            str(total_low_pri),
-            str(total_gpus),
-            "",
-            "",
-        )
+        separator_row.append(Text("────────", style="dim"))
+    separator_row.extend(
+        [
+            Text("────────", style="dim"),
+            Text("────────", style="dim"),
+            Text("────", style="dim"),
+            Text("────", style="dim"),
+            Text("────", style="dim"),
+            Text("────", style="dim"),
+            Text("────────", style="dim"),
+            Text("────", style="dim"),
+        ]
+    )
+    first_bucket = True
+    for bucket in ("gpu", "cpu", "ascend"):
+        items = bucketed[bucket]
+        if not items:
+            continue
+        if not first_bucket:
+            table.add_row(*separator_row, end_section=True)
+        first_bucket = False
+        for item in items:
+            actual_available = int(getattr(item, "available_gpus", 0))
+            display_available = max(actual_available, 0)
+            row = []
+            if show_workspace:
+                row.append(str(getattr(item, "workspace_name", "") or "-"))
+            specs_text = _specs_text_for_item(item, specs_by_key)
+            row.extend(
+                [
+                    str(item.gpu_type or "-"),
+                    str(item.group_name or "-"),
+                    str(display_available),
+                    str(item.used_gpus),
+                    str(item.low_priority_gpus),
+                    str(item.total_gpus),
+                    specs_text,
+                    _status_text(display_available),
+                ]
+            )
+            table.add_row(*row)
 
     console.print(table)
 
@@ -885,14 +923,6 @@ def _format_accurate_availability_table(
     config: Optional[Config] = None,
     session=None,  # noqa: ANN001
 ) -> None:
-    bucket_titles = {
-        "gpu": "GPU Resources",
-        "cpu": "CPU Resources",
-        "ascend": "ASCEND Resources",
-    }
-    bucketed = {key: [] for key in bucket_titles}
-    for item in _sorted_accurate_availability(availability):
-        bucketed[_resource_bucket(item, config)].append(item)
     specs_by_key: dict[tuple[str, str], str] = {}
     if session is not None:
         specs_by_key = {
@@ -912,19 +942,17 @@ def _format_accurate_availability_table(
         return
 
     console = _make_console()
-    show_workspace = _workspace_column_enabled(availability)
-
-    for bucket in ("gpu", "cpu", "ascend"):
-        items = bucketed[bucket]
-        if not items:
-            continue
-        _render_accurate_rich_table(
-            console,
-            items,
-            title=bucket_titles[bucket],
-            show_workspace=show_workspace,
-            specs_by_key=specs_by_key,
-        )
+    visible_items = [
+        item for item in availability if _should_render_accurate_item(item, specs_by_key)
+    ]
+    show_workspace = _workspace_column_enabled(visible_items)
+    _render_accurate_rich_table(
+        console,
+        visible_items,
+        config=config,
+        show_workspace=show_workspace,
+        specs_by_key=specs_by_key,
+    )
 
     console.print("[bold]说明[/bold]")
     console.print("  • Available：当前空闲可用 GPU")
@@ -1392,6 +1420,8 @@ class CPUResourceSummary:
     group_name: str
     cpu_per_node_min: int | None = None
     cpu_per_node_max: int | None = None
+    total_cpu_cores: int = 0
+    available_cpu_cores: int = 0
     spec_cpu_min: int | None = None
     spec_cpu_max: int | None = None
     spec_memory_gib_min: int | None = None
@@ -1643,6 +1673,15 @@ def _is_node_free(node: dict) -> bool:
     )
 
 
+def _is_cpu_node_ready(node: dict) -> bool:
+    status = str(node.get("status") or "").upper()
+    if not status:
+        return not node.get("is_maint", False) and str(node.get("resource_pool") or "").lower() != (
+            "fault"
+        )
+    return status == "READY"
+
+
 def _collect_cpu_node_summaries(
     *,
     config: Config | None,
@@ -1688,11 +1727,21 @@ def _collect_cpu_node_summaries(
                 summary.cpu_per_node_max,
                 cpu_value,
             )
+            if cpu_value is not None:
+                summary.total_cpu_cores += cpu_value
             summary.total_nodes += 1
 
-            if str(node.get("status") or "").upper() == "READY":
+            if _is_cpu_node_ready(node):
+                is_free = _is_node_free(node)
                 summary.ready_nodes += 1
-                if _is_node_free(node):
+                available_cpu = node.get("cpu", {}).get("available")
+                available_cpu_value = int(available_cpu or 0) if available_cpu is not None else None
+                if available_cpu_value is not None:
+                    summary.available_cpu_cores += max(available_cpu_value, 0)
+                elif is_free:
+                    if cpu_value is not None:
+                        summary.available_cpu_cores += cpu_value
+                if is_free:
                     summary.free_nodes += 1
 
     return summaries
@@ -1789,6 +1838,8 @@ def _merge_cpu_resources(
                 target.cpu_per_node_max,
                 entry.cpu_per_node_max,
             )
+            target.total_cpu_cores += entry.total_cpu_cores
+            target.available_cpu_cores += entry.available_cpu_cores
             target.spec_cpu_min, target.spec_cpu_max = _update_range(
                 target.spec_cpu_min,
                 target.spec_cpu_max,
@@ -1857,6 +1908,8 @@ def _cpu_resources_to_json(cpu_resources: list[CPUResourceSummary]) -> list[dict
             "workspace_aliases": item.workspace_aliases,
             "cpu_per_node_min": item.cpu_per_node_min,
             "cpu_per_node_max": item.cpu_per_node_max,
+            "total_cpu_cores": item.total_cpu_cores,
+            "available_cpu_cores": item.available_cpu_cores,
             "spec_cpu_min": item.spec_cpu_min,
             "spec_cpu_max": item.spec_cpu_max,
             "spec_memory_gib_min": item.spec_memory_gib_min,
@@ -1937,6 +1990,7 @@ def _collect_accurate_availability_compat(
     try:
         availability = browser_api_module.get_accurate_gpu_availability(
             workspace_ids=workspace_ids,
+            session=session,
         )
         _apply_workspace_aliases(availability, aliases_by_id)
         for item in availability:
@@ -1976,8 +2030,11 @@ def _cpu_resources_as_availability(
     for item in cpu_resources:
         workspace_id = item.workspace_ids[0] if item.workspace_ids else ""
         workspace_name = _workspace_label(config, session, workspace_id) if workspace_id else ""
-        total = item.cpu_per_node_max or item.spec_cpu_max or 0
-        free = item.cpu_per_node_min or item.spec_cpu_min or 0
+        total = item.total_cpu_cores
+        free = min(max(item.available_cpu_cores, 0), total)
+        if total <= 0:
+            total = item.cpu_per_node_max or item.spec_cpu_max or 0
+            free = item.cpu_per_node_min or item.spec_cpu_min or 0
         entry = browser_api_module.GPUAvailability(
             group_id=item.group_id,
             group_name=item.group_name,
@@ -1993,6 +2050,21 @@ def _cpu_resources_as_availability(
         setattr(entry, "workspace_aliases", list(item.workspace_aliases))
         converted.append(entry)
     return converted
+
+
+def _merge_cpu_resource_availability(
+    raw_availability: list,
+    cpu_resources: list[CPUResourceSummary],
+    *,
+    config: Config | None,
+    session,
+) -> list:
+    non_cpu_items = [item for item in raw_availability if _resource_bucket(item, config) != "cpu"]
+    return non_cpu_items + _cpu_resources_as_availability(
+        cpu_resources,
+        config=config,
+        session=session,
+    )
 
 
 def _list_accurate_resources(ctx: Context, show_all: bool) -> None:
@@ -2046,17 +2118,12 @@ def _list_accurate_resources(ctx: Context, show_all: bool) -> None:
             )
             return
 
-        render_availability = list(raw_availability)
-        if not any(
-            str(getattr(item, "gpu_type", "") or "").upper() == "CPU" for item in raw_availability
-        ):
-            render_availability.extend(
-                _cpu_resources_as_availability(
-                    cpu_resources,
-                    config=config,
-                    session=session,
-                )
-            )
+        render_availability = _merge_cpu_resource_availability(
+            raw_availability,
+            cpu_resources,
+            config=config,
+            session=session,
+        )
         has_browser_auth = bool(getattr(session, "cookies", None)) or bool(
             (getattr(session, "storage_state", None) or {}).get("cookies")
         )
@@ -2224,7 +2291,8 @@ def run_resources_list(
                     )
                 )
                 return
-            render_availability = availability + _cpu_resources_as_availability(
+            render_availability = _merge_cpu_resource_availability(
+                availability,
                 cpu_resources,
                 config=config,
                 session=session,
