@@ -540,6 +540,149 @@ def test_resources_list_cpu_summary_uses_workspace_nodes(
     assert "56" in hpc_line
 
 
+def test_resources_list_ignores_cpu_rows_outside_cpu_hpc_workspaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+    config, _ = config_module.Config.from_files_and_env(require_credentials=False)
+    config.workspace_cpu_id = "ws-cpu"
+    config.workspace_gpu_id = "ws-gpu"
+    config.workspaces = {
+        "cpu": "ws-cpu",
+        "gpu": "ws-gpu",
+        "ascend": "ws-asc",
+    }
+
+    class FakeSession:
+        workspace_id = "ws-gpu"
+        all_workspace_ids = None
+        all_workspace_names = {
+            "ws-cpu": "WCPU",
+            "ws-gpu": "WGPU",
+            "ws-asc": "WASC",
+        }
+        storage_state = {"cookies": [{"name": "a", "value": "b"}]}
+        cookies = {}
+
+    monkeypatch.setattr(
+        web_session_module, "get_web_session", lambda *args, **kwargs: FakeSession()
+    )
+    monkeypatch.setattr(
+        resources_list_module,
+        "get_web_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    def fake_get_accurate_gpu_availability(
+        workspace_id=None, session=None, _retry=True
+    ):  # noqa: ARG001
+        if workspace_id == "ws-gpu":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-gpu",
+                    group_name="G-A",
+                    gpu_type="GPU-A",
+                    total_gpus=8,
+                    used_gpus=2,
+                    available_gpus=6,
+                    low_priority_gpus=0,
+                )
+            ]
+        if workspace_id == "ws-asc":
+            return [
+                browser_api_module.GPUAvailability(
+                    group_id="lcg-asc",
+                    group_name="N-A",
+                    gpu_type="NPU-A",
+                    total_gpus=16,
+                    used_gpus=8,
+                    available_gpus=8,
+                    low_priority_gpus=0,
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_accurate_gpu_availability",
+        fake_get_accurate_gpu_availability,
+    )
+
+    def fake_fetch_workspace_availability(session, *, base_url, workspace_id):  # noqa: ARG001
+        if workspace_id == "ws-cpu":
+            return [
+                {
+                    "logic_compute_group_id": "lcg-cpu",
+                    "logic_compute_group_name": "C-A",
+                    "gpu_count": 0,
+                    "cpu_count": 64,
+                    "cpu": {"available": 32},
+                    "task_list": [],
+                    "cordon_type": "",
+                    "is_maint": False,
+                    "resource_pool": "online",
+                }
+            ]
+        if workspace_id == "ws-gpu":
+            return [
+                {
+                    "logic_compute_group_id": "lcg-zero",
+                    "logic_compute_group_name": "G-ZERO",
+                    "gpu_count": 0,
+                    "cpu_count": 184,
+                    "task_list": [],
+                    "cordon_type": "",
+                    "is_maint": False,
+                    "resource_pool": "unknown",
+                    "status": "SCHEDULING_DISABLED",
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(
+        resources_list_module,
+        "fetch_workspace_availability",
+        fake_fetch_workspace_availability,
+    )
+
+    def fake_list_notebook_compute_groups(workspace_id=None, session=None):  # noqa: ARG001
+        if workspace_id == "ws-asc":
+            return [{"logic_compute_group_id": "lcg-asc", "name": "N-A"}]
+        if workspace_id == "ws-cpu":
+            return [{"logic_compute_group_id": "lcg-cpu", "name": "C-A"}]
+        return []
+
+    monkeypatch.setattr(
+        browser_api_module,
+        "list_notebook_compute_groups",
+        fake_list_notebook_compute_groups,
+    )
+
+    def fake_get_resource_prices(
+        workspace_id=None, logic_compute_group_id="", session=None
+    ):  # noqa: ARG001
+        if workspace_id == "ws-asc" and logic_compute_group_id == "lcg-asc":
+            return [
+                {"gpu_count": 0, "cpu_count": 32, "memory_size_gib": 256},
+                {"gpu_count": 0, "cpu_count": 6, "memory_size_gib": 100},
+            ]
+        if workspace_id == "ws-cpu" and logic_compute_group_id == "lcg-cpu":
+            return [{"gpu_count": 0, "cpu_count": 32, "memory_size_gib": 128}]
+        return []
+
+    monkeypatch.setattr(browser_api_module, "get_resource_prices", fake_get_resource_prices)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["resources", "list", "--all"])
+
+    assert result.exit_code == 0
+    assert "C-A" in result.output
+    assert "G-ZERO" not in result.output
+    assert "WCPU" in result.output
+    assert "N-A" in result.output
+    assert result.output.count("CPU") == 2
+
+
 def test_resources_list_sorts_unknown_resource_type_last_within_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

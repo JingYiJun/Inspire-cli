@@ -1457,7 +1457,35 @@ def _workspace_aliases_by_id(config: Config | None) -> dict[str, list[str]]:
         aliases_by_id.setdefault(workspace_id, [])
         if alias not in aliases_by_id[workspace_id]:
             aliases_by_id[workspace_id].append(alias)
+    explicit_aliases = {
+        "cpu": getattr(config, "workspace_cpu_id", None),
+        "hpc": getattr(config, "workspace_hpc_id", None),
+    }
+    for alias, raw_workspace_id in explicit_aliases.items():
+        workspace_id = str(raw_workspace_id or "").strip()
+        if not workspace_id:
+            continue
+        aliases_by_id.setdefault(workspace_id, [])
+        if alias not in aliases_by_id[workspace_id]:
+            aliases_by_id[workspace_id].append(alias)
     return aliases_by_id
+
+
+def _workspace_supports_cpu_summary(
+    workspace_id: str,
+    *,
+    config: Config | None,
+    aliases_by_id: dict[str, list[str]],
+) -> bool:
+    normalized_workspace_id = str(workspace_id or "").strip()
+    if not normalized_workspace_id:
+        return False
+    if normalized_workspace_id == str(getattr(config, "workspace_cpu_id", "") or "").strip():
+        return True
+    if normalized_workspace_id == str(getattr(config, "workspace_hpc_id", "") or "").strip():
+        return True
+    aliases = set(aliases_by_id.get(normalized_workspace_id, []))
+    return bool(aliases & {"cpu", "hpc"})
 
 
 def _enumerate_accessible_workspace_ids(session) -> list[str]:  # noqa: ANN001
@@ -1693,6 +1721,12 @@ def _collect_cpu_node_summaries(
     summaries: dict[str, CPUResourceSummary] = {}
 
     for workspace_id in workspace_ids:
+        if not _workspace_supports_cpu_summary(
+            workspace_id,
+            config=config,
+            aliases_by_id=aliases_by_id,
+        ):
+            continue
         try:
             nodes = fetch_workspace_availability(
                 session,
@@ -1757,6 +1791,12 @@ def _collect_cpu_spec_summaries(
     seen_workspace_group_pairs: set[tuple[str, str]] = set()
 
     for workspace_id in workspace_ids:
+        if not _workspace_supports_cpu_summary(
+            workspace_id,
+            config=None,
+            aliases_by_id=aliases_by_id,
+        ):
+            continue
         try:
             groups = browser_api_module.list_notebook_compute_groups(
                 workspace_id=workspace_id,
