@@ -31,11 +31,13 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.opencode/
 
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
+.hypothesis/
 
 # Local cache
 .inspire/
@@ -54,3 +56,6 @@ AGENTS.md
 scripts/
 API_ENDPOINTS.md
 .playwright-cli/
+
+# Local-only workflow used for ad-hoc live tests
+.forgejo/workflows/live-cold-notebook-ssh.yml
