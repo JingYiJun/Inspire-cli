@@ -1456,9 +1456,11 @@ def _resolve_resources_workspace_scope(
     config: Config | None,
     show_all: bool,
     all_workspaces: bool = False,
+    session=None,  # noqa: ANN001
 ) -> tuple[list[str], dict[str, list[str]], str]:
     aliases_by_id = _workspace_aliases_by_id(config)
-    session = get_web_session(require_workspace=True)
+    if session is None:
+        session = get_web_session(require_workspace=True)
     configured_workspace_ids = _dedupe_ordered(
         list((getattr(config, "workspaces", None) or {}).values()) if config else []
     )
@@ -1646,8 +1648,8 @@ def _collect_cpu_node_summaries(
     config: Config | None,
     workspace_ids: list[str],
     aliases_by_id: dict[str, list[str]],
+    session,  # noqa: ANN001
 ) -> dict[str, CPUResourceSummary]:
-    session = get_web_session(require_workspace=True)
     base_url = _group_base_url(config)
     summaries: dict[str, CPUResourceSummary] = {}
 
@@ -1700,13 +1702,17 @@ def _collect_cpu_spec_summaries(
     *,
     workspace_ids: list[str],
     aliases_by_id: dict[str, list[str]],
+    session,  # noqa: ANN001
 ) -> dict[str, CPUResourceSummary]:
     summaries: dict[str, CPUResourceSummary] = {}
     seen_workspace_group_pairs: set[tuple[str, str]] = set()
 
     for workspace_id in workspace_ids:
         try:
-            groups = browser_api_module.list_notebook_compute_groups(workspace_id=workspace_id)
+            groups = browser_api_module.list_notebook_compute_groups(
+                workspace_id=workspace_id,
+                session=session,
+            )
         except Exception:
             continue
         for group in groups:
@@ -1722,6 +1728,7 @@ def _collect_cpu_spec_summaries(
                 prices = browser_api_module.get_resource_prices(
                     workspace_id=workspace_id,
                     logic_compute_group_id=group_id,
+                    session=session,
                 )
             except Exception:
                 continue
@@ -1825,15 +1832,18 @@ def _collect_cpu_resources(
     config: Config | None,
     workspace_ids: list[str],
     aliases_by_id: dict[str, list[str]],
+    session,  # noqa: ANN001
 ) -> list[CPUResourceSummary]:
     live_cpu = _collect_cpu_node_summaries(
         config=config,
         workspace_ids=workspace_ids,
         aliases_by_id=aliases_by_id,
+        session=session,
     )
     spec_cpu = _collect_cpu_spec_summaries(
         workspace_ids=workspace_ids,
         aliases_by_id=aliases_by_id,
+        session=session,
     )
     return _merge_cpu_resources(live_cpu, spec_cpu)
 
@@ -1993,6 +2003,7 @@ def _list_accurate_resources(ctx: Context, show_all: bool) -> None:
             config=config,
             show_all=show_all,
             all_workspaces=False,
+            session=session,
         )
         raw_availability = _collect_accurate_availability_compat(
             config=config,
@@ -2005,6 +2016,7 @@ def _list_accurate_resources(ctx: Context, show_all: bool) -> None:
             config=config,
             workspace_ids=workspace_ids,
             aliases_by_id=aliases_by_id,
+            session=session,
         )
 
         if ctx.json_output:
@@ -2064,10 +2076,12 @@ def _list_workspace_resources(ctx: Context, show_all: bool, no_cache: bool) -> N
             clear_availability_cache()
 
         config = _load_optional_config()
+        session = get_web_session(require_workspace=True)
         workspace_ids, aliases_by_id, _scope_note = _resolve_resources_workspace_scope(
             config=config,
             show_all=show_all,
             all_workspaces=False,
+            session=session,
         )
         availability = fetch_resource_availability(
             config=config,
@@ -2079,6 +2093,7 @@ def _list_workspace_resources(ctx: Context, show_all: bool, no_cache: bool) -> N
             config=config,
             workspace_ids=workspace_ids,
             aliases_by_id=aliases_by_id,
+            session=session,
         )
 
         if ctx.json_output:
@@ -2167,6 +2182,7 @@ def run_resources_list(
             config=config,
             show_all=show_all,
             all_workspaces=True,
+            session=session,
         )
         try:
             availability = _collect_accurate_availability_compat(
@@ -2180,6 +2196,7 @@ def run_resources_list(
                 config=config,
                 workspace_ids=workspace_ids,
                 aliases_by_id=aliases_by_id,
+                session=session,
             )
             if ctx.json_output:
                 output = [

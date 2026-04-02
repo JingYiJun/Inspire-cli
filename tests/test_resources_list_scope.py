@@ -124,6 +124,46 @@ def test_resources_list_defaults_to_configured_workspaces(monkeypatch) -> None:
     ]
 
 
+def test_resources_list_summary_reuses_single_session(monkeypatch) -> None:
+    config = SimpleNamespace(workspaces={"gpu": "ws-gpu"})
+    session = SimpleNamespace(
+        workspace_id="ws-gpu",
+        all_workspace_ids=["ws-gpu"],
+        all_workspace_names={},
+    )
+    calls = {"count": 0, "cpu_session": None}
+
+    _patch_config(monkeypatch, config)
+
+    def fake_get_web_session(require_workspace=False):  # noqa: ANN001
+        calls["count"] += 1
+        return session
+
+    monkeypatch.setattr(resources_list_module, "get_web_session", fake_get_web_session)
+    monkeypatch.setattr(
+        resources_list_module.browser_api_module,
+        "get_accurate_gpu_availability",
+        lambda **kwargs: [],
+    )
+
+    def fake_collect_cpu_resources(**kwargs):  # noqa: ANN003
+        calls["cpu_session"] = kwargs["session"]
+        return []
+
+    monkeypatch.setattr(
+        resources_list_module,
+        "_collect_cpu_resources",
+        fake_collect_cpu_resources,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "resources", "list"])
+
+    assert result.exit_code == 0
+    assert calls["count"] == 1
+    assert calls["cpu_session"] is session
+
+
 def test_resources_list_all_expands_to_all_accessible_workspaces(monkeypatch) -> None:
     config = SimpleNamespace(workspaces={"gpu": "ws-gpu"})
     session = SimpleNamespace(
