@@ -5,33 +5,35 @@
 - CLI entry point: `inspire/cli/main.py`; top-level command registration is in `inspire/cli/commands/__init__.py`.
 - CLI command modules live in `inspire/cli/commands/`:
   - Group packages: `bridge/`, `config/`, `hpc/`, `image/`, `init/`, `job/`, `notebook/`, `project/`, `resources/`, `tunnel/`
-  - Top-level command modules: `run.py`, `sync.py`
+  - Top-level command modules: `run.py`, `sync.py`, `mount.py`
 - Command package conventions:
   - Most groups use thin `__init__.py` files (Click group + `add_command` calls), with implementation in submodules.
   - `init` is the exception: command implementation is in `init/init_cmd.py`; `init/__init__.py` is a stable import surface used by tests.
 - Current command implementation map:
   - `bridge/`: `exec_cmd.py`, `ssh_cmd.py`, `scp_cmd.py`
-  - `tunnel/`: `add.py`, `remove.py`, `status.py`, `list_cmd.py`, `update.py`, `set_default.py`, `ssh_config.py`, `test_cmd.py`
-  - `config/`: `check.py`, `show.py`, `env_cmd.py`
+  - `tunnel/`: `add.py`, `remove.py`, `status.py`, `list_cmd.py`, `update.py`, `set_default.py`, `ssh_config.py`, `_ssh_config_sync.py`, `test_cmd.py`, `migrate.py`
+  - `config/`: `check.py`, `show.py`, `env_cmd.py`, `set_cmd.py`
   - `hpc/`: `hpc_create.py`, `hpc_commands.py`
-  - `init/`: `init_cmd.py`, `discover.py`, `templates.py`, `env_detect.py`, `toml_helpers.py`, `errors.py`, `json_report.py`
+  - `init/`: `init_cmd.py`, `discover.py`, `templates.py`, `env_detect.py`, `toml_helpers.py`, `errors.py`, `json_report.py`, `wizard.py`, `wizard_discovery.py`
   - `image/`: `image_commands.py` (list, detail, register, save, delete, set-default)
   - `job/`: `job_commands.py`, `job_create.py`, `job_logs.py`, `job_deps.py`
-  - `notebook/`: `notebook_commands.py`, `notebook_create_flow.py`, `top.py`
-  - `project/`: `project_commands.py`
-  - `resources/`: `resources_list.py`, `resources_nodes.py`
+  - `notebook/`: `notebook_commands.py`, `notebook_create_flow.py`, `notebook_ssh_flow.py`, `notebook_presenters.py`, `notebook_lookup.py`, `top.py`
+  - `project/`: `project_commands.py`, `select.py`
+  - `resources/`: `resources_list.py`, `resources_nodes.py`, `resources_specs.py`
 - Formatters: `inspire/cli/formatters/human_formatter.py` (human-readable) and `json_formatter.py` (machine-readable).
 - Domain packages (preferred for shared logic used by CLI):
   - `inspire/config/`: config models, TOML/env loading, schema/options, runtime helpers.
   - `inspire/config/options/`: option groups in `api.py`, `hpc.py`, `infra.py`, `project.py`.
   - `inspire/platform/openapi/`: OpenAPI client/auth/jobs/hpc_jobs/nodes/resources.
   - `inspire/platform/web/`: web session (SSO) + browser-only APIs (`session/`, `browser_api/`, `resources.py`).
-  - `inspire/platform/web/browser_api/`: split domain modules including `availability/`, `jobs.py`, `notebooks.py`, `images.py`, `projects.py`, `workspaces.py`, `playwright_notebooks.py`, `rtunnel.py`.
+  - `inspire/platform/web/browser_api/`: split domain modules including `core.py`, `availability/`, `jobs.py`, `hpc_jobs.py`, `notebooks/`, `images.py`, `projects.py`, `workspaces.py`, `playwright_notebooks.py`, `rtunnel/` (multi-file pipeline: `flow.py`, `terminal.py`, `upload.py`, `verify.py`, `probe.py`, `state.py`, `commands.py`, `diagnostics.py`, `logging.py`, `_jupyter.py`).
   - `inspire/bridge/tunnel/`: tunnel config/models + rtunnel/ssh/scp/sync helpers.
+  - `inspire/mcp/`: MCP (Model Context Protocol) server for IDE integration (`server.py`, `sync.py`, `remote_fs.py`, `runtime.py`, `errors.py`); entry point `inspire-mcp`.
 - `tests/` contains pytest suites across CLI, bridge/tunnel, openapi, web session, and notebook flows (for example, `tests/test_cli_commands.py`, `tests/test_cli_smoke.py`).
 - `examples/` holds miscellaneous setup examples.
 - `scripts/` contains internal exploration/automation utilities and is gitignored.
-- `docs/` and `README.md` document usage; `bin/inspire` is a repo-local wrapper.
+- `README.md` documents usage; `bin/inspire` is a repo-local wrapper.
+- `docs/` is gitignored (internal-only documentation, not shipped).
 
 ## Build, Test, and Development Commands
 - Prefer `uv` for all Python/CLI invocations (`uv run ...`, `uv tool run ...`); avoid system `python`/`pip`.
@@ -45,12 +47,10 @@
 - `uv` may update `uv.lock` during runs; avoid committing it unless dependencies were intentionally changed.
 
 ## CI/CD and Release Process
-- CI runs on Codeberg Forgejo Actions (`.forgejo/workflows/`) on push/PR to `main`.
+- CI runs on GitHub Actions (`.github/workflows/ci.yml`) on push/PR to `main`, with `concurrency` set to cancel in-progress runs on the same ref.
 - CI jobs run in parallel:
   - `lint`: `uv run ruff check inspire tests` and `uv run black --check inspire tests`
-  - `test`: `uv run pytest -x -q --tb=short`
-- Release workflow triggers on `v*` tag push and validates version consistency across `pyproject.toml`, `inspire/__init__.py`, and the git tag.
-- Dependency checks run weekly (Monday 09:00 UTC) via `deps-check`.
+  - `test`: matrix across Python 3.10 / 3.11 / 3.12, `uv run pytest -x -q --tb=short`
 - Release process:
   1. `uv run cz bump --patch` (or `--minor` / `--major`) updates `pyproject.toml`, `inspire/__init__.py`, `CHANGELOG.md`, and creates a git tag.
   2. `git push origin main --tags` triggers release validation CI.
