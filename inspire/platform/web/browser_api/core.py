@@ -130,14 +130,19 @@ def _request_json(
 
 
 def _in_asyncio_loop() -> bool:
+    """Return True when this thread has a running asyncio loop.
+
+    Playwright's sync API must not run on the loop thread. We intentionally
+    key off *any* running loop, not ``asyncio.current_task()`` — sync callbacks
+    scheduled on the loop (e.g. ``call_soon``) can run with no current Task but
+    still see ``get_running_loop()``, which would wrongly skip the thread
+    offload and trigger: "Playwright Sync API inside the asyncio loop".
+    """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return False
-    try:
-        return asyncio.current_task(loop=loop) is not None
-    except RuntimeError:
-        return False
+    return True
 
 
 def _run_in_thread(func, *args, **kwargs):  # noqa: ANN001
