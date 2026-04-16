@@ -434,19 +434,20 @@ def test_contents_api_filename_does_not_override_rtunnel_bin_path() -> None:
         contents_api_filename=".inspire_rtunnel_bin",
     )
 
-    # Find first indices of the RTUNNEL_BIN_PATH copy and the contents API move
+    # Find first indices of the configured-path check and the contents API move
     bin_path_idx = None
     contents_api_idx = None
     for i, line in enumerate(commands):
         if (
             bin_path_idx is None
-            and 'if [ -x "$RTUNNEL_BIN_PATH" ]; then RTUNNEL_BIN="$RTUNNEL_BIN_PATH"; ' in line
+            and "/project/rtunnel" in line
+            and "RTUNNEL_BIN=" in line
         ):
             bin_path_idx = i
         if contents_api_idx is None and ".inspire_rtunnel_bin" in line and "cp" in line:
             contents_api_idx = i
 
-    assert bin_path_idx is not None, "RTUNNEL_BIN_PATH copy line not found"
+    assert bin_path_idx is not None, "Configured rtunnel_bin path check line not found"
     assert contents_api_idx is not None, "Contents API copy line not found"
     assert (
         bin_path_idx < contents_api_idx

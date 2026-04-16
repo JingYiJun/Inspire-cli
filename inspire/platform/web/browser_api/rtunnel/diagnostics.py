@@ -51,6 +51,8 @@ def _doctor_command(
         f'echo "apt_mirror_url={apt_mirror_url}"',
         f'echo "dropbear_deb_dir={dropbear_deb_dir}"',
         f'echo "sshd_deb_dir={sshd_deb_dir}"',
+        f"PORT={port}",
+        f"SSH_PORT={ssh_port}",
         f'echo "rtunnel_port={port}"',
         f'echo "ssh_port={ssh_port}"',
         "_has_sshd_bin=$( [ -x /usr/sbin/sshd ] && echo 1 || echo 0 )",

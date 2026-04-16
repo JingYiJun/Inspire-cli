@@ -85,6 +85,8 @@ def _ssh_locale_args() -> list[str]:
         "SetEnv=LC_ALL=C",
         "-o",
         "SetEnv=LANG=C",
+        "-o",
+        "SetEnv=TERM=xterm-256color",
     ]
 
 

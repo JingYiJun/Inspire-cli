@@ -146,6 +146,20 @@ def _build_key_setup_line(ssh_public_key: Optional[str]) -> str:
     return "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
 
 
+def _split_rtunnel_bin_paths(rtunnel_bin: object) -> list[str]:
+    """Normalize rtunnel_bin into a list of paths.
+
+    Accepts ``None``, a single path string, a colon-separated string
+    (like ``$PATH``), or a ``list[str]``.  Empty / whitespace-only
+    entries are silently dropped.
+    """
+    if not rtunnel_bin:
+        return []
+    if isinstance(rtunnel_bin, list):
+        return [str(p).strip() for p in rtunnel_bin if str(p).strip()]
+    return [p.strip() for p in str(rtunnel_bin).split(":") if p.strip()]
+
+
 def _build_rtunnel_bin_lines(
     *,
     rtunnel_bin: Optional[str],
@@ -153,17 +167,25 @@ def _build_rtunnel_bin_lines(
 ) -> list[str]:
     import shlex
 
+    paths = _split_rtunnel_bin_paths(rtunnel_bin)
+
     lines = [
-        f"RTUNNEL_BIN_PATH={shlex.quote(rtunnel_bin or '')}",
         'RTUNNEL_BIN="/tmp/rtunnel-$PORT"',
     ]
-    if rtunnel_bin:
-        lines.append(
-            'if [ -x "$RTUNNEL_BIN_PATH" ]; then RTUNNEL_BIN="$RTUNNEL_BIN_PATH"; '
-            'elif [ -f "$RTUNNEL_BIN_PATH" ]; then rm -f "$RTUNNEL_BIN" && '
-            'cp "$RTUNNEL_BIN_PATH" "$RTUNNEL_BIN" '
-            '&& chmod +x "$RTUNNEL_BIN"; fi'
-        )
+
+    if paths:
+        # Try each configured path in order; use first that exists.
+        for path in paths:
+            safe = shlex.quote(path)
+            lines.append(
+                f'if [ ! -x "$RTUNNEL_BIN" ] && [ -x {safe} ]; then RTUNNEL_BIN={safe}; '
+                f'elif [ ! -x "$RTUNNEL_BIN" ] && [ -f {safe} ]; then '
+                f'rm -f "$RTUNNEL_BIN" && cp {safe} "$RTUNNEL_BIN" && chmod +x "$RTUNNEL_BIN"; fi'
+            )
+        # Keep RTUNNEL_BIN_PATH set to the first path for legacy sentinel logic.
+        lines.insert(1, f"RTUNNEL_BIN_PATH={shlex.quote(paths[0])}")
+    else:
+        lines.insert(1, "RTUNNEL_BIN_PATH=''")
 
     if contents_api_filename:
         safe_name = shlex.quote(contents_api_filename)

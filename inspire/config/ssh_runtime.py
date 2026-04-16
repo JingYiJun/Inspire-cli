@@ -11,6 +11,17 @@ from inspire.config.rtunnel_defaults import DEFAULT_RTUNNEL_DOWNLOAD_URL
 from inspire.config.schema_models import _parse_upload_policy
 
 
+def _normalize_rtunnel_bin(value: object) -> Optional[str]:
+    """Accept str, list[str], or None and return a colon-separated string."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        joined = ":".join(str(p).strip() for p in value if str(p).strip())
+        return joined or None
+    s = str(value).strip()
+    return s or None
+
+
 @dataclass(frozen=True)
 class SshRuntimeConfig:
     """Resolved SSH runtime options used by notebook and tunnel workflows."""

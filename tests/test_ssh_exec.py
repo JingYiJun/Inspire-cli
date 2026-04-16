@@ -21,6 +21,7 @@ def _assert_has_locale_ssh_options(args: list[str]) -> None:
     assert "/dev/null" in args
     assert "SetEnv=LC_ALL=C" in args
     assert "SetEnv=LANG=C" in args
+    assert "SetEnv=TERM=xterm-256color" in args
 
 
 def _stub_resolve(*args: Any, **kwargs: Any) -> tuple[TunnelConfig, BridgeProfile, str]:
@@ -243,6 +244,7 @@ def test_get_ssh_command_args_uses_stdio_proxycommand(
     assert "-F /dev/null" in joined
     assert "SetEnv=LC_ALL=C" in joined
     assert "SetEnv=LANG=C" in joined
+    assert "SetEnv=TERM=xterm-256color" in joined
     assert "ProxyCommand=" in joined
     assert "stdio://" in joined
     assert "pick_port" not in joined
@@ -358,6 +360,7 @@ def test_build_ssh_base_args_structure(
     assert "/dev/null" in args
     assert "SetEnv=LC_ALL=C" in args
     assert "SetEnv=LANG=C" in args
+    assert "SetEnv=TERM=xterm-256color" in args
     assert "StrictHostKeyChecking=no" in args
     assert "UserKnownHostsFile=/dev/null" in args
     assert "BatchMode=yes" in args
@@ -478,6 +481,7 @@ def test_ssh_locale_args_returns_correct_options() -> None:
     assert "/dev/null" in args
     assert "SetEnv=LC_ALL=C" in args
     assert "SetEnv=LANG=C" in args
+    assert "SetEnv=TERM=xterm-256color" in args
 
 
 def test_constants_defined() -> None:

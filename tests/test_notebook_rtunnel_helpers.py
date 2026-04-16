@@ -1006,7 +1006,7 @@ def test_build_rtunnel_setup_commands_uses_configured_rtunnel_bin_in_place() -> 
     )
     script = "\n".join(commands)
 
-    assert 'if [ -x "$RTUNNEL_BIN_PATH" ]; then RTUNNEL_BIN="$RTUNNEL_BIN_PATH"; ' in script
+    assert "if [ ! -x \"$RTUNNEL_BIN\" ] && [ -x /shared/bin/rtunnel ]" in script
     assert 'nohup "$RTUNNEL_BIN" "$SSH_PORT" "$PORT" ' in script
     assert 'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x "$RTUNNEL_BIN" ] ' in script
 
@@ -1493,7 +1493,7 @@ def test_resolve_rtunnel_binary_configured_hash_match(tmp_path, monkeypatch):
 
 
 def test_resolve_rtunnel_binary_configured_hash_mismatch(tmp_path, monkeypatch):
-    """rtunnel_bin set, local exists, hash mismatch → return None, no upload."""
+    """rtunnel_bin set, local exists, hash mismatch → falls through to upload."""
     from inspire.config.ssh_runtime import SshRuntimeConfig
 
     local_bin = tmp_path / ".local" / "bin" / "rtunnel"
@@ -1522,18 +1522,20 @@ def test_resolve_rtunnel_binary_configured_hash_mismatch(tmp_path, monkeypatch):
         "_upload_rtunnel_via_contents_api",
         lambda *a, **kw: upload_called.append(1) or True,
     )
+    monkeypatch.setattr(upload_module, "_upload_rtunnel_hash_sidecar", lambda *a, **kw: True)
 
     result = _resolve_rtunnel_binary(
         context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
     )
-    assert result is None
-    assert len(hash_calls) == 1
-    assert len(match_calls) == 1
-    assert upload_called == []
+    assert result == _CONTENTS_API_RTUNNEL_FILENAME
+    # hash/match called twice: once in auto+configured block, once in upload block
+    assert len(hash_calls) == 2
+    assert len(match_calls) == 2
+    assert len(upload_called) == 1
 
 
 def test_resolve_rtunnel_binary_configured_no_local(tmp_path, monkeypatch):
-    """rtunnel_bin set, no local binary → return None, no hash/match/upload calls."""
+    """rtunnel_bin set, no local binary → falls through, download attempted, returns None."""
     from inspire.config.ssh_runtime import SshRuntimeConfig
 
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
@@ -1559,6 +1561,12 @@ def test_resolve_rtunnel_binary_configured_no_local(tmp_path, monkeypatch):
         "_upload_rtunnel_via_contents_api",
         lambda *a, **kw: upload_called.append(1) or True,
     )
+    download_calls = []
+    monkeypatch.setattr(
+        upload_module,
+        "_download_rtunnel_locally",
+        lambda _url, _dest: (download_calls.append(1), False)[1],
+    )
 
     result = _resolve_rtunnel_binary(
         context=ctx, lab_url="https://nb.example.com/lab", ssh_runtime=ssh_rt
@@ -1567,6 +1575,7 @@ def test_resolve_rtunnel_binary_configured_no_local(tmp_path, monkeypatch):
     assert hash_calls == []
     assert match_calls == []
     assert upload_called == []
+    assert len(download_calls) == 1
 
 
 def test_resolve_rtunnel_binary_not_configured_downloads(tmp_path, monkeypatch):

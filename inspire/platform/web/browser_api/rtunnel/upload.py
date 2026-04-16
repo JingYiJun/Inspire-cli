@@ -65,13 +65,20 @@ def _upload_rtunnel_via_contents_api(
             },
             timeout=30000,
         )
-        _log.debug("Contents API upload response: %d", resp.status)
         if resp.status not in (200, 201):
             try:
                 body = resp.text()[:500]
             except Exception:
                 body = "(unable to read body)"
-            _log.debug("Contents API upload error body: %s", body)
+            _log.warning(
+                "Contents API upload failed: HTTP %d for %s (%d bytes). Body: %s",
+                resp.status,
+                api_url,
+                len(raw),
+                body,
+            )
+        else:
+            _log.debug("Contents API upload response: %d", resp.status)
         return resp.status in (200, 201)
     except (
         PlaywrightError,
@@ -82,7 +89,7 @@ def _upload_rtunnel_via_contents_api(
         ValueError,
         TypeError,
     ) as exc:
-        _log.debug("Contents API upload failed: %s", exc, exc_info=True)
+        _log.warning("Contents API upload failed for %s: %s", api_url, exc)
         return False
 
 
@@ -217,9 +224,11 @@ def _resolve_rtunnel_binary(
 
     Returns ``_CONTENTS_API_RTUNNEL_FILENAME`` when a usable copy is already on
     the notebook (hash-verified), or after a successful upload.  Returns
-    ``None`` when no upload is needed (e.g. ``rtunnel_bin`` is configured so the
-    setup script will copy from the shared path) or when all upload attempts
-    fail.
+    ``None`` when all upload attempts fail or the upload policy is ``"never"``.
+
+    When ``policy="auto"`` and ``rtunnel_bin`` is configured, the binary is
+    still uploaded as a fallback because the configured shared-filesystem path
+    may not exist on the target notebook (e.g. different cluster/project).
     """
     local_rtunnel = Path.home() / ".local" / "bin" / "rtunnel"
     local_exists = local_rtunnel.is_file()
@@ -244,10 +253,18 @@ def _resolve_rtunnel_binary(
             if local_hash and _rtunnel_matches_on_notebook(context, lab_url, local_hash):
                 trace_event("rtunnel_upload_reused_contents_copy", policy=policy)
                 return _CONTENTS_API_RTUNNEL_FILENAME
-        trace_event("rtunnel_upload_skipped", policy=policy, reason="configured_bin_path")
-        return None
+        # The configured rtunnel_bin path may not exist on the target notebook
+        # (e.g. different cluster/project). Fall through to upload via Contents
+        # API as a portable fallback so the setup script can find the binary
+        # even when the shared-filesystem path is unavailable.
+        _log.debug(
+            "  Configured rtunnel_bin may be unavailable on target; "
+            "uploading via Contents API as fallback."
+        )
+        trace_event("rtunnel_upload_fallthrough", policy=policy, reason="configured_bin_fallback")
 
-    # -- "always", or "auto" without rtunnel_bin: download + upload -----------
+    # -- "always", or "auto" with configured-bin fallback, or "auto" without
+    #    rtunnel_bin: download + upload ----------------------------------------
 
     if policy == "always" and rtunnel_bin_configured:
         _log.debug("  Upload policy: always — preparing Contents API fallback.")
