@@ -865,11 +865,12 @@ def _resolve_discover_runtime(
             config,
             cli_username=cli_username,
             cli_base_url=cli_base_url,
-            allow_config_username=bool(cli_username),
-            # CLI overrides force an interactive login path; do not silently
-            # reuse a config-derived password because the caller may be fixing
-            # stale credentials while updating the username or base URL.
-            allow_config_password=False,
+            # Fill username from config/env when the flag is omitted; prompt only
+            # when still missing after config.
+            allow_config_username=True,
+            # Reuse password from config or INSPIRE_PASSWORD when present so
+            # discover can run non-interactively; prompt only when absent.
+            allow_config_password=True,
         )
         prompted_credentials = (username, password, base_url)
         click.echo("Logging in...")
@@ -888,7 +889,8 @@ def _resolve_discover_runtime(
                 config,
                 cli_username=cli_username,
                 cli_base_url=cli_base_url,
-                allow_config_password=False,
+                allow_config_username=True,
+                allow_config_password=True,
             )
             prompted_credentials = (username, password, base_url)
             click.echo("Logging in...")

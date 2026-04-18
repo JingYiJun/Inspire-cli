@@ -1186,10 +1186,10 @@ class TestInitCommand:
         global_data = Config._load_toml(global_config)
         assert "cli-user" in global_data.get("accounts", {})
 
-    def test_discover_fallback_always_prompts_password(
+    def test_discover_fallback_uses_env_password_without_password_prompt(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
     ) -> None:
-        """Finding 2: password must always be prompted in the fallback path."""
+        """Fallback Playwright login uses INSPIRE_PASSWORD without re-prompting."""
         from inspire.platform.web.session.models import WebSession
 
         workspace_id = "ws-11111111-1111-1111-1111-111111111111"
@@ -1200,9 +1200,7 @@ class TestInitCommand:
             login_username="newuser",
         )
 
-        # Even with INSPIRE_PASSWORD set, the interactive fallback should
-        # prompt again because the existing session failed.
-        monkeypatch.setenv("INSPIRE_PASSWORD", "old-stale-pw")
+        monkeypatch.setenv("INSPIRE_PASSWORD", "env-stored-pw")
         monkeypatch.setenv("INSPIRE_BASE_URL", "https://example.invalid")
 
         global_config, _ = self._setup_discover_mocks(
@@ -1213,7 +1211,42 @@ class TestInitCommand:
         )
 
         runner = CliRunner()
-        # Input provides: username, then password
+        result = runner.invoke(
+            init,
+            ["--discover", "--force"],
+            input="newuser\n",
+        )
+
+        assert result.exit_code == 0
+        assert "Note: prompted account password was stored in global config" not in result.output
+        global_data = Config._load_toml(global_config)
+        account = global_data["accounts"]["newuser"]
+        assert account["password"] == "env-stored-pw"
+
+    def test_discover_fallback_prompts_password_when_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
+    ) -> None:
+        """When no password in config/env, fallback path prompts for password."""
+        from inspire.platform.web.session.models import WebSession
+
+        workspace_id = "ws-11111111-1111-1111-1111-111111111111"
+        login_session = WebSession(
+            storage_state={"cookies": [], "origins": []},
+            created_at=0.0,
+            workspace_id=workspace_id,
+            login_username="newuser",
+        )
+
+        monkeypatch.setenv("INSPIRE_BASE_URL", "https://example.invalid")
+
+        global_config, _ = self._setup_discover_mocks(
+            monkeypatch,
+            tmp_path,
+            get_web_session_side_effect=ValueError("Missing credentials"),
+            login_session=login_session,
+        )
+
+        runner = CliRunner()
         result = runner.invoke(
             init,
             ["--discover", "--force"],
@@ -1222,15 +1255,14 @@ class TestInitCommand:
 
         assert result.exit_code == 0
         assert "Note: prompted account password was stored in global config" in result.output
-        # Verify the freshly prompted password (not the stale one) was persisted
         global_data = Config._load_toml(global_config)
         account = global_data["accounts"]["newuser"]
         assert account["password"] == "fresh-password"
 
-    def test_discover_prompted_credentials_overwrite_stale_values(
+    def test_discover_reuses_config_password_with_base_url_override(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
     ) -> None:
-        """Finding 3: prompted credentials must overwrite existing config values."""
+        """--base-url with stored account password skips password prompt; URL still updates."""
         from inspire.platform.web.session.models import WebSession
 
         workspace_id = "ws-11111111-1111-1111-1111-111111111111"
@@ -1250,7 +1282,6 @@ class TestInitCommand:
             login_session=login_session,
         )
 
-        # Pre-populate global config with stale values
         global_config.parent.mkdir(parents=True, exist_ok=True)
         global_config.write_text(
             '[api]\nbase_url = "https://old-url.invalid"\n\n'
@@ -1261,13 +1292,12 @@ class TestInitCommand:
         result = runner.invoke(
             init,
             ["--discover", "--force", "--base-url", "https://new-url.invalid"],
-            input="testuser\nnew-password\n",
         )
 
         assert result.exit_code == 0
         global_data = Config._load_toml(global_config)
         assert global_data["api"]["base_url"] == "https://new-url.invalid"
-        assert global_data["accounts"]["testuser"]["password"] == "new-password"
+        assert global_data["accounts"]["testuser"]["password"] == "old-password"
 
     def test_discover_probe_respects_limit_and_forwards_probe_flags(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
