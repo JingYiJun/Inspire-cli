@@ -15,6 +15,7 @@ from inspire.cli.context import (
     EXIT_LOG_NOT_FOUND,
     EXIT_JOB_NOT_FOUND,
     EXIT_VALIDATION_ERROR,
+    EXIT_API_ERROR,
 )
 
 from inspire import config as config_module
@@ -2793,6 +2794,142 @@ def test_notebook_list_all_workspaces_combines_results(
     items = payload["data"]["items"]
     assert [item["id"] for item in items] == ["nb-gpu", "nb-cpu"]
     assert calls == [ws_cpu, ws_gpu]
+
+
+def test_notebook_list_all_workspaces_empty_results_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Empty result sets from successful calls should render an empty list, not fail.
+
+    Regression guard: previously ``--all-workspaces --status RUNNING`` incorrectly
+    reported "Failed to list notebooks from configured workspaces." whenever every
+    workspace happened to contain no matching notebooks.
+    """
+    ws_cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
+    ws_gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
+
+    config = config_module.Config(
+        username="user",
+        password="pass",
+        base_url="https://example.invalid",
+        target_dir=str(tmp_path / "logs"),
+        job_cache_path=str(tmp_path / "jobs.json"),
+        log_cache_dir=str(tmp_path / "log_cache"),
+        job_workspace_id=None,
+        workspace_cpu_id=ws_cpu,
+        workspace_gpu_id=ws_gpu,
+        workspace_internet_id=None,
+        timeout=5,
+        max_retries=0,
+        retry_delay=0.0,
+    )
+
+    def fake_from_files_and_env(
+        cls, require_target_dir: bool = False, require_credentials: bool = True
+    ):  # type: ignore[override]
+        return config, {}
+
+    monkeypatch.setattr(
+        config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
+    )
+
+    class FakeSession:
+        workspace_id = "ws-00000000-0000-0000-0000-000000000000"
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: FakeSession())
+
+    calls: list[str] = []
+
+    def fake_request_json(
+        session,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[dict] = None,
+        timeout: int = 30,
+        _retry_count: int = 0,
+    ) -> dict:
+        assert method.upper() == "POST"
+        assert url.endswith("/api/v1/notebook/list")
+        assert body and "workspace_id" in body
+        calls.append(str(body["workspace_id"]))
+        return {"code": 0, "data": {"list": []}}
+
+    monkeypatch.setattr(web_session_module, "request_json", fake_request_json)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main,
+        ["notebook", "list", "--all-workspaces", "--all", "--status", "RUNNING", "--json"],
+    )
+
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    payload = json.loads(result.output)
+    assert payload["data"]["items"] == []
+    assert set(calls) == {ws_cpu, ws_gpu}
+
+
+def test_notebook_list_all_workspaces_all_calls_fail_reports_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When every workspace call raises, the command should still surface an error."""
+    ws_cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
+    ws_gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
+
+    config = config_module.Config(
+        username="user",
+        password="pass",
+        base_url="https://example.invalid",
+        target_dir=str(tmp_path / "logs"),
+        job_cache_path=str(tmp_path / "jobs.json"),
+        log_cache_dir=str(tmp_path / "log_cache"),
+        job_workspace_id=None,
+        workspace_cpu_id=ws_cpu,
+        workspace_gpu_id=ws_gpu,
+        workspace_internet_id=None,
+        timeout=5,
+        max_retries=0,
+        retry_delay=0.0,
+    )
+
+    def fake_from_files_and_env(
+        cls, require_target_dir: bool = False, require_credentials: bool = True
+    ):  # type: ignore[override]
+        return config, {}
+
+    monkeypatch.setattr(
+        config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
+    )
+
+    class FakeSession:
+        workspace_id = "ws-00000000-0000-0000-0000-000000000000"
+        storage_state = {}
+
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda: FakeSession())
+
+    def fake_request_json(
+        session,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[dict] = None,
+        timeout: int = 30,
+        _retry_count: int = 0,
+    ) -> dict:
+        raise ValueError("API error: boom")
+
+    monkeypatch.setattr(web_session_module, "request_json", fake_request_json)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main, ["notebook", "list", "--all-workspaces", "--all", "--json"]
+    )
+
+    assert result.exit_code == EXIT_API_ERROR, result.output
+    assert "Failed to list notebooks" in result.output or "boom" in result.output
 
 
 def test_notebook_list_human_output_uses_compound_resource_format(

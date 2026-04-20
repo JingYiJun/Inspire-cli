@@ -673,6 +673,7 @@ def list_notebooks(
     user_ids = [] if show_all else _try_get_current_user_ids(session, base_url=base_url)
 
     all_items: list[dict] = []
+    successful_workspaces = 0
     # When filtering by tunneled, fetch more to ensure we get enough after filtering
     fetch_limit = limit * 5 if tunneled else limit
     for ws_id in workspace_ids:
@@ -688,6 +689,7 @@ def list_notebooks(
                 status=status_filter,
             )
             all_items.extend(items)
+            successful_workspaces += 1
         except ValueError as e:
             if len(workspace_ids) == 1:
                 _handle_error(
@@ -709,7 +711,10 @@ def list_notebooks(
                 click.echo(f"Warning: workspace {ws_id} failed: {e}", err=True)
             continue
 
-    if not all_items and len(workspace_ids) > 1:
+    # Only report a failure when every workspace call raised. An empty result set
+    # from successful calls (e.g. no notebooks match --status RUNNING) is not an
+    # error and should fall through to render an empty list.
+    if successful_workspaces == 0 and len(workspace_ids) > 1:
         _handle_error(
             ctx,
             "APIError",

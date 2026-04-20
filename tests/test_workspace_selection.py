@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from inspire.config import Config, ConfigError
+from inspire.config import Config, ConfigDeprecationWarning, ConfigError
 from inspire.config.workspaces import select_workspace_id
 
 WS_CPU = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
@@ -112,22 +112,31 @@ special = "ws-22222222-2222-2222-2222-222222222222"
     assert cfg.workspaces.get("special") == WS_SPECIAL
 
 
-def test_config_ignores_legacy_top_level_workspaces(
+def test_config_legacy_top_level_workspaces_populates_fields_with_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Top-level [workspaces] still works but emits a deprecation warning."""
     project_root = tmp_path / "proj"
     project_root.mkdir()
     (project_root / ".inspire").mkdir()
 
+    cpu_id = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
+    gpu_id = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
+    internet_id = "ws-11111111-1111-1111-1111-111111111111"
+    hpc_id = "ws-f9be64cb-9b66-40fb-8172-488abed619bc"
+    special_id = "ws-22222222-2222-2222-2222-222222222222"
+
     (project_root / ".inspire" / "config.toml").write_text(
-        """
+        f"""
 [auth]
 username = "proj-user"
 
 [workspaces]
-cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
-gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
-special = "ws-22222222-2222-2222-2222-222222222222"
+cpu = "{cpu_id}"
+gpu = "{gpu_id}"
+internet = "{internet_id}"
+hpc = "{hpc_id}"
+special = "{special_id}"
 """.lstrip(),
         encoding="utf-8",
     )
@@ -141,8 +150,17 @@ special = "ws-22222222-2222-2222-2222-222222222222"
     monkeypatch.delenv("INSPIRE_WORKSPACE_GPU_ID", raising=False)
     monkeypatch.delenv("INSPIRE_WORKSPACE_INTERNET_ID", raising=False)
 
-    cfg, _ = Config.from_files_and_env(require_credentials=False)
-    assert cfg.workspace_cpu_id is None
-    assert cfg.workspace_gpu_id is None
-    assert cfg.workspace_internet_id is None
-    assert cfg.workspaces == {}
+    with pytest.warns(ConfigDeprecationWarning, match=r"top-level \[workspaces\]"):
+        cfg, _ = Config.from_files_and_env(require_credentials=False)
+
+    assert cfg.workspace_cpu_id == cpu_id
+    assert cfg.workspace_gpu_id == gpu_id
+    assert cfg.workspace_internet_id == internet_id
+    assert cfg.workspace_hpc_id == hpc_id
+    assert cfg.workspaces == {
+        "cpu": cpu_id,
+        "gpu": gpu_id,
+        "internet": internet_id,
+        "hpc": hpc_id,
+        "special": special_id,
+    }
