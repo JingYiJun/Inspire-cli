@@ -9,9 +9,11 @@ Usage:
 
 import logging
 import sys
+import warnings
 import click
 
 from inspire import __version__
+from inspire.config import ConfigDeprecationWarning
 from inspire.cli.utils.profile import apply_env_profile
 from inspire.cli.logging_setup import (
     _configure_json_logging,
@@ -23,6 +25,34 @@ from inspire.cli.context import (
     pass_context,
     EXIT_GENERAL_ERROR,
 )
+
+
+def _install_friendly_warning_formatter() -> None:
+    """Render ConfigDeprecationWarning compactly for end users.
+
+    Python's default ``warnings`` output prints the triggering source line on
+    its own (e.g. ``return config_from_files_and_env(``), which is noise for
+    CLI users. For our own deprecation warnings we collapse it to a single
+    ``warning: <message>`` line. Other warnings keep the default format so
+    Python/library warnings remain debuggable.
+    """
+    default_formatwarning = warnings.formatwarning
+
+    def _formatwarning(
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        line: str | None = None,
+    ) -> str:
+        if issubclass(category, ConfigDeprecationWarning):
+            return f"warning: {message}\n"
+        return default_formatwarning(message, category, filename, lineno, line)
+
+    warnings.formatwarning = _formatwarning
+
+
+_install_friendly_warning_formatter()
 from inspire.cli.commands import (
     job,
     hpc,

@@ -302,7 +302,6 @@ def _print_notebook_list(
         return
 
     table = Table(
-        title="Notebook Instances",
         box=box.SIMPLE_HEAVY,
         show_header=True,
         header_style="bold cyan",
