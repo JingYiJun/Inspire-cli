@@ -6,10 +6,10 @@ Command-line interface for the Inspire HPC training platform.
 
 ```bash
 # Via SSH (recommended)
-uv tool install git+ssh://git@github.com/EmbodiedForge/Inspire-cli.git
+uv tool install git+ssh://git@github.com/jingyijun/Inspire-cli.git
 
 # Or via HTTPS
-uv tool install git+https://github.com/EmbodiedForge/Inspire-cli.git
+uv tool install git+https://github.com/jingyijun/Inspire-cli.git
 ```
 
 ### Local Development
@@ -29,9 +29,10 @@ inspire init --discover -u YOUR_USERNAME --base-url https://your-platform.com
 
 This opens a browser to log in, then automatically discovers your projects, workspaces, compute groups, and shared filesystem paths. Writes both global (`~/.config/inspire/config.toml`) and project (`.inspire/config.toml`) configs.
 
-Set your password as an env var to avoid repeated prompts:
+`--discover` reuses any credentials already present in config (`[accounts."<username>"].password`) or in the `INSPIRE_PASSWORD` env var, so repeat runs can be fully non-interactive. A prompt only appears when both the config and env fallback are empty.
+
 ```bash
-export INSPIRE_PASSWORD="your_password"
+export INSPIRE_PASSWORD="your_password"   # optional: skips the password prompt
 ```
 
 ### 2. Verify
@@ -137,7 +138,7 @@ inspire project list
 - Notebook compute-group auto-selection is workspace-scoped. Availability is evaluated inside the selected workspace, not across unrelated workspaces.
 - `inspire image detail` is workspace-aware and can resolve a full ID, partial ID, image name, or full URL. When multiple workspaces match, the CLI may ask you to choose.
 - `inspire image list --source personal-visible` matches the web UI's personal visible tab.
-- `inspire resources list` now emphasizes grouped human-readable summaries and schedulable resource-spec visibility.
+- `inspire resources list` now emphasizes grouped human-readable summaries (separate GPU/CPU/ASCEND buckets with schedulable resource-spec visibility), hides zero-total groups without any schedulable spec, and correctly applies CPU workspace filtering. The underlying API session is reused across buckets to reduce redundant calls.
 
 ## HPC Notes
 
@@ -243,7 +244,9 @@ gpu_type = "H100"
 
 [ssh]
 # For GPU notebooks (H100/H200) without internet:
+# rtunnel_bin accepts either a single path or a list of candidates (tried in order).
 # rtunnel_bin = "/inspire/shared/tools/rtunnel"
+# rtunnel_bin = ["/inspire/shared/tools/rtunnel", "/opt/rtunnel/bin/rtunnel"]
 # Option A: APT mirror (simpler — no pre-placed debs needed)
 # apt_mirror_url = "http://nexus.example.com/repository/ubuntu/"
 # Option B: Pre-placed dropbear debs
